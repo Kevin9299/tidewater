@@ -189,7 +189,7 @@ ${ SH ? /* wgsl */`
 		// thin run-up sheet on the sand: take whichever surface is higher (smooth max)
 		let k = 0.04;
 		// no run-up sheet on steep rock (cliffs, sea stacks): waves break against it instead
-		let nr = ${ T ? 'terrainNormalRock( worldXZ )' : 'vec4f( 0.0 )' };
+		let nr = ${ T ? 'terrainNormalRockLevel( worldXZ, 0.0 )' : 'vec4f( 0.0 )' };
 		let gentle = ${ T ? 'smoothstep( 0.45, 0.25, length( nr.xy ) )' : '1.0' };
 		let hmx = sat( ( swashLevel - y ) / k * 0.5 + 0.5 ) * gentle;
 		let smax = mix( y, swashLevel, hmx ) + hmx * ( 1.0 - hmx ) * k;

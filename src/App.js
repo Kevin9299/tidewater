@@ -255,10 +255,10 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		useStaticVelocity( this.rocks.group );
 		scene.add( this.ocean );
 
+		this.query = new WaterQuery( renderer, this.surface );
+
 		this.marineSnow = new MarineSnow( { fft: this.fft, query: this.query } );
 		scene.add( this.marineSnow.mesh );
-
-		this.query = new WaterQuery( renderer, this.surface );
 
 		// ---- surf: plunging lips along the beach + spray particles (the breakers emit on the GPU;
 		// spray.emit() / emitAlongPoints() for boat bow spray and splashes)

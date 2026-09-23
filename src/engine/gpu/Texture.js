@@ -145,7 +145,9 @@ export class Texture {
 		this.depth = d;
 		if ( this.gpu ) {
 
-			this.gpu.destroy();
+			// commands recorded earlier this frame may still use it: free it after the submit
+			const old = this.gpu;
+			GPU.onSubmit( null, () => old.destroy() );
 			this.gpu = null;
 
 		}

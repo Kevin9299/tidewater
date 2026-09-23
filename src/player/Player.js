@@ -1,0 +1,514 @@
+import * as THREE from 'three/webgpu';
+import { WORLD } from '../world/WorldLayout.js';
+
+const EYE = 1.62;
+const SWIM_EYE = EYE * 0.1; // eyes above the body's float point while swimming
+const RADIUS = 0.3;
+const HEIGHT = 1.75;
+// water depth (mean level over the feet) where you start swimming / find your feet again
+const SWIM_DEPTH = 1.35;
+const STAND_DEPTH = 1.1;
+
+const _v = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler( 0, 0, 0, 'YXZ' );
+
+// First-person walker / swimmer / boat captain.
+//   walk : capsule on terrain + walkable colliders, wading slows you down
+//   swim : floats with the head at the surface; look down + W (or C) to dive, Space to rise
+//   boat : E near the boat to board; V toggles helm (1st person) / chase (3rd person) camera
+export class Player {
+
+	constructor( { camera, input, terrain, colliders, query, boat, reef = null, audio = null } ) {
+
+		this.camera = camera;
+		this.input = input;
+		this.terrain = terrain;
+		this.colliders = colliders;
+		this.query = query;
+		this.boat = boat;
+		this.reef = reef;
+		this.audio = audio;
+
+		this.mode = 'walk';
+		this.camMode = 'third';
+		this.position = new THREE.Vector3().copy( WORLD.spawn.position );
+		this.position.y = terrain.heightAt( this.position.x, this.position.z );
+		this.velocity = new THREE.Vector3();
+		this.yaw = WORLD.spawn.yaw;
+		this.pitch = - 0.05;
+		this.grounded = false;
+		this.bob = 0;
+		this.stepDist = 0;
+		this.waterH = 0;
+		this.waterMean = null; // water level low-passed over the passing waves (mode decisions)
+		this.wade = 0;
+		// eye height easing between modes (critically damped offset from the mode's eye height)
+		this.camOff = 0;
+		this.camOffV = 0;
+		this._camY = null;
+		this.floating = true; // swimming at the surface (riding the waves) vs. free under water
+		this.slot = query.allocate( 'player', 1 );
+		this.prompt = null;
+		this.surface = 'sand';
+
+		// boat cameras
+		this.orbitYaw = 0;
+		this.orbitPitch = 0.22;
+		this.orbitDist = 13;
+		this.helmYaw = 0;
+		this.helmPitch = - 0.05;
+		this.camPos = new THREE.Vector3();
+		this.camInit = false;
+		this.wasUnder = false;
+
+	}
+
+	// ------------------------------------------------------------------ helpers
+
+	waterHeight() {
+
+		const q = this.query;
+		if ( ! q.cpuValid ) return 0;
+		const h = q.cpu[ this.slot * 4 ];
+		return Number.isFinite( h ) ? h : this.waterH || 0;
+
+	}
+
+	groundAt( x, z, maxY ) {
+
+		let g = this.terrain.heightAt( x, z );
+		const c = this.colliders.groundHeightAt( x, z, maxY );
+		if ( c > g ) g = c;
+		if ( this.reef && this.reef.floorHeightAt ) g = Math.max( g, this.reef.floorHeightAt( x, z ) );
+		return g;
+
+	}
+
+	nearBoat() {
+
+		if ( ! this.boat ) return false;
+		const bp = this.boat.toWorld( this.boat.model.boardPoint, _v );
+		const d = Math.hypot( bp.x - this.position.x, bp.z - this.position.z );
+		const dy = Math.abs( bp.y - this.position.y );
+		return d < 4.2 && dy < 3.2;
+
+	}
+
+	// ------------------------------------------------------------------ update
+
+	update( dt ) {
+
+		const inp = this.input;
+		this.query.setPoint( this.slot, this.position.x, this.position.z );
+		this.waterH = this.waterHeight();
+		this.waterMean = this.waterMean === null ? this.waterH : this.waterMean + ( this.waterH - this.waterMean ) * ( 1 - Math.exp( - dt / 4 ) );
+		this.prompt = null;
+
+		if ( this.mode === 'boat' ) {
+
+			this.updateBoat( dt );
+			return;
+
+		}
+
+		const look = inp.consumeLook();
+		this.yaw -= look.x * 0.0022;
+		this.pitch = THREE.MathUtils.clamp( this.pitch - look.y * 0.0022, - 1.5, 1.5 );
+
+		if ( this.nearBoat() ) {
+
+			this.prompt = { key: 'E', text: 'Board boat' };
+			if ( inp.hit( 'KeyE' ) ) {
+
+				this.enterBoat();
+				return;
+
+			}
+
+		}
+
+		const prevMode = this.mode;
+		if ( this.mode === 'walk' ) this.updateWalk( dt );
+		else this.updateSwim( dt );
+
+		// camera. Wading out of your depth, finding your feet again or climbing out on a ladder
+		// changes the eye height: ease the view there (critically damped) instead of jumping
+		const eye = this.position.clone();
+		if ( this.mode === 'walk' ) eye.y += EYE + Math.sin( this.bob ) * 0.035 * ( 1 - 0.6 * this.wade );
+		else eye.y += SWIM_EYE;
+		if ( this._camY === null || this.camera.position.y !== this._camY ) {
+
+			// something else drove the camera since our last frame (free camera, boat): start fresh
+			this.camOff = 0;
+			this.camOffV = 0;
+
+		} else if ( this.mode !== prevMode ) {
+
+			this.camOff = this._camY - eye.y;
+
+		}
+
+		const w = 6, e = Math.exp( - w * dt ), j = ( this.camOffV + w * this.camOff ) * dt;
+		this.camOff = ( this.camOff + j ) * e;
+		this.camOffV = ( this.camOffV - w * j ) * e;
+		eye.y += this.camOff;
+		this.camera.position.copy( eye );
+		this._camY = this.camera.position.y;
+		this.camera.quaternion.setFromEuler( _e.set( this.pitch, this.yaw, 0 ) );
+
+	}
+
+	updateWalk( dt ) {
+
+		const inp = this.input;
+		_fwd.set( - Math.sin( this.yaw ), 0, - Math.cos( this.yaw ) );
+		_right.set( - _fwd.z, 0, _fwd.x );
+		const wish = new THREE.Vector3();
+		if ( inp.down( 'KeyW' ) ) wish.add( _fwd );
+		if ( inp.down( 'KeyS' ) ) wish.sub( _fwd );
+		if ( inp.down( 'KeyD' ) ) wish.add( _right );
+		if ( inp.down( 'KeyA' ) ) wish.sub( _right );
+		if ( wish.lengthSq() > 0 ) wish.normalize();
+
+		const depth = this.waterH - this.position.y; // water depth at the feet
+		const wade = THREE.MathUtils.clamp( depth / 1.2, 0, 1 );
+		this.wade = wade;
+		const sprint = inp.down( 'ShiftLeft' ) || inp.down( 'ShiftRight' );
+		const speed = ( sprint ? 6.2 : 3.0 ) * THREE.MathUtils.lerp( 1, 0.42, wade );
+		const accel = this.grounded ? 14 : 2.5;
+		const k = 1 - Math.exp( - accel * dt );
+		this.velocity.x += ( wish.x * speed - this.velocity.x ) * k;
+		this.velocity.z += ( wish.z * speed - this.velocity.z ) * k;
+
+		if ( this.grounded && inp.hit( 'Space' ) && depth < 0.9 ) {
+
+			this.velocity.y = 4.6;
+			this.grounded = false;
+
+		}
+
+		this.velocity.y -= 9.81 * dt;
+		// water drag while wading
+		if ( depth > 0 ) this.velocity.multiplyScalar( Math.exp( - dt * depth * 0.8 ) );
+
+		const p = this.position;
+		const old = p.clone();
+		p.addScaledVector( this.velocity, dt );
+		this.colliders.resolveCapsule( p, RADIUS, HEIGHT, 0.4 );
+		const g = this.groundAt( p.x, p.z, p.y + 0.45 );
+		if ( p.y <= g ) {
+
+			p.y = g;
+			if ( this.velocity.y < 0 ) this.velocity.y = 0;
+			this.grounded = true;
+
+		} else {
+
+			this.grounded = p.y - g < 0.06;
+
+		}
+
+		// head bob + footsteps
+		const moved = Math.hypot( p.x - old.x, p.z - old.z );
+		if ( this.grounded ) {
+
+			this.bob += moved * 2.4;
+			this.stepDist += moved;
+			const stride = sprint ? 0.9 : 0.62;
+			if ( this.stepDist > stride ) {
+
+				this.stepDist = 0;
+				this.surface = this.surfaceType( depth );
+				if ( this.audio ) this.audio.footstep( this.surface );
+
+			}
+
+		}
+
+		// out of your depth -> swim. Wading in, the body lifts into the floating position at the
+		// surface and the view eases down to it (update()); falling in off the pier plunges under
+		// and floats back up.
+		if ( this.waterMean - p.y > SWIM_DEPTH ) {
+
+			const wadedIn = this.grounded;
+			this.mode = 'swim';
+			if ( wadedIn ) p.y = Math.max( p.y, this.waterH - SWIM_EYE + 0.1 );
+			this.velocity.y = wadedIn ? 0 : Math.max( this.velocity.y * 0.3, - 2.5 );
+			if ( this.audio ) this.audio.splash( wadedIn ? 0.2 : 0.5, p );
+
+		}
+
+	}
+
+	surfaceType( depth ) {
+
+		const p = this.position;
+		if ( depth > 0.12 ) return 'water';
+		const onWood = this.colliders.groundHeightAt( p.x, p.z, p.y + 0.1 ) > this.terrain.heightAt( p.x, p.z ) + 0.05;
+		if ( onWood ) return 'wood';
+		const h = this.terrain.heightAt( p.x, p.z );
+		if ( h < 0.6 ) return 'wetsand';
+		if ( h > 3.6 ) return 'grass';
+		return 'sand';
+
+	}
+
+	updateSwim( dt ) {
+
+		const inp = this.input;
+		const p = this.position;
+		const surfaceY = this.waterH;
+		// look-relative movement (diving follows the view)
+		_fwd.set( 0, 0, - 1 ).applyEuler( _e.set( this.pitch, this.yaw, 0 ) );
+		_right.set( - Math.cos( this.yaw ), 0, Math.sin( this.yaw ) ).negate();
+		const wish = new THREE.Vector3();
+		if ( inp.down( 'KeyW' ) ) wish.add( _fwd );
+		if ( inp.down( 'KeyS' ) ) wish.sub( _fwd );
+		if ( inp.down( 'KeyD' ) ) wish.add( _right );
+		if ( inp.down( 'KeyA' ) ) wish.sub( _right );
+		if ( inp.down( 'Space' ) ) wish.y += 1;
+		if ( inp.down( 'KeyC' ) || inp.down( 'ControlLeft' ) ) wish.y -= 1;
+		if ( wish.lengthSq() > 0 ) wish.normalize();
+
+		const atSurface = this.floating && p.y > surfaceY - 0.45;
+		// at the surface W along a level view keeps you on top; looking down dives
+		if ( atSurface && wish.y > - 0.25 && ! inp.down( 'KeyC' ) ) wish.y = Math.max( wish.y, 0 );
+
+		const sprint = inp.down( 'ShiftLeft' ) || inp.down( 'ShiftRight' );
+		const speed = sprint ? 2.5 : 1.5;
+		const k = 1 - Math.exp( - dt * 3.0 );
+		this.velocity.lerp( wish.multiplyScalar( speed ), k );
+
+		// A swimmer at the surface floats with the head riding the waves; one who dives stays where
+		// they swim to (neutral buoyancy, nothing pulls them back up) until they swim up to the
+		// surface again.
+		const eyeTarget = surfaceY - SWIM_EYE + 0.1; // eyes ~10 cm above the water; waves still wash over
+		const diving = inp.down( 'KeyC' ) || ( inp.down( 'KeyW' ) && this.pitch < - 0.35 ) || wish.y < - 0.1;
+		if ( diving ) this.floating = false;
+		else if ( p.y > eyeTarget - 0.15 ) this.floating = true;
+		if ( this.floating ) {
+
+			p.y += ( eyeTarget - p.y ) * ( 1 - Math.exp( - dt * 5 ) );
+			if ( this.velocity.y > 0 ) this.velocity.y *= 0.5;
+
+		}
+
+		p.addScaledVector( this.velocity, dt );
+		p.y = Math.min( p.y, surfaceY + 0.05 );
+		this.colliders.resolveCapsule( p, RADIUS, 1.0, 0 );
+		const g = this.groundAt( p.x, p.z, p.y + 0.3 );
+		if ( p.y < g + 0.25 ) p.y = g + 0.25;
+
+		// strokes / bubbles
+		this.stepDist += this.velocity.length() * dt;
+		if ( this.stepDist > 1.3 ) {
+
+			this.stepDist = 0;
+			if ( this.audio ) this.audio.swimStroke();
+
+		}
+
+		const under = this.camera.position.y < surfaceY - 0.05;
+		if ( under !== this.wasUnder && this.audio ) {
+
+			if ( under ) this.audio.submerge();
+			else this.audio.emerge();
+
+		}
+
+		this.wasUnder = under;
+
+		// shallow enough to stand -> walk (update() eases the view up to standing height). The mean
+		// level decides, so a passing wave doesn't flip you between swimming and standing.
+		if ( this.waterMean - g < STAND_DEPTH ) {
+
+			this.mode = 'walk';
+			p.y = g;
+			this.velocity.set( this.velocity.x, 0, this.velocity.z );
+
+		}
+
+		// ladders on the pier: climb out when swimming into them
+		if ( this.colliders.boxes ) {
+
+			for ( const b of this.colliders.boxes ) {
+
+				if ( b.tag !== 'ladder' ) continue;
+				if ( Math.hypot( b.center.x - p.x, b.center.z - p.z ) < 1.1 ) {
+
+					this.prompt = { key: 'Space', text: 'Climb ladder' };
+					if ( inp.down( 'Space' ) || inp.down( 'KeyW' ) ) {
+
+						const top = this.colliders.groundHeightAt( b.center.x, b.center.z, 10 );
+						if ( top > p.y ) {
+
+							p.y += dt * 1.6;
+							if ( p.y > top - 1.0 ) {
+
+								// step onto the deck
+								const deck = WORLD.pier.deckHeight;
+								p.set( b.center.x - Math.sign( b.center.x - WORLD.pier.x ) * 1.2, deck, b.center.z );
+								this.mode = 'walk';
+								this.velocity.set( 0, 0, 0 );
+
+							}
+
+						}
+
+					}
+
+					break;
+
+				}
+
+			}
+
+		}
+
+	}
+
+	// ------------------------------------------------------------------ boat
+
+	enterBoat() {
+
+		this.mode = 'boat';
+		this.boat.driven = true;
+		this.boat.moored = false;
+		this.helmYaw = 0;
+		this.helmPitch = - 0.05;
+		this.orbitYaw = this.boat.getYaw() + Math.PI;
+		this.camInit = false;
+		if ( this.audio ) this.audio.engineStart();
+
+	}
+
+	exitBoat() {
+
+		const b = this.boat;
+		b.driven = false;
+		b.throttle = 0;
+		// choose the exit point closest to something walkable (pier deck / sand)
+		let best = null, bestScore = Infinity;
+		for ( const ep of b.model.exitPoints ) {
+
+			const w = b.toWorld( ep, new THREE.Vector3() );
+			const side = w.clone().sub( b.position ).setY( 0 ).normalize().multiplyScalar( 1.4 );
+			const out = w.clone().add( side );
+			const g = this.groundAt( out.x, out.z, w.y + 2.5 );
+			const score = Math.abs( g - w.y ) + ( g < this.query.cpu[ 0 ] - 0.3 ? 5 : 0 );
+			if ( score < bestScore ) { bestScore = score; best = { out, g }; }
+
+		}
+
+		const dock = WORLD.boatDock.position;
+		if ( b.position.distanceTo( dock ) < 14 && b.speed < 1.5 ) {
+
+			b.moored = true;
+			b.mooring.anchor.set( b.position.x, 0, b.position.z );
+			b.mooring.heading = b.getYaw();
+
+		}
+
+		if ( best && bestScore < 1.2 ) {
+
+			this.position.set( best.out.x, best.g, best.out.z );
+			this.mode = 'walk';
+
+		} else {
+
+			const w = b.toWorld( new THREE.Vector3( 2.2, 0, 0 ), new THREE.Vector3() );
+			this.position.set( w.x, this.waterH - 0.2, w.z );
+			this.mode = 'swim';
+			if ( this.audio ) this.audio.splash( 0.8, this.position );
+
+		}
+
+		this.velocity.set( 0, 0, 0 );
+		this.yaw = b.getYaw() + Math.PI;
+		if ( this.audio ) this.audio.engineStop();
+
+	}
+
+	updateBoat( dt ) {
+
+		const inp = this.input;
+		const b = this.boat;
+		const look = inp.consumeLook();
+		const wheel = inp.consumeWheel();
+
+		if ( inp.hit( 'KeyV' ) ) this.camMode = this.camMode === 'first' ? 'third' : 'first';
+		if ( inp.hit( 'KeyE' ) ) {
+
+			this.exitBoat();
+			return;
+
+		}
+
+		let throttle = 0;
+		if ( inp.down( 'KeyW' ) ) throttle = inp.down( 'ShiftLeft' ) ? 1 : 0.7;
+		if ( inp.down( 'KeyS' ) ) throttle = - 0.6;
+		let steer = 0;
+		if ( inp.down( 'KeyA' ) ) steer += 1;
+		if ( inp.down( 'KeyD' ) ) steer -= 1;
+		b.setInput( throttle, steer, dt );
+		this.prompt = { key: 'E', text: 'Leave boat   ·   V  camera' };
+
+		// keep the player attached (for audio / queries)
+		b.toWorld( b.model.helmEye, this.position );
+		this.position.y -= EYE;
+
+		if ( this.camMode === 'first' ) {
+
+			this.helmYaw = THREE.MathUtils.clamp( this.helmYaw - look.x * 0.0022, - 2.2, 2.2 );
+			this.helmPitch = THREE.MathUtils.clamp( this.helmPitch - look.y * 0.0022, - 1.2, 1.0 );
+			const eye = b.toWorld( b.model.helmEye, new THREE.Vector3() );
+			this.camera.position.copy( eye );
+			// head partially stabilises against roll and pitch (feels natural, less nausea)
+			const boatQ = b.quaternion;
+			const yawOnly = new THREE.Quaternion().setFromAxisAngle( new THREE.Vector3( 0, 1, 0 ), b.getYaw() + Math.PI );
+			const base = new THREE.Quaternion().slerpQuaternions( boatQ.clone().multiply( new THREE.Quaternion().setFromAxisAngle( new THREE.Vector3( 0, 1, 0 ), Math.PI ) ), yawOnly, 0.55 );
+			const local = new THREE.Quaternion().setFromEuler( _e.set( this.helmPitch, this.helmYaw, 0 ) );
+			this.camera.quaternion.copy( base ).multiply( local );
+
+		} else {
+
+			this.orbitYaw -= look.x * 0.003;
+			this.orbitPitch = THREE.MathUtils.clamp( this.orbitPitch + look.y * 0.003, - 0.05, 1.2 );
+			this.orbitDist = THREE.MathUtils.clamp( this.orbitDist * ( 1 + wheel * 0.08 ), 6, 40 );
+			// gently swing behind the boat when moving
+			if ( b.speed > 2 && Math.abs( look.x ) < 0.5 ) {
+
+				const behind = b.getYaw() + Math.PI;
+				let d = behind - this.orbitYaw;
+				d = Math.atan2( Math.sin( d ), Math.cos( d ) );
+				this.orbitYaw += d * ( 1 - Math.exp( - dt * 0.8 ) );
+
+			}
+
+			const target = b.toWorld( new THREE.Vector3( 0, 1.4, 0 ), new THREE.Vector3() );
+			const off = new THREE.Vector3(
+				Math.sin( this.orbitYaw ) * Math.cos( this.orbitPitch ),
+				Math.sin( this.orbitPitch ),
+				Math.cos( this.orbitYaw ) * Math.cos( this.orbitPitch )
+			).multiplyScalar( this.orbitDist );
+			const want = target.clone().add( off );
+			want.y = Math.max( want.y, this.waterH + 0.7 );
+			if ( ! this.camInit ) {
+
+				this.camPos.copy( want );
+				this.camInit = true;
+
+			}
+
+			this.camPos.lerp( want, 1 - Math.exp( - dt * 6 ) );
+			this.camera.position.copy( this.camPos );
+			this.camera.lookAt( target );
+
+		}
+
+	}
+
+}

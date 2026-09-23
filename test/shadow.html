@@ -1,0 +1,33 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>shadow test</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}</style></head>
+<body><script type="module">
+import * as THREE from 'three/webgpu';
+import { CSMShadowNode } from 'three/addons/csm/CSMShadowNode.js';
+const q = new URLSearchParams( location.search );
+const rev = q.get( 'rev' ) !== '0';
+const renderer = new THREE.WebGPURenderer( { reversedDepthBuffer: rev } );
+renderer.setSize( innerWidth, innerHeight );
+renderer.shadowMap.enabled = true;
+document.body.appendChild( renderer.domElement );
+await renderer.init();
+const scene = new THREE.Scene();
+scene.background = new THREE.Color( 0x88aacc );
+const camera = new THREE.PerspectiveCamera( 60, innerWidth / innerHeight, 0.06, 60000 );
+camera.position.set( 6, 4, 8 ); camera.lookAt( 0, 1, 0 );
+const sun = new THREE.DirectionalLight( 0xffffff, 3 );
+sun.position.set( 30, 40, 20 );
+sun.castShadow = true;
+sun.shadow.mapSize.set( 2048, 2048 );
+sun.shadow.bias = Number( q.get( 'bias' ) ?? - 0.0004 );
+sun.shadow.normalBias = Number( q.get( 'nb' ) ?? 0.02 );
+if ( q.has( 'csm' ) ) sun.shadow.shadowNode = new CSMShadowNode( sun, { cascades: 3, maxFar: 320, mode: 'practical', lightMargin: 200 } );
+else { sun.shadow.camera.left = - 20; sun.shadow.camera.right = 20; sun.shadow.camera.top = 20; sun.shadow.camera.bottom = - 20; sun.shadow.camera.near = 1; sun.shadow.camera.far = 200; }
+scene.add( sun, sun.target, new THREE.HemisphereLight( 0xaaccff, 0x445544, 1 ) );
+const m = new THREE.MeshStandardNodeMaterial( { color: 0xddccaa, roughness: 0.8 } );
+const box = new THREE.Mesh( new THREE.BoxGeometry( 2, 2, 2 ), m ); box.position.y = 1; box.castShadow = box.receiveShadow = true; scene.add( box );
+const sph = new THREE.Mesh( new THREE.SphereGeometry( 1, 48, 24 ), m ); sph.position.set( - 3, 1, 1 ); sph.castShadow = sph.receiveShadow = true; scene.add( sph );
+const ground = new THREE.Mesh( new THREE.PlaneGeometry( 60, 60 ).rotateX( - Math.PI / 2 ), m ); ground.receiveShadow = true; ground.castShadow = true; scene.add( ground );
+renderer.setAnimationLoop( () => renderer.render( scene, camera ) );
+window.__ok = true;
+</script></body></html>

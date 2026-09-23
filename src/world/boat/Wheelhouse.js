@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { BufferGeometry, CircleGeometry, Float32BufferAttribute, Matrix4, PlaneGeometry, Vector2, Vector3 } from '../../engine/index.js';
 import {
 	slab, loft, fanCap, box, roundedBox, cylinder, rod, sphere, torus, lathe, tube, prepare, mat4, alignY,
 	auxVertices, paintVertices, mergePrepared,
@@ -7,7 +7,7 @@ import { houseHalfWidth, foredeckY, PALETTE } from './HullBuilder.js';
 import { lerp } from './HullLines.js';
 import { buoyGeometry } from './DeckGear.js';
 
-const V = ( x, y, z ) => new THREE.Vector3( x, y, z );
+const V = ( x, y, z ) => new Vector3( x, y, z );
 
 // Wheelhouse dimensions (boat frame)
 export const HOUSE = {
@@ -101,9 +101,9 @@ function area2( poly ) {
 // Quad from four corner points (counter-clockwise seen from the front) with 0..1 or metric UVs.
 function quad( a, b, c, d, uvs = [ 0, 0, 1, 0, 1, 1, 0, 1 ] ) {
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( [ a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z ], 3 ) );
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( [ a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z ], 3 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 	g.setIndex( [ 0, 1, 2, 0, 2, 3 ] );
 	g.computeVertexNormals();
 	return g;
@@ -197,8 +197,8 @@ function buildWalls( kit, L ) {
 function buildWindshield( kit, L ) {
 
 	const { wsBottomY, roofUnderY } = HOUSE;
-	const rake = new THREE.Vector3( 0, 0.76, - 0.25 ).normalize();
-	const normal = new THREE.Vector3( 0, 0.25, 0.76 ).normalize();
+	const rake = new Vector3( 0, 0.76, - 0.25 ).normalize();
+	const normal = new Vector3( 0, 0.25, 0.76 ).normalize();
 	const base = V( 0, wsBottomY, L.houseFront );
 	const vTop = ( roofUnderY - wsBottomY ) / rake.y;
 	const at = ( u, v ) => base.clone().addScaledVector( rake, v ).setX( u );
@@ -339,7 +339,7 @@ function metricUV( g, fn ) {
 
 	}
 
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uv, 2 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( uv, 2 ) );
 
 }
 
@@ -349,7 +349,7 @@ function metricUV( g, fn ) {
 export function panelFrame() {
 
 	const d = HOUSE.dash;
-	const B = new THREE.Vector2( d.zFace, d.yKnee ), C = new THREE.Vector2( d.zTop, d.yTop );
+	const B = new Vector2( d.zFace, d.yKnee ), C = new Vector2( d.zTop, d.yTop );
 	const dir = C.clone().sub( B ).normalize(); // (dz, dy)
 	const along = V( 0, dir.y, dir.x ); // up the panel
 	const normal = V( 0, dir.x, - dir.y ); // toward the helmsman (up and aft)
@@ -394,30 +394,30 @@ function buildConsole( kit, L, parts ) {
 	for ( const [ x, f ] of [ [ - 0.76, 0.72 ], [ - 0.34, 0.72 ], [ - 0.55, 0.9 ], [ - 0.12, 0.5 ], [ 0.02, 0.5 ] ] ) {
 
 		const c = pf.at( x, f ).addScaledVector( pf.normal, 0.012 );
-		const m = new THREE.Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( c );
+		const m = new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( c );
 		const bezel = torus( 0.043, 0.006, 4, 16 );
 		bezel.applyMatrix4( m );
 		kit.add( 'fittings', bezel, STAINLESS );
-		const dial = new THREE.CircleGeometry( 0.042, 20 );
+		const dial = new CircleGeometry( 0.042, 20 );
 		// 3 mm proud of the panel face (was coplanar with it: z-fighting)
-		dial.applyMatrix4( new THREE.Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( c.clone().addScaledVector( pf.normal, 0.001 ) ) );
+		dial.applyMatrix4( new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( c.clone().addScaledVector( pf.normal, 0.001 ) ) );
 		kit.add( 'glow', dial, { color: 0xffffff, rough: 0.2, pattern: 3 } );
 
 	}
 
 	// switch panel with rocker switches
 	const sw = pf.at( 0.55, 0.45 ).addScaledVector( pf.normal, 0.012 );
-	const swm = new THREE.Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw );
+	const swm = new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw );
 	const swPlate = box( 0.34, 0.1, 0.008 );
 	swPlate.applyMatrix4( swm );
 	kit.add( 'fittings', swPlate, { color: 0x2d3036, rough: 0.5 } );
 	for ( let i = 0; i < 6; i ++ ) {
 
 		const r = box( 0.03, 0.045, 0.015 );
-		r.applyMatrix4( new THREE.Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw.clone().add( V( - 0.13 + i * 0.052, 0, 0 ) ).addScaledVector( pf.normal, 0.008 ) ) );
+		r.applyMatrix4( new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw.clone().add( V( - 0.13 + i * 0.052, 0, 0 ) ).addScaledVector( pf.normal, 0.008 ) ) );
 		kit.add( 'fittings', r, { color: 0x111214, rough: 0.4 } );
 		const led = box( 0.008, 0.008, 0.004 );
-		led.applyMatrix4( new THREE.Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw.clone().add( V( - 0.13 + i * 0.052, 0, 0 ) ).addScaledVector( pf.along, 0.035 ).addScaledVector( pf.normal, 0.006 ) ) );
+		led.applyMatrix4( new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw.clone().add( V( - 0.13 + i * 0.052, 0, 0 ) ).addScaledVector( pf.along, 0.035 ).addScaledVector( pf.normal, 0.006 ) ) );
 		kit.add( 'glow', led, { color: i % 3 === 0 ? 0x33ff66 : 0xff5522, rough: 0.3, pattern: 6 } );
 
 	}
@@ -469,8 +469,8 @@ function buildConsole( kit, L, parts ) {
 		const mount = box( 0.1, 0.05, 0.08 );
 		mount.translate( x, d.yTop + 0.035, 1.3 );
 		kit.add( 'fittings', mount, BLACK_PLASTIC );
-		const screen = new THREE.PlaneGeometry( w - 0.05, h - 0.06 );
-		screen.applyMatrix4( new THREE.Matrix4().makeRotationY( Math.PI ) );
+		const screen = new PlaneGeometry( w - 0.05, h - 0.06 );
+		screen.applyMatrix4( new Matrix4().makeRotationY( Math.PI ) );
 		screen.applyMatrix4( mat4( 0, 0.012, - 0.037 ) ); // 2 mm proud of the bezel face
 		screen.applyMatrix4( bodyM );
 		// PlaneGeometry uvs are flipped horizontally after the Y rotation; restore them
@@ -487,19 +487,19 @@ function buildConsole( kit, L, parts ) {
 	kit.add( 'fittings', oc, { color: 0x24262a, rough: 0.6 } );
 	const face = mat4( - 0.15, oy, oz, - 0.25, 0, 0 ); // aft face tilted down toward the helm
 	const vhf = box( 0.2, 0.06, 0.02 );
-	vhf.applyMatrix4( new THREE.Matrix4().makeTranslation( - 0.18, 0, - 0.155 ) );
+	vhf.applyMatrix4( new Matrix4().makeTranslation( - 0.18, 0, - 0.155 ) );
 	vhf.applyMatrix4( face );
 	kit.add( 'fittings', vhf, { color: 0x111214, rough: 0.4 } );
-	const lcd = new THREE.PlaneGeometry( 0.09, 0.03 );
-	lcd.applyMatrix4( new THREE.Matrix4().makeRotationY( Math.PI ) );
-	lcd.applyMatrix4( new THREE.Matrix4().makeTranslation( - 0.2, 0.005, - 0.168 ) ); // 3 mm proud of the radio face
+	const lcd = new PlaneGeometry( 0.09, 0.03 );
+	lcd.applyMatrix4( new Matrix4().makeRotationY( Math.PI ) );
+	lcd.applyMatrix4( new Matrix4().makeTranslation( - 0.2, 0.005, - 0.168 ) ); // 3 mm proud of the radio face
 	lcd.applyMatrix4( face );
 	kit.add( 'glow', lcd, { color: 0x7dff9a, rough: 0.2, pattern: 6 } );
 	for ( const k of [ - 0.06, 0.1, 0.26 ] ) {
 
 		const knob = cylinder( 0.012, 0.012, 0.02, 10 );
-		knob.applyMatrix4( new THREE.Matrix4().makeRotationX( Math.PI / 2 ) );
-		knob.applyMatrix4( new THREE.Matrix4().makeTranslation( k, 0, - 0.16 ) );
+		knob.applyMatrix4( new Matrix4().makeRotationX( Math.PI / 2 ) );
+		knob.applyMatrix4( new Matrix4().makeTranslation( k, 0, - 0.16 ) );
 		knob.applyMatrix4( face );
 		kit.add( 'fittings', knob, STAINLESS );
 
@@ -658,7 +658,7 @@ function buildRoofGear( kit, L, parts ) {
 	const head = cylinder( 0.065, 0.06, 0.15, 16 );
 	head.applyMatrix4( mat4( sx, syy + 0.17, szz, Math.PI / 2, 0, 0 ) );
 	kit.add( 'fittings', head, STAINLESS );
-	const sl = new THREE.CircleGeometry( 0.058, 16 );
+	const sl = new CircleGeometry( 0.058, 16 );
 	sl.translate( sx, syy + 0.17, szz + 0.0755 );
 	kit.add( 'glow', sl, { color: 0xfff1d6, rough: 0.2, pattern: 4 } );
 	const horn = lathe( [ [ 0.0, 0 ], [ 0.018, 0.0 ], [ 0.016, 0.1 ], [ 0.024, 0.17 ], [ 0.05, 0.22 ], [ 0.046, 0.222 ], [ 0.0, 0.2 ] ], 16 );
@@ -684,7 +684,7 @@ function buildRoofGear( kit, L, parts ) {
 		const fl = roundedBox( 0.13, 0.07, 0.08, 0.01, 1 );
 		fl.translate( s * 0.55, HOUSE.roofUnderY - 0.035, HOUSE.roofZ0 + 0.14 );
 		kit.add( 'fittings', fl, BLACK_PLASTIC );
-		const lens = new THREE.PlaneGeometry( 0.11, 0.06 );
+		const lens = new PlaneGeometry( 0.11, 0.06 );
 		lens.applyMatrix4( mat4( s * 0.55, HOUSE.roofUnderY - 0.071, HOUSE.roofZ0 + 0.14, Math.PI / 2 + 0.35, 0, 0 ) );
 		kit.add( 'glow', lens, { color: 0xfff1d6, rough: 0.2, pattern: 4 } );
 
@@ -731,10 +731,10 @@ export function wheelGeometry() {
 	}
 
 	const hub = lathe( [ [ 0, - 0.03 ], [ 0.05, - 0.03 ], [ 0.058, - 0.012 ], [ 0.058, 0.012 ], [ 0.05, 0.028 ], [ 0.0, 0.03 ] ], 20 );
-	hub.applyMatrix4( new THREE.Matrix4().makeRotationX( Math.PI / 2 ) );
+	hub.applyMatrix4( new Matrix4().makeRotationX( Math.PI / 2 ) );
 	list.push( prepare( hub, { ...wood, color: 0xe8b898 } ) );
 	const cap = sphere( 0.032, 16, 6, 0, Math.PI * 2, 0, Math.PI / 2 );
-	cap.applyMatrix4( new THREE.Matrix4().makeRotationX( - Math.PI / 2 ) );
+	cap.applyMatrix4( new Matrix4().makeRotationX( - Math.PI / 2 ) );
 	cap.translate( 0, 0, - 0.028 );
 	list.push( prepare( cap, { color: 0xc8a050, rough: 0.25, metal: 1, pattern: 1 } ) );
 	return mergePrepared( list );
@@ -751,7 +751,7 @@ export function throttleGeometry() {
 	knob.translate( 0, 0.165, 0.016 );
 	list.push( prepare( knob, BLACK_PLASTIC ) );
 	const boss = cylinder( 0.02, 0.02, 0.05, 12 );
-	boss.applyMatrix4( new THREE.Matrix4().makeRotationZ( Math.PI / 2 ) );
+	boss.applyMatrix4( new Matrix4().makeRotationZ( Math.PI / 2 ) );
 	list.push( prepare( boss, STAINLESS ) );
 	return mergePrepared( list );
 

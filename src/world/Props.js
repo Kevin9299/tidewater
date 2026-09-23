@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Color, Matrix4, Vector3 } from '../engine/index.js';
 import { Builder, mat4, gridPart, slabPart, sagPoints } from './village/GeoBuilder.js';
 import { FishProps } from './fish/FishProps.js';
 import { mulberry32 } from '../util/Noise.js';
@@ -7,8 +7,8 @@ import { mulberry32 } from '../util/Noise.js';
 // (in B's current local frame) using the shared material keys:
 //   wood, roofMetal, thatch, hard, glass, stone, rope, net, cloth, flag
 
-const _col = new THREE.Color();
-const _v = new THREE.Vector3();
+const _col = new Color();
+const _v = new Vector3();
 
 // sRGB hex -> linear [r, g, b]
 export const lin = ( hex ) => {
@@ -137,13 +137,13 @@ export function ropeCoil( B, x, y, z, r0 = 0.09, r1 = 0.32, turns = 5, seed = 0.
 		const t = i / n;
 		const a = t * turns * Math.PI * 2;
 		const r = r0 + ( r1 - r0 ) * t;
-		pts.push( new THREE.Vector3( x + Math.cos( a ) * r, y + 0.02 + Math.sin( a * 3.1 ) * 0.004, z + Math.sin( a ) * r ) );
+		pts.push( new Vector3( x + Math.cos( a ) * r, y + 0.02 + Math.sin( a * 3.1 ) * 0.004, z + Math.sin( a ) * r ) );
 
 	}
 
 	// loose tail
 	const last = pts[ pts.length - 1 ];
-	pts.push( new THREE.Vector3( last.x + 0.25, y + 0.02, last.z + 0.3 ) );
+	pts.push( new Vector3( last.x + 0.25, y + 0.02, last.z + 0.3 ) );
 	B.tube( 'rope', pts, 0.02, { radial: 4, tint, data: [ seed, 0, 0, 0 ] } );
 	// a second, smaller layer on top
 	const pts2 = [];
@@ -151,7 +151,7 @@ export function ropeCoil( B, x, y, z, r0 = 0.09, r1 = 0.32, turns = 5, seed = 0.
 
 		const a = i / 24 * Math.PI * 4 + 1.3;
 		const r = r0 + 0.05 + ( r1 - r0 - 0.1 ) * i / 24;
-		pts2.push( new THREE.Vector3( x + Math.cos( a ) * r, y + 0.055, z + Math.sin( a ) * r ) );
+		pts2.push( new Vector3( x + Math.cos( a ) * r, y + 0.055, z + Math.sin( a ) * r ) );
 
 	}
 
@@ -293,7 +293,7 @@ export function bucket( B, x, y, z, tint = C.blue, seed = 0.5 ) {
 // Fish, lobsters and their displays: modelled and drawn by fish/FishProps.js (one instanced mesh
 // with the fish material, collected on the builder as B.fishProps).
 
-const _fm = new THREE.Matrix4();
+const _fm = new Matrix4();
 const fishProps = ( B ) => B.fishProps || ( B.fishProps = new FishProps() );
 
 // A fish in B's local frame. o.pose:
@@ -362,12 +362,12 @@ export function lobster( B, x, y, z, ry = 0, len = 0.3, seed = 0.5, rx = 0 ) {
 // Twine from (a) down to a loop around a fish's tail stalk at (b).
 export function fishTwine( B, a, b, seed = 0.5, loop = 0.018 ) {
 
-	B.tube( 'rope', [ new THREE.Vector3( a[ 0 ], a[ 1 ], a[ 2 ] ), new THREE.Vector3( b[ 0 ], b[ 1 ] + loop * 0.5, b[ 2 ] ) ], 0.0035, { radial: 3, tint: C.rope, data: [ seed, 0, 0, 0 ] } );
+	B.tube( 'rope', [ new Vector3( a[ 0 ], a[ 1 ], a[ 2 ] ), new Vector3( b[ 0 ], b[ 1 ] + loop * 0.5, b[ 2 ] ) ], 0.0035, { radial: 3, tint: C.rope, data: [ seed, 0, 0, 0 ] } );
 	const pts = [];
 	for ( let i = 0; i <= 8; i ++ ) {
 
 		const t = i / 8 * Math.PI * 2;
-		pts.push( new THREE.Vector3( b[ 0 ] + Math.cos( t ) * loop, b[ 1 ] + Math.sin( t * 2 ) * 0.003, b[ 2 ] + Math.sin( t ) * loop * 0.6 ) );
+		pts.push( new Vector3( b[ 0 ] + Math.cos( t ) * loop, b[ 1 ] + Math.sin( t * 2 ) * 0.003, b[ 2 ] + Math.sin( t ) * loop * 0.6 ) );
 
 	}
 
@@ -405,8 +405,8 @@ export function cleaningTable( B, x, y, z, ry = 0, seed = 0.5 ) {
 	fish( B, 0.21, board, 0.035, { ...cut, kind: 'head', ry: 0.4 } );
 	// fillet knife: steel blade, dark wooden handle with brass rivets
 	B.pushAt( 0.26, board + 0.002, 0.13, - 0.45 );
-	const blade = [ [ 0, 0.011 ], [ 0.13, 0.009 ], [ 0.175, 0.002 ], [ 0.19, - 0.004 ], [ 0.12, - 0.009 ], [ 0, - 0.01 ] ].map( ( p ) => new THREE.Vector3( p[ 0 ], 0, p[ 1 ] ) );
-	B.slab( 'hard', blade, 0.0016, { up: new THREE.Vector3( 0, 1, 0 ), tint: lin( 0xc8ccd0 ), data: HARD( seed, 0.05, 0.95, 0.18 ) } );
+	const blade = [ [ 0, 0.011 ], [ 0.13, 0.009 ], [ 0.175, 0.002 ], [ 0.19, - 0.004 ], [ 0.12, - 0.009 ], [ 0, - 0.01 ] ].map( ( p ) => new Vector3( p[ 0 ], 0, p[ 1 ] ) );
+	B.slab( 'hard', blade, 0.0016, { up: new Vector3( 0, 1, 0 ), tint: lin( 0xc8ccd0 ), data: HARD( seed, 0.05, 0.95, 0.18 ) } );
 	B.box( 'wood', - 0.055, 0.009, 0, 0.11, 0.018, 0.024, { grain: 0, tint: C.black, data: WOOD( seed, 0.2, 0.8, 0 ) } );
 	for ( const rx of [ - 0.085, - 0.03 ] ) B.cyl( 'hard', rx, 0.0175, 0, 0.0035, 0.0035, 0.002, { segs: 5, tint: lin( 0xb08d3a ), data: HARD( seed, 0.1, 0.9, 0.3 ) } );
 	B.pop();
@@ -415,11 +415,11 @@ export function cleaningTable( B, x, y, z, ry = 0, seed = 0.5 ) {
 	for ( let i = 0; i < 9; i ++ ) {
 
 		const a = i / 9 * Math.PI * 2;
-		smear.push( new THREE.Vector3( 0.215 + Math.cos( a ) * 0.05 * ( 1 + 0.25 * Math.sin( a * 3 + seed * 9 ) ), board + 0.0005, 0.04 + Math.sin( a ) * 0.028 ) );
+		smear.push( new Vector3( 0.215 + Math.cos( a ) * 0.05 * ( 1 + 0.25 * Math.sin( a * 3 + seed * 9 ) ), board + 0.0005, 0.04 + Math.sin( a ) * 0.028 ) );
 
 	}
 
-	B.slab( 'hard', smear, 0.0008, { up: new THREE.Vector3( 0, 1, 0 ), tint: lin( 0x4a0808 ), data: HARD( seed, 0, 0, 0.15 ) } );
+	B.slab( 'hard', smear, 0.0008, { up: new Vector3( 0, 1, 0 ), tint: lin( 0x4a0808 ), data: HARD( seed, 0, 0, 0.15 ) } );
 	// a blackfin tuna waiting its turn
 	fish( B, - 0.33, 0.9025, - 0.06, { species: 'tuna', len: 0.52, ry: 2.75, sag: - 0.12, curl: 0.05, jaw: 0.3, seed: seed + 0.3 } );
 	bucket( B, - 0.3, 0.265, 0.05, C.white, seed );
@@ -544,8 +544,8 @@ export function rowboat( B, x, y, z, ry = 0, o = {} ) {
 				const p = secPoint( t, s );
 				const pt = secPoint( Math.min( 1, t + eps ), s ), pt2 = secPoint( Math.max( 0, t - eps ), s );
 				const ps = secPoint( t, Math.min( 1, s + eps ) ), ps2 = secPoint( t, Math.max( - 1, s - eps ) );
-				const dt = new THREE.Vector3( pt[ 0 ] - pt2[ 0 ], pt[ 1 ] - pt2[ 1 ], pt[ 2 ] - pt2[ 2 ] );
-				const ds = new THREE.Vector3( ps[ 0 ] - ps2[ 0 ], ps[ 1 ] - ps2[ 1 ], ps[ 2 ] - ps2[ 2 ] );
+				const dt = new Vector3( pt[ 0 ] - pt2[ 0 ], pt[ 1 ] - pt2[ 1 ], pt[ 2 ] - pt2[ 2 ] );
+				const ds = new Vector3( ps[ 0 ] - ps2[ 0 ], ps[ 1 ] - ps2[ 1 ], ps[ 2 ] - ps2[ 2 ] );
 				const n = dt.clone().cross( ds ).normalize();
 				// make the normal point outward (away from the boat centerline / downward)
 				const cx = p[ 0 ], cy = p[ 1 ] - D * 0.9;
@@ -568,13 +568,13 @@ export function rowboat( B, x, y, z, ry = 0, o = {} ) {
 	} );
 
 	const waterline = D * 0.42;
-	B.add( 'wood', hullPart( outer, false ), new THREE.Matrix4(),
+	B.add( 'wood', hullPart( outer, false ), new Matrix4(),
 		( px, py ) => ( py < waterline ? bottomCol : hullCol ),
 		WOOD( seed, 0.5, 0.7, 1 ) );
 	if ( ! upside || o.interior !== false ) {
 
 		buildSurface( 0.03, inner );
-		B.add( 'wood', hullPart( inner, true ), new THREE.Matrix4(), lin( 0xd8d2c0 ), WOOD( seed + 0.3, 0.55, 0.6, 5 ) );
+		B.add( 'wood', hullPart( inner, true ), new Matrix4(), lin( 0xd8d2c0 ), WOOD( seed + 0.3, 0.55, 0.6, 5 ) );
 
 	}
 
@@ -586,7 +586,7 @@ export function rowboat( B, x, y, z, ry = 0, o = {} ) {
 
 			const t = 0.02 + 0.96 * i / NT;
 			const p = secPoint( t, side );
-			pts.push( new THREE.Vector3( p[ 0 ] - side * 0.012, p[ 1 ] + 0.01, p[ 2 ] ) );
+			pts.push( new Vector3( p[ 0 ] - side * 0.012, p[ 1 ] + 0.01, p[ 2 ] ) );
 
 		}
 
@@ -599,7 +599,7 @@ export function rowboat( B, x, y, z, ry = 0, o = {} ) {
 
 		const t = 0.02 + 0.96 * i / NT;
 		const p = secPoint( t, 0 );
-		keelPts.push( new THREE.Vector3( 0, p[ 1 ] - 0.015, p[ 2 ] ) );
+		keelPts.push( new Vector3( 0, p[ 1 ] - 0.015, p[ 2 ] ) );
 
 	}
 
@@ -608,11 +608,11 @@ export function rowboat( B, x, y, z, ry = 0, o = {} ) {
 	for ( let j = 0; j <= 10; j ++ ) {
 
 		const p = secPoint( 0.02, - 1 + 2 * j / 10 );
-		tr.push( new THREE.Vector3( p[ 0 ], p[ 1 ], p[ 2 ] ) );
+		tr.push( new Vector3( p[ 0 ], p[ 1 ], p[ 2 ] ) );
 
 	}
 
-	B.add( 'wood', slabPart( tr, 0.035, new THREE.Vector3( 1, 0, 0 ), new THREE.Vector3( 0, 0, - 1 ) ), new THREE.Matrix4(), hullCol, WOOD( seed + 0.4, 0.55, 0.7, 6 ) );
+	B.add( 'wood', slabPart( tr, 0.035, new Vector3( 1, 0, 0 ), new Vector3( 0, 0, - 1 ) ), new Matrix4(), hullCol, WOOD( seed + 0.4, 0.55, 0.7, 6 ) );
 
 	if ( ! upside ) {
 
@@ -650,7 +650,7 @@ export function wreck( B, x, y, z, ry, rand, o = {} ) {
 	for ( let i = 0; i <= 10; i ++ ) {
 
 		const t = i / 10;
-		keel.push( new THREE.Vector3( 0, 0.12 * Math.pow( 2 * t - 1, 4 ) + ( t > 0.85 ? ( t - 0.85 ) * 3.5 : 0 ), ( t - 0.5 ) * L ) );
+		keel.push( new Vector3( 0, 0.12 * Math.pow( 2 * t - 1, 4 ) + ( t > 0.85 ? ( t - 0.85 ) * 3.5 : 0 ), ( t - 0.5 ) * L ) );
 
 	}
 
@@ -670,7 +670,7 @@ export function wreck( B, x, y, z, ry, rand, o = {} ) {
 
 				const a = k / 6 * keep;
 				const ang = a * Math.PI / 2;
-				pts.push( new THREE.Vector3( side * half * Math.sin( ang ), D * ( 1 - Math.cos( ang ) ) * 1.05 + 0.05, zz + rand.range( - 0.02, 0.02 ) ) );
+				pts.push( new Vector3( side * half * Math.sin( ang ), D * ( 1 - Math.cos( ang ) ) * 1.05 + 0.05, zz + rand.range( - 0.02, 0.02 ) ) );
 
 			}
 
@@ -730,7 +730,7 @@ export function netRack( B, x, gy, z, ry, len = 3.2, netTint = lin( 0x3f6f5f ), 
 		return { p: [ xx, yy, zz ], n: [ 0, 0.2, side ], uv: [ xx, v * drop * 2 ] };
 
 	} );
-	B.add( 'net', part, new THREE.Matrix4(), netTint, ( px, py ) => [ seed, Math.min( 1, Math.max( 0, ( top - py ) / drop ) ) * 0.8, 0.045, 0 ] );
+	B.add( 'net', part, new Matrix4(), netTint, ( px, py ) => [ seed, Math.min( 1, Math.max( 0, ( top - py ) / drop ) ) * 0.8, 0.045, 0 ] );
 	// float line along the bottom edges
 	for ( const side of [ - 1, 1 ] ) {
 
@@ -843,7 +843,7 @@ export function fence( B, pts, groundFn, style = 'picket', tint = C.white, seed 
 			const a = toWorld( x0, z0 ), b = toWorld( x1, z1 );
 			const cx = ( a.x + b.x ) / 2, cz = ( a.z + b.z ) / 2;
 			const g = Math.max( groundFn( x0, z0 ), groundFn( x1, z1 ) );
-			colliders.addBox( new THREE.Vector3( cx, g + 0.5, cz ), new THREE.Vector3( 0.06, 0.6, L / 2 ), Math.atan2( b.x - a.x, b.z - a.z ), { tag: 'fence' } );
+			colliders.addBox( new Vector3( cx, g + 0.5, cz ), new Vector3( 0.06, 0.6, L / 2 ), Math.atan2( b.x - a.x, b.z - a.z ), { tag: 'fence' } );
 
 		}
 
@@ -919,7 +919,7 @@ export function flagPole( B, x, gy, z, h = 5, flagTint = C.red, seed = 0.5 ) {
 		return { p: [ a, yy, 0 ], n: [ 0, 0, 1 ], uv: [ a, j / 3 * hh ] };
 
 	} );
-	const m = B.frame.clone().invert().multiply( new THREE.Matrix4().makeTranslation( w.x, 0, w.z ) );
+	const m = B.frame.clone().invert().multiply( new Matrix4().makeTranslation( w.x, 0, w.z ) );
 	B.add( 'flag', part, m, flagTint, ( px ) => [ seed, px, w.x, w.z ] );
 
 }
@@ -929,7 +929,7 @@ export function laundryLine( B, a, b, rand, colors ) {
 
 	const pts = sagPoints( a, b, 0.18, 10 );
 	B.tube( 'rope', pts, 0.006, { radial: 3, tint: C.white, data: [ rand.next(), 0, 0, 0 ] } );
-	const dir = new THREE.Vector3( b[ 0 ] - a[ 0 ], 0, b[ 2 ] - a[ 2 ] ).normalize();
+	const dir = new Vector3( b[ 0 ] - a[ 0 ], 0, b[ 2 ] - a[ 2 ] ).normalize();
 	const yaw = Math.atan2( dir.x, dir.z ) - Math.PI / 2;
 	const n = rand.int( 3, 5 );
 	for ( let i = 0; i < n; i ++ ) {
@@ -1026,11 +1026,11 @@ function buildTrapProto( B ) {
 		for ( let i = 0; i <= 10; i ++ ) {
 
 			const a = i / 10 * Math.PI;
-			pts.push( new THREE.Vector3( sx, 0.05 + Math.sin( a ) * ( R - 0.01 ), Math.cos( a ) * ( R - 0.01 ) ) );
+			pts.push( new Vector3( sx, 0.05 + Math.sin( a ) * ( R - 0.01 ), Math.cos( a ) * ( R - 0.01 ) ) );
 
 		}
 
-		B.add( 'net', slabPart( pts, 0.0, new THREE.Vector3( 0, 0, 1 ), new THREE.Vector3( 1, 0, 0 ) ), new THREE.Matrix4(), lin( 0x4a6a58 ), [ 0.5, 0, 0.035, 0 ] );
+		B.add( 'net', slabPart( pts, 0.0, new Vector3( 0, 0, 1 ), new Vector3( 1, 0, 0 ) ), new Matrix4(), lin( 0x4a6a58 ), [ 0.5, 0, 0.035, 0 ] );
 
 	}
 
@@ -1052,7 +1052,7 @@ export class InstancedProps {
 			trap: this._proto( buildTrapProto ),
 		};
 		this.counts = { barrel: 0, crate: 0, trap: 0 };
-		this._m = new THREE.Matrix4();
+		this._m = new Matrix4();
 
 	}
 

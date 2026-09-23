@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Color, Matrix4, Vector3 } from '../../engine/index.js';
 import { slabPart, quad01Part, gridPart } from './GeoBuilder.js';
 import {
 	WOOD, HARD, C, lin, wallLantern, lantern, buoyString, waterTank, woodpile, rowboat, oar, flagPole,
@@ -10,11 +10,11 @@ import { mulberry32 } from '../../util/Noise.js';
 // plus a boathouse and a market stall. All geometry goes into a GeoBuilder in the building's
 // local frame (x across the facade, +z = front, y = world height).
 
-const UP = new THREE.Vector3( 0, 1, 0 );
-const V3 = ( x, y, z ) => new THREE.Vector3( x, y, z );
-const _v = new THREE.Vector3();
-const _h = new THREE.Vector3();
-const WARM = new THREE.Color( 1.0, 0.68, 0.38 );
+const UP = new Vector3( 0, 1, 0 );
+const V3 = ( x, y, z ) => new Vector3( x, y, z );
+const _v = new Vector3();
+const _h = new Vector3();
+const WARM = new Color( 1.0, 0.68, 0.38 );
 
 function frameFns( terrain, x, z, yaw ) {
 
@@ -565,7 +565,7 @@ export function buildHouse( ctx, s ) {
 				return { p: [ px + outX * o, yy, pz + outZ * o ], n: [ outX, 0.2, outZ ], uv: [ j === 0 ? - hang : 0.2, tt * L ] };
 
 			} );
-			B.add( 'thatch', part, new THREE.Matrix4(), [ 0.95, 0.92, 0.88 ], [ rand.next(), ( s.thatchAge ?? 0.4 ) + 0.1, 0, 0 ] );
+			B.add( 'thatch', part, new Matrix4(), [ 0.95, 0.92, 0.88 ], [ rand.next(), ( s.thatchAge ?? 0.4 ) + 0.1, 0, 0 ] );
 
 		};
 
@@ -659,7 +659,7 @@ export function buildHouse( ctx, s ) {
 
 	}
 
-	if ( litWindows.length ) lights.push( { position: litWindows[ 0 ], color: new THREE.Color( 1.0, 0.62, 0.32 ), intensity: 1.6, kind: 'window' } );
+	if ( litWindows.length ) lights.push( { position: litWindows[ 0 ], color: new Color( 1.0, 0.62, 0.32 ), intensity: 1.6, kind: 'window' } );
 
 	// ------------------------------------------------------------- porch or stoop
 	const porchPaint = s.porchPaint || null;
@@ -738,7 +738,7 @@ export function buildHouse( ctx, s ) {
 				return { p: [ px, yy, zEnd + ( j === 0 ? 0.04 : 0 ) ], n: [ 0, 0.2, 1 ], uv: [ j === 0 ? - hang : 0.2, px ] };
 
 			} );
-			B.add( 'thatch', part, new THREE.Matrix4(), [ 0.95, 0.92, 0.88 ], [ rand.next(), ( s.thatchAge ?? 0.4 ) + 0.1, 0, 0 ] );
+			B.add( 'thatch', part, new Matrix4(), [ 0.95, 0.92, 0.88 ], [ rand.next(), ( s.thatchAge ?? 0.4 ) + 0.1, 0, 0 ] );
 
 		}
 
@@ -817,7 +817,7 @@ export function buildHouse( ctx, s ) {
 
 			} );
 			const ns = rand.next();
-			B.add( 'net', netPart, new THREE.Matrix4(), s.railNet, ( px, py ) => [ ns, Math.min( 1, Math.max( 0, porchY + 0.9 - py ) ) * 0.5, 0.04, 0 ] );
+			B.add( 'net', netPart, new Matrix4(), s.railNet, ( px, py ) => [ ns, Math.min( 1, Math.max( 0, porchY + 0.9 - py ) ) * 0.5, 0.04, 0 ] );
 
 		}
 
@@ -1136,7 +1136,7 @@ export function buildBoathouse( ctx, s ) {
 		return { p: [ - w / 2 + 0.16 + Math.sin( u * 12 + v * 3 ) * 0.03, yE - 0.35 - v * 1.6 + sag * 0.3, pz + Math.sin( v * 5 ) * 0.05 ], n: [ 1, 0, 0 ], uv: [ u * 2.4, v * 1.6 ] };
 
 	} );
-	B.add( 'net', netPart, new THREE.Matrix4(), lin( 0x4f7a6a ), ( px, py ) => [ 0.3, Math.min( 1, Math.max( 0, ( yE - 0.35 - py ) / 1.6 ) ) * 0.4, 0.04, 0 ] );
+	B.add( 'net', netPart, new Matrix4(), lin( 0x4f7a6a ), ( px, py ) => [ 0.3, Math.min( 1, Math.max( 0, ( yE - 0.35 - py ) / 1.6 ) ) * 0.4, 0.04, 0 ] );
 	const lp = lantern( B, 0, yR - 0.25, 0.8, rand.next() );
 	lights.push( { position: B.toWorld( lp[ 0 ], lp[ 1 ], lp[ 2 ] ), color: WARM.clone(), intensity: 3, kind: 'lantern' } );
 

@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 
 // Beach critters sharing one template: ghost crab, hermit crab (in a turban shell) and the crab
 // burrow (a dark hole in a fan of dug-out sand).

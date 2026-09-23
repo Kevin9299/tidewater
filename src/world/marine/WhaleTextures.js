@@ -1,4 +1,5 @@
-import * as THREE from 'three/webgpu';
+import { Texture } from '../../engine/gpu/Texture.js';
+import { generateMipmaps } from '../../engine/gpu/Mipmaps.js';
 
 // Minimal PNG decoder (8-bit RGBA, non-interlaced, all five filters) built on DecompressionStream,
 // so the whale's baked maps load identically in the browser and in headless tests, and upload
@@ -71,15 +72,18 @@ export async function loadTexture( url, srgb ) {
 
 	const buf = await fetch( url ).then( ( r ) => r.arrayBuffer() );
 	const img = await decodePNG( buf );
-	const tex = new THREE.DataTexture( img.data, img.width, img.height, THREE.RGBAFormat, THREE.UnsignedByteType );
-	tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-	tex.flipY = false;
-	tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-	tex.magFilter = THREE.LinearFilter;
-	tex.minFilter = THREE.LinearMipmapLinearFilter;
-	tex.generateMipmaps = true;
-	tex.anisotropy = 8;
-	tex.needsUpdate = true;
+	// sampled with the shared anisotropic clamp sampler (was ClampToEdge, trilinear, anisotropy 8)
+	const tex = new Texture( {
+		label: url.split( '/' ).pop(),
+		width: img.width, height: img.height,
+		format: srgb ? 'rgba8unorm-srgb' : 'rgba8unorm',
+		mips: true,
+		usage: [ 'sample', 'copyDst' ],
+		sampler: 'anisoClamp',
+		data: img.data,
+	} );
+	tex.getGPU();
+	generateMipmaps( tex );
 	return tex;
 
 }

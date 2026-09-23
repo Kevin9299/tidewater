@@ -1,8 +1,8 @@
-import * as THREE from 'three/webgpu';
+import { Matrix4, Vector3 } from '../../engine/index.js';
 import { lathe, fanCap, gridSurface, orientTowards, prepare, mergePrepared, cylinder } from './GeoKit.js';
 import { PALETTE } from './HullBuilder.js';
 
-const V = ( x, y, z ) => new THREE.Vector3( x, y, z );
+const V = ( x, y, z ) => new Vector3( x, y, z );
 
 // Propeller hub centre (boat frame) and rudder stock pivot.
 export const PROP = { position: V( 0, - 0.53, - 3.3 ), radius: 0.21, blades: 4, pitch: 0.42 };
@@ -18,7 +18,7 @@ export function propellerGeometry() {
 	const list = [];
 
 	const hub = lathe( [ [ 0, - 0.09 ], [ 0.015, - 0.085 ], [ 0.03, - 0.068 ], [ 0.043, - 0.04 ], [ 0.048, 0.0 ], [ 0.047, 0.04 ], [ 0.042, 0.06 ], [ 0, 0.06 ] ], 18 );
-	hub.applyMatrix4( new THREE.Matrix4().makeRotationX( Math.PI / 2 ) );
+	hub.applyMatrix4( new Matrix4().makeRotationX( Math.PI / 2 ) );
 	list.push( prepare( hub, BRONZE ) );
 
 	const rh = 0.042;

@@ -1,40 +1,19 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, If, float, int, vec2, vec3, vec4, normalize, mix, smoothstep, saturate, clamp, max, min, sin, dot, sqrt, pow, fract,
-	positionWorld, positionGeometry, attribute, transformNormalToView, uniform, length, texture, fwidth, dFdx,
-	dFdy, cameraPosition,
-} from 'three/tsl';
+import { Mesh, Vector2, Vector3 } from '../engine/index.js';
+import { ShaderModule } from '../engine/gpu/Shader.js';
 import { CDLOD } from '../core/CDLOD.js';
 import { standard } from '../materials/Materials.js';
-import { SceneLightingModel } from '../materials/SceneLighting.js';
-import { G } from '../core/Globals.js';
+import { G } from '../engine/render/Frame.js';
 import { WORLD } from './WorldLayout.js';
-import { srgb, rot2, perturbNormal, rockSurface, saturation, meadowTone, MEADOW } from './terrain/TerrainShading.js';
-import { gustAt, windStrength } from './vegetation/VegNodes.js';
-import { FADE_T0 as GRASS_FADE } from './vegetation/GrassField.js';
+import { srgb, rot2, terrainShadingModule } from './terrain/TerrainShading.js';
 
-export { perturbNormal };
+// = GrassField FADE_T0 (vegetation/GrassField.js): tier 0 blades drop out at random distances in
+// this range. Kept as a literal so the terrain doesn't pull in the grass field's shaders.
+const GRASS_FADE = [ 62, 87 ];
 
-// Multiplies the key directional light by the soft heightfield sun shadow (long hill shadows
-// beyond the shadow map range and from terrain outside the view).
-export class TerrainLightingModel extends SceneLightingModel {
-
-	constructor( material, sunShadow, grass = null ) {
-
-		super( material );
-		this.sunShadow = grass ? sunShadow.mul( grass ) : sunShadow;
-
-	}
-
-	direct( data, builder ) {
-
-		const light = data.lightNode && data.lightNode.light;
-		if ( light && light.isDirectionalLight ) data = { ...data, lightColor: data.lightColor.mul( this.sunShadow ) };
-		super.direct( data, builder );
-
-	}
-
-}
+// The former TerrainLightingModel (multiplies the key directional light by the soft heightfield
+// sun shadow: long hill shadows beyond the shadow map range and from terrain outside the view) is
+// `terrainGPU.sunModulationModule` + the define MATERIAL_SUN_MODULATION (see TerrainGPU.js); the
+// terrain's own version below also darkens the tall-grass meadow at low sun.
 
 // Island terrain: CDLOD mesh displaced by the heightmap, with a procedural material that blends
 // coral sand (dry / damp / wet, wind ripples, shell grit, wrack line, swash marks), the seabed
@@ -42,15 +21,15 @@ export class TerrainLightingModel extends SceneLightingModel {
 // landslide scars, worn dirt paths and weathered volcanic rock (triplanar, faceted blocks, bedding,
 // lichen, moss, splash-zone zonation, rain streaks). Detail comes from one small tileable height
 // texture sampled at several scales / rotations; normals use surface-gradient bump mapping; the
-// baked horizon AO feeds material.aoNode. Rock is only evaluated where it can appear. The key light
+// baked horizon AO feeds the surface ao. Rock is only evaluated where it can appear. The key light
 // is multiplied by the baked heightfield sun shadow (long, soft hill shadows at low sun).
 export class Terrain {
 
 	// gridSize 40 / rangeFactor 2.0: 0.2 m vertices at the camera, ~80 quads per LOD range
 	// (~9-25 % finer than 32 / 2.3 at every distance) for 0.1-0.2 M triangles.
 	// sunShadow: apply the heightfield sun shadow here (pass false if it is applied to every scene
-	// material through SceneLighting.directModulation). renderer: optional, otherwise it is picked
-	// up on the first render (the sun shadow map is baked from update()).
+	// material through SceneLighting.directModulation). renderer: optional (unused: the sun shadow
+	// map is baked from update() into the frame encoder).
 	constructor( { scene, terrainData, terrainGPU, gridSize = 40, rangeFactor = 2.0, sunShadow = true, renderer = null } ) {
 
 		this.data = terrainData;
@@ -62,466 +41,73 @@ export class Terrain {
 			heightBounds: ( x0, z0, x1, z1 ) => terrainData.boundsFor( x0, z0, x1, z1 ),
 			center: { x: - half, z: - half, size: terrainData.size },
 			rangeFactor,
+			prefix: 'terrainLod',
 		} );
 
-		this.wetness = null; // optional TSL fn (xz, h) -> vec2(wetness, foamResidue), set by the shore system
-
-		const gpu = terrainGPU;
-		const mat = this.material = standard( { roughness: 0.9, metalness: 0 } );
-		mat.name = 'Terrain';
+		// optional wetness from the shore system: { modules: [ ... ], code: WGSL defining
+		// fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f (x = wetness, y = foam residue) }
+		this.wetness = null;
+		this.sunShadow = sunShadow;
+		this.renderer = renderer;
 
 		// Morph toward the view camera in every pass: the shadow passes render the same surface
-		// (with `cameraPosition` they would morph toward the light camera instead).
-		this.uViewPos = uniform( new THREE.Vector3() ).setName( 'terViewPos' );
-		mat.positionNode = Fn( () => this._vertexPosition() )();
-		mat.castShadowPositionNode = mat.positionNode;
+		// (with the pass camera they would morph toward the light camera instead).
+		this.uViewPos = { value: new Vector3() };
+		// travelling gust field offset (the same integration as Vegetation's vegGustOffset)
+		this.gustOffset = new Vector2();
 
-		this.renderer = renderer;
-		// tall grass shades itself when the sun is low (the meadow darkens and gains contrast)
-		const grassShadow = () => this.meadowNode ? mix( float( 1 ), smoothstep( - 0.05, 0.45, G.sunDir.y ).mul( 0.35 ).add( 0.62 ), this.meadowNode ) : null;
-		if ( sunShadow ) mat.setupLightingModel = () => new TerrainLightingModel( mat, gpu.sunShadowAt( positionWorld ), grassShadow() );
+		const mat = this.material = standard( {
+			name: 'Terrain',
+			roughness: 0.9, metalness: 0,
+			uniforms: {
+				viewPos: [ 'vec3f', this.uViewPos.value ],
+				wetDarken: [ 'f32', 0.58 ],
+				gustOffset: [ 'vec2f', this.gustOffset ],
+			},
+			attributes: { nodeData: 'vec4f' },
+		} );
+		this.params = { wetDarken: mat.uniforms.wetDarken };
+		this.uViewPos = mat.uniforms.viewPos;
 
-		this.params = {
-			wetDarken: uniform( 0.58 ).setName( 'terWetDark' ),
-		};
+		mat.vertex = /* wgsl */`
+	// CDLOD vertex (same lattice snapping and geomorph as the CDLOD module) morphing toward viewPos
+	let snapped = terrainLodSnapped( v.nodeData, v.position.xz );
+	let y0 = terrainHeightAt( snapped );
+	let cv = terrainLodMorph( v.nodeData, v.position.xz, mat.viewPos, y0 );
+	v.useWorld = true;
+	v.worldPos = vec3f( cv.worldXZ.x, terrainHeightAt( cv.worldXZ ), cv.worldXZ.y );
+	v.worldNormal = vec3f( 0.0, 1.0, 0.0 );
+`;
 
-		this._surface = () => this._buildSurface();
 		this.finalizeMaterial();
 
-		this.mesh = new THREE.Mesh( this.lod.geometry, mat );
+		this.mesh = new Mesh( this.lod.geometry, mat );
 		this.mesh.frustumCulled = false;
 		this.mesh.receiveShadow = true;
 		this.mesh.castShadow = true;
+		this.mesh.staticVelocity = true;
 		this.mesh.name = 'Terrain';
-		this.mesh.onBeforeRender = ( r ) => {
-
-			if ( ! this.renderer ) this.renderer = r;
-
-		};
 		scene.add( this.mesh );
 
 	}
 
-	// CDLOD vertex (same lattice snapping and geomorph as CDLOD.vertexNodes) using uViewPos
-	_vertexPosition() {
-
-		const lod = this.lod, gpu = this.gpu;
-		const node = attribute( 'nodeData', 'vec4' );
-		const level = int( node.w );
-		const h = lod.uSpacing.element( level );
-		const p = node.xy.add( positionGeometry.xz.mul( node.z ) );
-		const idx = p.div( h ).add( 1e-3 ).floor();
-		const snapped = idx.mul( h );
-		const y0 = gpu.heightAt( snapped );
-		const dist = this.uViewPos.sub( vec3( snapped.x, y0, snapped.y ) ).length();
-		const m = lod.uMorph.element( level );
-		const morphK = clamp( dist.sub( m.x ).mul( m.y ), 0, 1 );
-		const odd = fract( idx.mul( 0.5 ) ).mul( 2 );
-		const xz = snapped.sub( odd.mul( h ).mul( morphK ) );
-		return vec3( xz.x, gpu.heightAt( xz ), xz.y );
-
-	}
-
-	_buildSurface() {
-
-		const gpu = this.gpu;
-		const det = gpu.detailTexture;
-		const outRough = float( 0.9 ).toVar( 'terRough' );
-		const outN = vec3( 0, 1, 0 ).toVar( 'terNormal' );
-		const outAO = float( 1 ).toVar( 'terAO' );
-		const meadowW = float( 0 ).toVar( 'terMeadow' );
-
-		const albedoNode = Fn( () => {
-
-			const p = positionWorld;
-			const xz = p.xz;
-			const h = p.y;
-
-			// ---- data maps
-			const nr = gpu.normalRock( xz ).toVar();
-			const N0 = normalize( vec3( nr.x, sqrt( max( float( 1 ).sub( nr.x.mul( nr.x ) ).sub( nr.y.mul( nr.y ) ), 0.0025 ) ), nr.y ) ).toVar();
-			const sp = gpu.splat( xz ).toVar();
-			const slope = float( 1 ).sub( N0.y ).toVar();
-			const camDist = length( cameraPosition.sub( p ) ).toVar();
-			const dpdx = dFdx( p ).toVar(), dpdy = dFdy( p ).toVar();
-			const fwY = fwidth( h ).toVar();
-
-			// ---- deep seabed (seen through the water: no rock, land cover, swash or wind ripples),
-			// the same colour / relief / AO as the full path below, from 6 detail samples instead of ~17
-			// detail samples shared by both paths (sampled in uniform control flow: no derivative seams
-			// where the paths meet)
-			const macroA = texture( det, rot2( xz, 0.7 ).div( 173 ) ).w.toVar();
-			const macroB = texture( det, rot2( xz, 2.1 ).div( 47 ) ).w.toVar();
-			const macro = macroA.mul( 0.6 ).add( macroB.mul( 0.4 ) ).toVar();
-			const dN = texture( det, xz.div( 1.9 ) ).toVar();
-			const dM = texture( det, rot2( xz, 1.3 ).div( 6.7 ).add( 0.21 ) ).toVar();
-			const dF = texture( det, rot2( xz, 2.4 ).div( 0.63 ).add( 0.53 ) ).toVar();
-			const grain = min( dN.z, 0.62 ).toVar();
-			const grainF = min( dF.z, 0.62 );
-			const seabedPath = h.lessThan( - 0.8 ).and( nr.z.lessThan( 0.05 ) ).and( slope.lessThan( 0.18 ) );
-			const albedoOut = vec3( 0 ).toVar( 'terAlbedo' );
-			If( seabedPath, () => {
-
-				const underW = float( 1 );
-				const sandW = smoothstep( 0.3, 0.72, sp.x.add( dM.z.sub( 0.5 ).mul( 0.5 ) ).add( macro.sub( 0.5 ).mul( 0.35 ) ) );
-				// ---- seabed: sand with ripple fields, seagrass meadows, rubble heads
-				const depth = h.negate();
-				const rc = WORLD.reef.center;
-				const reefD = length( xz.sub( vec2( rc.x, rc.z ) ) );
-				const reefW = float( 1 ).sub( smoothstep( WORLD.reef.radius * 0.5, WORLD.reef.radius * 1.15, reefD.add( macro.sub( 0.5 ).mul( 30 ) ) ) );
-				let under = mix( srgb( 0.84, 0.78, 0.64 ), srgb( 0.72, 0.7, 0.58 ), smoothstep( 1.0, 9.0, depth ) );
-				under = under.mul( dM.w.sub( 0.5 ).mul( 0.14 ).add( 1 ) ).mul( grain.sub( 0.45 ).mul( 0.25 ).add( 1 ) );
-				// megaripple fields (~0.75 m) across the swell, troughs collect darker shell hash; not in
-				// the swash zone or the first metre of depth
-				const sw = WORLD.swellDir;
-				const swDir = vec2( sw.x, sw.y );
-				const ph2 = dot( xz, swDir ).mul( 6.2832 / 0.75 ).add( dM.w.mul( 16 ) ).add( macroB.mul( 24 ) );
-				const fade2 = float( 1 ).sub( smoothstep( 0.5, 2.0, fwidth( ph2 ) ) );
-				const rip2 = pow( sin( ph2 ).mul( 0.5 ).add( 0.5 ), 1.4 );
-				const fieldW = smoothstep( 0.42, 0.62, macroB.add( dM.w.sub( 0.5 ).mul( 0.35 ) ) ).mul( smoothstep( 0.9, 2.0, depth ) ).mul( float( 1 ).sub( reefW ) ).toVar();
-				under = under.mul( rip2.sub( 0.55 ).mul( 0.22 ).mul( fieldW ).mul( fade2 ).add( 1 ) );
-				// small wave ripples (~0.16 m) everywhere below the swash
-				const ph3 = dot( xz, swDir ).mul( 6.2832 / 0.16 ).add( dM.w.mul( 26 ) ).add( dN.w.mul( 5 ) );
-				const fade3 = float( 1 ).sub( smoothstep( 0.6, 2.2, fwidth( ph3 ) ) );
-				const rip3 = pow( sin( ph3 ).mul( 0.5 ).add( 0.5 ), 1.5 );
-				// seagrass meadows: ragged edges, blade streaks leaning with the wave surge, epiphyte tips
-				// (the fringe breaks up into clumps: noise at three scales thresholds the soft splat edge)
-				const clumps = dM.w.sub( 0.5 ).mul( 0.5 ).add( dN.y.sub( 0.45 ).mul( 0.4 ) ).add( macroB.sub( 0.5 ).mul( 0.3 ) );
-				const seagrassW = smoothstep( 0.3, 0.55, sp.z.add( clumps ) ).mul( underW ).mul( smoothstep( 0.3, 0.9, depth ) ).toVar();
-				const swPerp = vec2( swDir.y.negate(), swDir.x );
-				const blades = texture( det, vec2( dot( xz, swDir ).div( 2.6 ), dot( xz, swPerp ).div( 0.35 ) ) ).y.toVar();
-				let meadow = mix( srgb( 0.12, 0.16, 0.07 ), srgb( 0.27, 0.29, 0.15 ), smoothstep( 0.35, 0.75, blades ) );
-				meadow = mix( meadow, srgb( 0.24, 0.2, 0.11 ), smoothstep( 0.55, 0.8, dM.y.add( macroB.sub( 0.5 ).mul( 0.4 ) ) ).mul( 0.5 ) );
-				// sparse at the fringe: sand shows between the blades; thinner, paler patches inside
-				meadow = mix( under, meadow, smoothstep( 0.3, 0.85, sp.z.add( clumps.mul( 0.5 ) ) ).mul( 0.35 ).add( 0.65 ) );
-				meadow = mix( meadow, mix( meadow, under, 0.45 ), smoothstep( 0.58, 0.8, macroB.add( dM.w.sub( 0.5 ).mul( 0.4 ) ) ) );
-				under = mix( under, meadow, seagrassW );
-				// rubble heads: coral rubble and rock turfed with algae, pink coralline crusts
-				const rubbleW = smoothstep( 0.3, 0.6, sp.w.add( dN.x.sub( 0.5 ).mul( 0.4 ) ).add( dM.w.sub( 0.5 ).mul( 0.3 ) ) ).mul( underW ).toVar();
-				let rubble = mix( srgb( 0.2, 0.19, 0.15 ), srgb( 0.36, 0.33, 0.26 ), smoothstep( 0.3, 0.7, dN.x ) );
-				rubble = mix( rubble, srgb( 0.2, 0.24, 0.1 ), smoothstep( 0.5, 0.7, dF.y ).mul( 0.6 ) );
-				rubble = mix( rubble, srgb( 0.58, 0.38, 0.44 ), smoothstep( 0.62, 0.74, dM.x ).mul( 0.6 ) );
-				under = mix( under, rubble, rubbleW );
-				// reef flat: coral rubble and pink crusts toward the reef
-				under = mix( under, mix( srgb( 0.56, 0.50, 0.44 ), srgb( 0.60, 0.43, 0.46 ), smoothstep( 0.45, 0.7, dM.x ) ), reefW.mul( 0.7 ).mul( smoothstep( 0.4, 0.6, dN.x ) ) );
-
-				// damp sand below the berm (wet = 0 under water)
-				const dampMottle = smoothstep( 0.3, 0.7, dM.w.add( dN.y.sub( 0.45 ).mul( 0.6 ) ).add( macroB.sub( 0.5 ).mul( 0.4 ) ) );
-				const wetK = smoothstep( 1.7, 0.5, h.add( dM.w.mul( 0.3 ) ) ).mul( sandW ).mul( mix( float( 0.22 ), float( 0.5 ), dampMottle ) );
-				const wetAlbedo = saturation( under.mul( this.params.wetDarken ), 1.15 ).mul( vec3( 0.97, 0.98, 1.0 ) );
-				albedoOut.assign( mix( under, wetAlbedo, wetK ) );
-				outRough.assign( 0.75 );
-				const waveR = rip3.mul( 0.012 ).mul( fade3 ).mul( smoothstep( - 0.3, - 0.9, h ) ).mul( float( 1 ).sub( seagrassW ) );
-				const megaR = rip2.mul( 0.035 ).mul( fade2 ).mul( fieldW ).mul( float( 1 ).sub( seagrassW ) );
-				const sandH = grain.mul( 0.004 ).add( grainF.mul( 0.003 ) ).add( waveR ).add( megaR );
-				const seabedH = seagrassW.mul( blades.mul( 0.05 ).add( 0.08 ) ).add( rubbleW.mul( dN.x.mul( 0.07 ).add( dF.x.mul( 0.015 ) ) ) );
-				outN.assign( perturbNormal( N0, sandH.add( seabedH ), 1.0 ) );
-				outAO.assign( nr.w.mul( float( 1 ).sub( seagrassW.mul( 0.3 ) ) ).mul( float( 1 ).sub( rubbleW.mul( smoothstep( 0.55, 0.2, dN.x ) ).mul( 0.35 ) ) ) );
-				meadowW.assign( 0 );
-
-			} ).Else( () => {
-
-				// ---- detail samples (tileable heights: x rock, y soil, z sand, w fbm)
-				// sand grain without the pebble peaks (pebbles are drawn separately where they belong)
-
-				// ---- downslope streaks (rock flutes, hanging vegetation, landslide scars): the detail
-				// texture stretched vertically on the two vertical projection planes
-				const sw4 = N0.xz.abs().pow( vec2( 4 ) );
-				const swN = sw4.div( sw4.x.add( sw4.y ).add( 1e-5 ) );
-				const stA = texture( det, vec2( p.z.div( 9.3 ), h.div( 37 ) ) ), stB = texture( det, vec2( p.x.div( 9.3 ).add( 0.5 ), h.div( 37 ).add( 0.3 ) ) );
-				const streak = stA.w.mul( swN.x ).add( stB.w.mul( swN.y ) ).toVar();
-				const scar = stA.y.mul( swN.x ).add( stB.y.mul( swN.y ) );
-
-				// ---- rock: only evaluated where the rock mask or the slope allow it. Exposure follows the
-				// form: steep faces, convex spurs and ridges (high AO) go bare, gully floors (low AO,
-				// drainage lines) keep soil and plants; noise and fall-line streaks break the outline up.
-				// Around the bare rock a band of scree / dark soil and moss; plants creep over it.
-				const gully = sp.z.mul( smoothstep( - 0.5, 0.5, h ) ).toVar();
-				const rockAlbedo = vec3( 0.2 ).toVar(), rockRough = float( 0.8 ).toVar(), rockHd = float( 0 ).toVar();
-				const rockW = float( 0 ).toVar(), screeW = float( 0 ).toVar();
-				If( nr.z.greaterThan( 0.06 ).or( slope.greaterThan( 0.3 ) ), () => {
-
-					const R = rockSurface( { tex: det, p, N: N0, h, macro, grad: { dpdx, dpdy, fwY } } );
-					const cliffK = smoothstep( 0.28, 0.55, slope );
-					const convex = smoothstep( 0.5, 0.85, nr.w );
-					const rv = nr.z.mul( 0.7 ).add( smoothstep( 0.3, 0.62, slope ).mul( 0.5 ) ).add( convex.mul( 0.14 ) ).sub( gully.mul( 0.4 ) )
-						.add( R.height.sub( 0.45 ).mul( 0.35 ) ).add( dM.w.sub( 0.5 ).mul( 0.34 ) ).add( dN.w.sub( 0.5 ).mul( 0.22 ) )
-						.add( streak.sub( 0.5 ).mul( 1.0 ).mul( cliffK ) ).toVar();
-					// fades to 0 at the branch boundary: no step along the slope / mask iso-lines
-					const branchK = max( smoothstep( 0.06, 0.18, nr.z ), smoothstep( 0.3, 0.42, slope ) );
-					rockW.assign( smoothstep( 0.5, 0.68, rv ).mul( branchK ) );
-					screeW.assign( smoothstep( 0.28, 0.52, rv ).mul( branchK ).mul( float( 1 ).sub( rockW ) ) );
-					// weathered basalt: darker and browner than the sea-cliff palette, streaked; moss and
-					// ferns on the ledges and on the less steep parts of the faces
-					// dark wet stains down the fall line, paler dry ribs between them
-					const stain = smoothstep( 0.5, 0.7, streak ).mul( cliffK );
-					// dark, weathered basalt (the island's inland rock is darker and browner than the pale
-					// sea-cliff palette), stained down the fall line
-					let basalt = R.albedo.mul( vec3( 0.36, 0.34, 0.31 ) ).mul( float( 1 ).sub( stain.mul( 0.45 ) ) ).mul( smoothstep( 0.42, 0.25, streak ).mul( cliffK ).mul( 0.15 ).add( 1 ) );
-					// soil and humus caught in the joints and hollows of the rock (low relief), so the face
-					// reads as fractured stone instead of a smooth plate
-					const joints = smoothstep( 0.42, 0.22, R.height.add( dN.w.sub( 0.5 ).mul( 0.25 ) ) );
-					basalt = mix( basalt, mix( srgb( 0.13, 0.1, 0.07 ), srgb( 0.2, 0.2, 0.1 ), dF.y ), joints.mul( 0.7 ) );
-					// moss / small plants on every ledge and on the less steep parts, more near the edges
-					const ledgeMoss = smoothstep( 0.4, 0.75, N0.y.add( dN.y.sub( 0.45 ).mul( 0.6 ) ) ).mul( smoothstep( 0.25, 0.55, macroB.add( dM.y.mul( 0.4 ) ) ) );
-					const fringe = smoothstep( 0.5, 0.58, rv ).mul( smoothstep( 0.8, 0.6, rv ) ).mul( smoothstep( 0.3, 0.6, dM.w.add( dN.y.mul( 0.4 ) ) ) );
-					const mossK = saturate( max( ledgeMoss.mul( 0.75 ), fringe.mul( 0.8 ) ).add( R.moss.mul( 0.3 ) ).add( joints.mul( 0.25 ) ) );
-					rockAlbedo.assign( mix( basalt, mix( srgb( 0.12, 0.17, 0.05 ), srgb( 0.22, 0.26, 0.09 ), dF.y ), mossK ) );
-					rockRough.assign( R.rough );
-					// craggier than the boulders: the big blocks and plates stand out from afar
-					rockHd.assign( R.hd.mul( 2.2 ).add( R.height.mul( 0.6 ) ) );
-
-				} );
-
-				// ---- weights
-				const notRock = float( 1 ).sub( rockW ).toVar();
-				const underW = smoothstep( 0.12, - 0.6, h ).toVar();
-				const landW = float( 1 ).sub( underW );
-				const sandW = smoothstep( 0.3, 0.72, sp.x.add( dM.z.sub( 0.5 ).mul( 0.5 ) ).add( macro.sub( 0.5 ).mul( 0.35 ) ) ).mul( notRock ).toVar();
-				const pathW = smoothstep( 0.28, 0.62, sp.y.add( dN.y.sub( 0.45 ).mul( 0.4 ) ).add( dM.w.sub( 0.5 ).mul( 0.25 ) ) ).mul( notRock ).mul( landW )
-					.mul( float( 1 ).sub( smoothstep( 50, 220, camDist ).mul( 0.85 ) ) ).toVar();
-				// forest on the higher / steeper ground and in the gullies, tall-grass meadow on the valley
-				// floor and around the village (same classification as the vegetation's land cover)
-				const jungleW = saturate( smoothstep( 9, 24, h.add( macro.sub( 0.5 ).mul( 18 ) ) ).add( smoothstep( 0.18, 0.36, slope ) ).add( gully.mul( 0.6 ) ) ).toVar();
-				// landslide scars: raw red-brown laterite in streaks down steep slopes, rare
-				const lateriteW = smoothstep( 0.62, 0.74, scar.add( macroB.sub( 0.5 ).mul( 0.3 ) ) ).mul( smoothstep( 0.3, 0.42, slope ) )
-					.mul( smoothstep( 0.52, 0.66, macro ) ).mul( notRock ).mul( 0.85 );
-
-				// ---- beach sand: pale coral sand, drifts of warmer / coarser sand, grain
-				const dryK = smoothstep( 0.8, 3.0, h );
-				let sand = mix( srgb( 0.83, 0.75, 0.6 ), srgb( 0.9, 0.84, 0.72 ), smoothstep( 0.3, 0.72, macro.add( dryK.mul( 0.2 ) ) ) );
-				sand = mix( sand, srgb( 0.84, 0.72, 0.55 ), smoothstep( 0.55, 0.8, dM.w.add( macroB.sub( 0.5 ).mul( 0.6 ) ) ).mul( 0.45 ) );
-				sand = sand.mul( dM.w.sub( 0.5 ).mul( 0.16 ).add( 1 ) ).mul( dN.w.sub( 0.5 ).mul( 0.1 ).add( 1 ) );
-				sand = sand.mul( grain.sub( 0.45 ).mul( 0.3 ).add( 0.97 ) ).mul( grainF.sub( 0.45 ).mul( 0.2 ).add( 1 ) );
-				// disturbed / trodden patches: slightly darker, coarser sand (footfall, crabs, wind scour)
-				const trod = smoothstep( 0.52, 0.7, dN.y.add( dM.y.sub( 0.5 ).mul( 0.6 ) ) ).mul( dryK );
-				sand = sand.mul( float( 1 ).sub( trod.mul( 0.07 ) ) );
-				// the high-water band collects shell grit, coral bits and dried seaweed
-				const hw = h.add( dM.w.sub( 0.5 ).mul( 0.5 ) );
-				const wrackBand = smoothstep( 1.15, 1.4, hw ).mul( smoothstep( 2.1, 1.7, hw ) );
-				const pebDensity = smoothstep( 0.62, 0.85, macroB.add( dM.w.mul( 0.3 ) ) ).mul( 0.2 ).add( wrackBand.mul( smoothstep( 0.3, 0.6, dM.y ) ) );
-				const pebW = smoothstep( 0.66, 0.8, dN.z ).mul( saturate( pebDensity ) ).mul( smoothstep( 0.6, 0.9, sp.x ) ).mul( landW )
-					.mul( float( 1 ).sub( smoothstep( 12, 35, camDist ) ) ).toVar();
-				const pebCol = mix( mix( srgb( 0.86, 0.82, 0.74 ), srgb( 0.78, 0.64, 0.6 ), smoothstep( 0.45, 0.75, dM.x ) ), srgb( 0.36, 0.33, 0.3 ), smoothstep( 0.74, 0.82, dM.y ) );
-				sand = mix( sand, pebCol, pebW.mul( 0.75 ) );
-				const wrack = wrackBand.mul( smoothstep( 0.58, 0.72, dN.y ) ).mul( smoothstep( 0.4, 0.6, macroB ) );
-				sand = mix( sand, srgb( 0.24, 0.18, 0.11 ), wrack.mul( 0.8 ) );
-				// trampled sand along the paths
-				sand = sand.mul( float( 1 ).sub( pathW.mul( 0.07 ) ) );
-
-				// wind ripples on the dry sand: crests across the wind (bent by the fbm), wavelength
-				// 8-13 cm, fading where trodden; visible in the albedo too (finer sand on the crests)
-				const wd = G.windDir;
-				const ph1 = dot( xz, wd ).mul( 6.2832 ).div( mix( float( 0.08 ), float( 0.13 ), macroB ) ).add( dM.w.mul( 24 ) ).add( dN.w.mul( 7 ) );
-				const fade1 = float( 1 ).sub( smoothstep( 0.6, 2.2, fwidth( ph1 ) ) );
-				const rip1 = pow( sin( ph1 ).mul( 0.5 ).add( 0.5 ), 1.6 );
-				const windK = fade1.mul( smoothstep( 1.5, 2.2, h ) ).mul( float( 1 ).sub( pathW ) ).mul( float( 1 ).sub( trod.mul( 0.7 ) ) )
-					.mul( smoothstep( 0.2, 0.5, macroB.add( dM.w.mul( 0.3 ) ) ) ).toVar();
-				sand = sand.mul( rip1.sub( 0.5 ).mul( 0.12 ).mul( windK ).add( 1 ) );
-
-				// ---- seabed: sand with ripple fields, seagrass meadows, rubble heads
-				const depth = h.negate();
-				const rc = WORLD.reef.center;
-				const reefD = length( xz.sub( vec2( rc.x, rc.z ) ) );
-				const reefW = float( 1 ).sub( smoothstep( WORLD.reef.radius * 0.5, WORLD.reef.radius * 1.15, reefD.add( macro.sub( 0.5 ).mul( 30 ) ) ) );
-				let under = mix( srgb( 0.84, 0.78, 0.64 ), srgb( 0.72, 0.7, 0.58 ), smoothstep( 1.0, 9.0, depth ) );
-				under = under.mul( dM.w.sub( 0.5 ).mul( 0.14 ).add( 1 ) ).mul( grain.sub( 0.45 ).mul( 0.25 ).add( 1 ) );
-				// megaripple fields (~0.75 m) across the swell, troughs collect darker shell hash; not in
-				// the swash zone or the first metre of depth
-				const sw = WORLD.swellDir;
-				const swDir = vec2( sw.x, sw.y );
-				const ph2 = dot( xz, swDir ).mul( 6.2832 / 0.75 ).add( dM.w.mul( 16 ) ).add( macroB.mul( 24 ) );
-				const fade2 = float( 1 ).sub( smoothstep( 0.5, 2.0, fwidth( ph2 ) ) );
-				const rip2 = pow( sin( ph2 ).mul( 0.5 ).add( 0.5 ), 1.4 );
-				const fieldW = smoothstep( 0.42, 0.62, macroB.add( dM.w.sub( 0.5 ).mul( 0.35 ) ) ).mul( smoothstep( 0.9, 2.0, depth ) ).mul( float( 1 ).sub( reefW ) ).toVar();
-				under = under.mul( rip2.sub( 0.55 ).mul( 0.22 ).mul( fieldW ).mul( fade2 ).add( 1 ) );
-				// small wave ripples (~0.16 m) everywhere below the swash
-				const ph3 = dot( xz, swDir ).mul( 6.2832 / 0.16 ).add( dM.w.mul( 26 ) ).add( dN.w.mul( 5 ) );
-				const fade3 = float( 1 ).sub( smoothstep( 0.6, 2.2, fwidth( ph3 ) ) );
-				const rip3 = pow( sin( ph3 ).mul( 0.5 ).add( 0.5 ), 1.5 );
-				// seagrass meadows: ragged edges, blade streaks leaning with the wave surge, epiphyte tips
-				// (the fringe breaks up into clumps: noise at three scales thresholds the soft splat edge)
-				const clumps = dM.w.sub( 0.5 ).mul( 0.5 ).add( dN.y.sub( 0.45 ).mul( 0.4 ) ).add( macroB.sub( 0.5 ).mul( 0.3 ) );
-				const seagrassW = smoothstep( 0.3, 0.55, sp.z.add( clumps ) ).mul( underW ).mul( smoothstep( 0.3, 0.9, depth ) ).toVar();
-				const swPerp = vec2( swDir.y.negate(), swDir.x );
-				const blades = texture( det, vec2( dot( xz, swDir ).div( 2.6 ), dot( xz, swPerp ).div( 0.35 ) ) ).y.toVar();
-				let meadow = mix( srgb( 0.12, 0.16, 0.07 ), srgb( 0.27, 0.29, 0.15 ), smoothstep( 0.35, 0.75, blades ) );
-				meadow = mix( meadow, srgb( 0.24, 0.2, 0.11 ), smoothstep( 0.55, 0.8, dM.y.add( macroB.sub( 0.5 ).mul( 0.4 ) ) ).mul( 0.5 ) );
-				// sparse at the fringe: sand shows between the blades; thinner, paler patches inside
-				meadow = mix( under, meadow, smoothstep( 0.3, 0.85, sp.z.add( clumps.mul( 0.5 ) ) ).mul( 0.35 ).add( 0.65 ) );
-				meadow = mix( meadow, mix( meadow, under, 0.45 ), smoothstep( 0.58, 0.8, macroB.add( dM.w.sub( 0.5 ).mul( 0.4 ) ) ) );
-				under = mix( under, meadow, seagrassW );
-				// rubble heads: coral rubble and rock turfed with algae, pink coralline crusts
-				const rubbleW = smoothstep( 0.3, 0.6, sp.w.add( dN.x.sub( 0.5 ).mul( 0.4 ) ).add( dM.w.sub( 0.5 ).mul( 0.3 ) ) ).mul( underW ).toVar();
-				let rubble = mix( srgb( 0.2, 0.19, 0.15 ), srgb( 0.36, 0.33, 0.26 ), smoothstep( 0.3, 0.7, dN.x ) );
-				rubble = mix( rubble, srgb( 0.2, 0.24, 0.1 ), smoothstep( 0.5, 0.7, dF.y ).mul( 0.6 ) );
-				rubble = mix( rubble, srgb( 0.58, 0.38, 0.44 ), smoothstep( 0.62, 0.74, dM.x ).mul( 0.6 ) );
-				under = mix( under, rubble, rubbleW );
-				// reef flat: coral rubble and pink crusts toward the reef
-				under = mix( under, mix( srgb( 0.56, 0.50, 0.44 ), srgb( 0.60, 0.43, 0.46 ), smoothstep( 0.45, 0.7, dM.x ) ), reefW.mul( 0.7 ).mul( smoothstep( 0.4, 0.6, dN.x ) ) );
-				sand = mix( sand, under, underW );
-
-				// ---- ground: tall-grass meadow (tone shared with the grass field), forest floor and, from
-				// afar, the forest canopy; laterite scars
-				const V = normalize( cameraPosition.sub( p ) );
-				const NdV = saturate( dot( N0, V ) ).toVar();
-				const mt = meadowTone( macroA, macroB, slope, N0.z, dM.w.mul( 0.65 ).add( dN.w.mul( 0.35 ) ) );
-				// clumps (1-3 m) and tussocks, blade-scale grain
-				const clump = dM.w.mul( 0.6 ).add( dN.y.mul( 0.4 ) ).toVar();
-				// seen from afar the tussocks and their shadowed gaps are what makes tall grass read as
-				// grass (not lawn): the clump contrast grows with distance as the blades fade out
-				const clumpK = mix( float( 0.34 ), float( 0.95 ), smoothstep( 40, 140, camDist ) );
-				let lawn = mt.tone.mul( clump.sub( 0.5 ).mul( clumpK ).add( 1 ) ).mul( dF.y.sub( 0.4 ).mul( 0.22 ).add( 1 ) );
-				lawn = lawn.mul( mix( float( 1 ), smoothstep( 0.25, 0.55, dN.y.mul( 0.5 ).add( dM.y.mul( 0.5 ) ) ).mul( 0.35 ).add( 0.72 ), smoothstep( 50, 160, camDist ) ) );
-				// grass combed along the wind: long streaks (anisotropic sample of the fbm channel)
-				const combUV = vec2( dot( xz, G.windDir ).div( 7.5 ), dot( xz, vec2( G.windDir.y.negate(), G.windDir.x ) ).div( 0.9 ) );
-				const comb = texture( det, combUV.add( vec2( 0.31, 0.77 ) ) ).w;
-				lawn = lawn.mul( comb.sub( 0.5 ).mul( 0.3 ).add( 1 ) );
-				// seen from above the dark soil shows between the clumps; at grazing angles blade sides
-				// cover everything (lighter, more saturated)
-				const gapK = smoothstep( 0.3, 0.95, NdV ).mul( smoothstep( 0.62, 0.3, clump ) );
-				lawn = mix( lawn, MEADOW.soil, gapK.mul( 0.45 ) );
-				lawn = mix( lawn, saturation( lawn.mul( 1.12 ), 1.15 ), smoothstep( 0.45, 0.1, NdV ).mul( 0.6 ) );
-				// travelling gusts flatten the grass: the paler blade backs show as waves (same gust
-				// field as the grass blades)
-				const gust = gustAt( xz ).mul( saturate( windStrength.mul( 0.5 ) ) ).toVar();
-				lawn = mix( lawn, lawn.mul( vec3( 1.25, 1.22, 1.06 ) ).add( 0.01 ), gust.mul( 0.6 ) );
-				// bare trodden soil in places, sandy soil toward the beach
-				lawn = mix( lawn, srgb( 0.4, 0.33, 0.23 ), smoothstep( 0.72, 0.84, dN.y.add( dM.y.sub( 0.5 ).mul( 0.5 ) ) ).mul( 0.25 ) );
-				lawn = mix( lawn, srgb( 0.60, 0.52, 0.38 ), saturate( sp.x.mul( 1.6 ) ).mul( smoothstep( 0.45, 0.62, dN.z.add( dM.y.mul( 0.3 ) ) ) ).mul( 0.7 ) );
-				// inside the geometric grass field (GrassField) the ground is only seen between the blades:
-				// the shaded base of the sward, dark and brownish with dead leaves; it hands over to the
-				// sward's own look (above) where the blades thin out
-				const grassHere = smoothstep( 2.5, 4.5, h ).mul( float( 1 ).sub( smoothstep( 0.45, 0.85, jungleW ) ) ).mul( float( 1 ).sub( saturate( sp.x.mul( 1.6 ) ) ) );
-				const fieldK = float( 1 ).sub( smoothstep( GRASS_FADE[ 0 ], GRASS_FADE[ 1 ], length( p.xz.sub( cameraPosition.xz ) ) ) ).mul( grassHere ).toVar();
-				const swardBase = mix( mt.tone.mul( 0.4 ), MEADOW.soil, 0.4 ).mul( dN.y.sub( 0.45 ).mul( 0.6 ).add( 1 ) ).mul( dF.y.sub( 0.4 ).mul( 0.3 ).add( 1 ) );
-				lawn = mix( lawn, swardBase, fieldK.mul( 0.85 ) );
-				const litter = mix( srgb( 0.2, 0.15, 0.09 ), srgb( 0.34, 0.25, 0.13 ), dF.y );
-				let jungle = mix( srgb( 0.1, 0.16, 0.05 ), litter, smoothstep( 0.52, 0.7, dN.y ) );
-				jungle = mix( jungle, srgb( 0.12, 0.1, 0.06 ), gully.mul( 0.3 ) );
-				const far = smoothstep( 40, 160, camDist );
-				let cover = mix( srgb( 0.08, 0.13, 0.04 ), srgb( 0.17, 0.24, 0.07 ), smoothstep( 0.3, 0.7, macro ) );
-				cover = mix( cover, srgb( 0.27, 0.29, 0.12 ), smoothstep( 0.66, 0.84, macroB.add( dM.w.mul( 0.2 ) ) ).mul( 0.45 ) );
-				jungle = mix( jungle, cover, far.mul( 0.8 ) );
-				jungle = jungle.mul( macro.sub( 0.5 ).mul( 0.3 ).add( 1 ) );
-				// canopy: seen from a distance (or on slopes too steep for the trees) the forest reads as
-				// a carpet of lumpy crowns with dark gaps
-				const crowns = texture( det, rot2( xz, 0.9 ).div( 61 ) ).w;
-				const crownsB = texture( det, rot2( xz, 2.3 ).div( 13 ).add( 0.37 ) ).w;
-				const canopyH = smoothstep( 0.32, 0.7, crowns.mul( 0.45 ).add( crownsB.mul( 0.4 ) ).add( dM.w.mul( 0.15 ) ) ).toVar();
-				const canopyW = jungleW.mul( max( smoothstep( 0.2, 0.4, slope ), smoothstep( 90, 260, camDist ) ) ).mul( smoothstep( 25, 70, camDist ) ).mul( notRock ).mul( float( 1 ).sub( screeW.mul( 0.7 ) ) ).toVar();
-				let canopy = mix( srgb( 0.05, 0.08, 0.025 ), mix( srgb( 0.14, 0.21, 0.06 ), srgb( 0.22, 0.27, 0.09 ), macroB ), canopyH );
-				// steep faces: the canopy hangs in streaks down the fall line
-				canopy = canopy.mul( streak.sub( 0.5 ).mul( 0.5 ).mul( smoothstep( 0.3, 0.5, slope ) ).add( 1 ) );
-				jungle = mix( jungle, canopy, canopyW );
-				let ground = mix( lawn, jungle, jungleW );
-				// around the bare rock: dark humus, stones and moss, with the surrounding plants creeping
-				// in (a soft, noisy band; no speckle)
-				const creepIn = smoothstep( 0.4, 0.75, dM.w.add( dN.y.sub( 0.45 ).mul( 0.5 ) ).add( macroB.sub( 0.5 ).mul( 0.3 ) ) );
-				let scree = mix( srgb( 0.16, 0.13, 0.1 ), srgb( 0.27, 0.24, 0.2 ), smoothstep( 0.45, 0.75, dM.x.add( dN.x.sub( 0.5 ).mul( 0.3 ) ) ) );
-				scree = mix( scree, mix( srgb( 0.13, 0.18, 0.06 ), srgb( 0.22, 0.26, 0.09 ), dF.y ), smoothstep( 0.45, 0.7, dM.y.add( dN.y.sub( 0.45 ).mul( 0.5 ) ) ).mul( 0.7 ) );
-				ground = mix( ground, scree, screeW.mul( float( 1 ).sub( creepIn.mul( 0.7 ) ) ) );
-				const laterite = mix( srgb( 0.42, 0.25, 0.16 ), srgb( 0.52, 0.36, 0.24 ), dM.w ).mul( dN.y.sub( 0.4 ).mul( 0.3 ).add( 1 ) );
-				ground = mix( ground, laterite, lateriteW );
-
-				// ---- worn dirt paths / trampled ground (darker, redder soil in the forest)
-				let dirt = mix( srgb( 0.38, 0.31, 0.23 ), srgb( 0.5, 0.43, 0.32 ), dM.w ).mul( dN.y.sub( 0.4 ).mul( 0.35 ).add( 0.95 ) );
-				dirt = mix( dirt, srgb( 0.3, 0.22, 0.15 ), jungleW.mul( 0.7 ) );
-				dirt = mix( dirt, srgb( 0.56, 0.53, 0.48 ), smoothstep( 0.72, 0.82, dN.z ).mul( 0.5 ) );
-				// grass creeping onto the trail, a grassy strip between the two worn ruts
-				const creep = smoothstep( 0.45, 0.7, dN.y.add( dF.y.sub( 0.45 ).mul( 0.5 ) ) ).mul( smoothstep( 0.9, 0.5, sp.y ) );
-				dirt = mix( dirt, lawn, creep.mul( 0.8 ) );
-
-				// ---- combine
-				meadowW.assign( float( 1 ).sub( jungleW ).mul( float( 1 ).sub( pathW ) ).mul( notRock ).mul( float( 1 ).sub( sandW ) ).mul( landW ).mul( float( 1 ).sub( screeW ) ) );
-				let albedo = mix( ground, dirt, pathW );
-				albedo = mix( albedo, sand, max( sandW, underW.mul( notRock ) ) );
-				albedo = mix( albedo, rockAlbedo, rockW );
-
-				// ---- wetness (swash zone) from the shore system, else a static damp band
-				const wetFoam = this.wetness ? this.wetness( xz, h ) : vec2( smoothstep( 0.5, 0.0, h ), 0 );
-				const wet = saturate( wetFoam.x ).mul( float( 1 ).sub( jungleW.mul( 0.8 ) ) ).mul( landW ).toVar();
-				// damp sand below the berm: darker in mottled, drying patches even when the swash has not
-				// reached it lately
-				const dampMottle = smoothstep( 0.3, 0.7, dM.w.add( dN.y.sub( 0.45 ).mul( 0.6 ) ).add( macroB.sub( 0.5 ).mul( 0.4 ) ) );
-				const damp = smoothstep( 1.7, 0.5, h.add( dM.w.mul( 0.3 ) ) ).mul( sandW ).mul( mix( float( 0.22 ), float( 0.5 ), dampMottle ) );
-				// sand dries in mottled patches; backwash leaves faint rills down the slope
-				const mottle = smoothstep( 0.25, 0.75, dM.w.add( dN.y.sub( 0.45 ).mul( 0.5 ) ) );
-				const dryEdge = smoothstep( 0.0, 0.6, wet ).mul( smoothstep( 1.0, 0.6, wet ) );
-				const wetK = max( wet, damp ).mul( float( 1 ).sub( dryEdge.mul( mottle ).mul( 0.6 ) ) ).mul( notRock ).toVar();
-				const slopeDir = normalize( N0.xz.add( vec2( 1e-4, 0 ) ) );
-				const rill = texture( det, vec2( dot( xz, slopeDir ).div( 3.2 ), dot( xz, vec2( slopeDir.y.negate(), slopeDir.x ) ).div( 0.3 ) ) ).w;
-				const rillK = smoothstep( 0.2, 0.9, wet ).mul( smoothstep( 0.05, 0.6, h ) ).mul( sandW );
-				const wetAlbedo = saturation( albedo.mul( this.params.wetDarken ), 1.15 ).mul( vec3( 0.97, 0.98, 1.0 ) ).mul( rill.sub( 0.5 ).mul( 0.25 ).mul( rillK ).add( 1 ) );
-				albedo = mix( albedo, wetAlbedo, wetK );
-				// swash marks: thin wavy lines of grit left at the limits of earlier uprushes
-				const sl = h.add( dM.w.mul( 0.18 ) ).add( dN.w.mul( 0.05 ) ).div( 0.13 );
-				const slD = fract( sl ).sub( 0.5 ).abs();
-				const slW = fwidth( sl ).add( 1e-4 );
-				const swashLine = smoothstep( slW.mul( 1.5 ).add( 0.04 ), 0.0, slD ).mul( smoothstep( 0.2, 0.4, h ) ).mul( smoothstep( 1.6, 1.2, h ) )
-					.mul( smoothstep( 0.45, 0.65, dM.y.add( macroB.sub( 0.5 ).mul( 0.4 ) ) ) ).mul( sandW ).mul( float( 1 ).sub( smoothstep( 0.8, 2.0, slW.mul( 10 ) ) ) );
-				albedo = mix( albedo.mul( float( 1 ).sub( swashLine.mul( 0.3 ) ) ), srgb( 0.9, 0.88, 0.84 ), swashLine.mul( smoothstep( 0.6, 0.75, dF.z ) ).mul( 0.5 ) );
-				// foam residue: lacy patterns stranded on the sand
-				const lace = smoothstep( 0.42, 0.18, texture( det, rot2( xz, 0.4 ).div( 0.9 ) ).x ).mul( 0.7 ).add( 0.3 );
-				const residue = saturate( wetFoam.y ).mul( lace ).mul( landW ).mul( notRock ).toVar();
-				albedo = mix( albedo, srgb( 0.88, 0.9, 0.9 ), residue );
-
-				// ---- roughness
-				let rough = mix( float( 0.88 ), float( 0.93 ), sandW );
-				rough = mix( rough, float( 0.9 ), pathW );
-				rough = mix( rough, rockRough, rockW );
-				// wet sand has a film of water: glossy while fresh, satin as it drains
-				rough = mix( rough, mix( float( 0.42 ), float( 0.16 ), wet ), wetK );
-				rough = mix( rough, float( 0.7 ), residue );
-				rough = mix( rough, float( 0.75 ), underW );
-				outRough.assign( rough );
-
-				// ---- micro relief for the normal
-				const windR = rip1.mul( 0.005 ).mul( windK );
-				const waveR = rip3.mul( 0.012 ).mul( fade3 ).mul( smoothstep( - 0.3, - 0.9, h ) ).mul( float( 1 ).sub( seagrassW ) );
-				const megaR = rip2.mul( 0.035 ).mul( fade2 ).mul( fieldW ).mul( float( 1 ).sub( seagrassW ) );
-				const sandH = grain.mul( 0.004 ).add( grainF.mul( 0.003 ) ).add( pebW.mul( 0.004 ) ).add( windR ).add( waveR ).add( megaR ).mul( float( 1 ).sub( wet.mul( 0.6 ) ) )
-					.add( rill.mul( 0.006 ).mul( rillK ) );
-				// seagrass canopy stands proud of the sand with a ragged scarp; rubble is knobbly
-				const seabedH = seagrassW.mul( blades.mul( 0.05 ).add( 0.08 ) ).add( rubbleW.mul( dN.x.mul( 0.07 ).add( dF.x.mul( 0.015 ) ) ) );
-				const groundH = dN.y.mul( mix( float( 0.05 ), float( 0.035 ), jungleW ) ).add( dF.y.mul( 0.012 ) ).add( dM.y.mul( 0.045 ) ).add( canopyH.mul( canopyW ).mul( 2.5 ) )
-					.add( clump.mul( 0.12 ).mul( float( 1 ).sub( jungleW ) ) ).add( comb.mul( 0.03 ).mul( float( 1 ).sub( jungleW ) ) );
-				const screeH = dN.z.mul( 0.04 ).add( dM.x.mul( 0.06 ) );
-				const dirtH = dN.z.mul( 0.012 ).add( dN.y.mul( 0.01 ) );
-				let hd = mix( mix( groundH, screeH, screeW ), dirtH, pathW );
-				hd = mix( hd, sandH.add( seabedH ), max( sandW, underW.mul( notRock ) ) );
-				hd = mix( hd, rockHd, rockW );
-				outN.assign( perturbNormal( N0, hd, 1.0 ) );
-
-				// ---- ambient occlusion: baked horizon + cavity, plus litter / crevices / seagrass canopy
-				const aoDetail = mix( float( 1 ), dN.y.mul( 0.5 ).add( 0.7 ), jungleW.mul( float( 1 ).sub( sandW ) ).mul( notRock ).mul( landW ) )
-					.mul( mix( float( 1 ), smoothstep( 0.2, 0.7, clump ).mul( 0.35 ).add( 0.65 ), meadowW ) );
-				outAO.assign( nr.w.mul( aoDetail ).mul( float( 1 ).sub( seagrassW.mul( 0.3 ) ) ).mul( float( 1 ).sub( rubbleW.mul( smoothstep( 0.55, 0.2, dN.x ) ).mul( 0.35 ) ) )
-					.mul( mix( float( 1 ), smoothstep( 0.15, 0.6, canopyH ).mul( 0.6 ).add( 0.4 ), canopyW ) ) );
-
-
-				albedoOut.assign( albedo );
-
-			} );
-
-			return albedoOut;
-
-		} )();
-
-		return { albedo: albedoNode, rough: outRough, N: outN, ao: outAO, meadow: meadowW };
-
-	}
-
-	// (Re)build the fragment nodes. Called again once the shore system provides wetness.
+	// (Re)build the fragment code. Called again once the shore system provides wetness.
 	finalizeMaterial() {
 
-		const s = this._surface();
 		const mat = this.material;
-		this.meadowNode = s.meadow;
-		mat.colorNode = vec4( s.albedo, 1 );
-		mat.roughnessNode = s.rough;
-		mat.normalNode = transformNormalToView( s.N );
-		mat.aoNode = saturate( s.ao );
+		const modules = [ this.gpu.module, terrainShadingModule(), this.lod.module ];
+		if ( this.wetness ) {
+
+			modules.push( ...( this.wetness.modules || [] ) );
+			modules.push( new ShaderModule( { name: 'terrainWetness', deps: [ this.gpu.module, ...( this.wetness.modules || [] ) ], code: this.wetness.code } ) );
+
+		}
+
+		modules.push( new ShaderModule( { name: 'terrainMaterial', deps: [ this.gpu.module, terrainShadingModule() ], code: TERRAIN_MATERIAL_WGSL } ) );
+		mat.modules = modules;
+		mat.defines.HAS_WETNESS = this.wetness ? 1 : 0;
+		mat.defines.MATERIAL_SUN_MODULATION = this.sunShadow ? 1 : 0;
+		mat.surface = TERRAIN_SURFACE;
 		mat.needsUpdate = true;
 
 	}
@@ -530,8 +116,434 @@ export class Terrain {
 
 		camera.getWorldPosition( this.uViewPos.value );
 		this.lod.update( camera );
-		if ( this.renderer ) this.gpu.updateSunShadow( this.renderer );
+		// travelling gust field offset (integrated so speed/direction changes never jump)
+		const wd = G.windDir.value;
+		const speed = 0.7 * G.windSpeed.value + 1.5;
+		const dt = G.dt.value;
+		this.gustOffset.x += wd.x * speed * dt;
+		this.gustOffset.y += wd.y * speed * dt;
+		this.gpu.updateSunShadow( this.renderer );
 
 	}
 
 }
+
+const S = srgb;
+
+// module part: meadow weight shared between the surface and the key-light modulation, the gust
+// field and the wetness fallback
+const TERRAIN_MATERIAL_WGSL = /* wgsl */`
+// meadow weight of the current fragment (written by the surface, read by the sun modulation)
+var<private> terMeadowW: f32 = 0.0;
+
+// tall grass shades itself when the sun is low (the meadow darkens and gains contrast)
+fn materialSunModulation( P: vec3f, N: vec3f ) -> vec3f {
+	let grass = mix( 1.0, smoothstep( -0.05, 0.45, frame.sunDir.y ) * 0.35 + 0.62, terMeadowW );
+	return vec3f( terrainSunShadowAt( P ) * grass );
+}
+
+// Travelling gust field in [0, 1] (VegNodes gustAt): noise of (worldXZ - windDir * t * speed),
+// where the time-integrated offset comes from mat.gustOffset. Two fetches of the detail texture's
+// fbm channel (~35 m and ~15 m gust cells).
+fn terGustAt( xz: vec2f, offset: vec2f ) -> f32 {
+	let p = xz - offset;
+	let n = textureSampleLevel( terrainDetailTex, smpLinearRepeat, p / 140.0, 0.0 ).w * 0.62
+		+ textureSampleLevel( terrainDetailTex, smpLinearRepeat, p / 61.0 + 0.37, 0.0 ).w * 0.38;
+	return smoothstep( 0.46, 0.6, n );
+}
+
+// ---- wetness (swash zone) from the shore system, else a static damp band
+fn terWetFoam( xz: vec2f, h: f32 ) -> vec2f {
+#if HAS_WETNESS
+	return terrainWetness( xz, h );
+#else
+	return vec2f( smoothstep( 0.5, 0.0, h ), 0.0 );
+#endif
+}
+
+fn terDetail( uv: vec2f ) -> vec4f {
+	return textureSample( terrainDetailTex, smpAniso4Repeat, uv );
+}
+`;
+
+const TERRAIN_SURFACE = /* wgsl */`
+	let p = in.P;
+	let xz = p.xz;
+	let h = p.y;
+	var outRough = 0.9;
+	var outN = vec3f( 0.0, 1.0, 0.0 );
+	var outAO = 1.0;
+	var albedoOut = vec3f( 0.0 );
+
+	// ---- data maps
+	let nr = terrainNormalRock( xz );
+	let N0 = normalize( vec3f( nr.x, sqrt( max( 1.0 - nr.x * nr.x - nr.y * nr.y, 0.0025 ) ), nr.y ) );
+	let sp = terrainSplat( xz );
+	let slope = 1.0 - N0.y;
+	let camDist = length( frame.cameraPos - p );
+	let dpx = dpdx( p ); let dpy = dpdy( p );
+	let fwY = fwidth( h );
+
+	// ---- deep seabed (seen through the water: no rock, land cover, swash or wind ripples),
+	// the same colour / relief / AO as the full path below, from 6 detail samples instead of ~17
+	// detail samples shared by both paths (sampled in uniform control flow: no derivative seams
+	// where the paths meet)
+	let macroA = terDetail( ${ rot2( 'xz', 0.7 ) } / 173.0 ).w;
+	let macroB = terDetail( ${ rot2( 'xz', 2.1 ) } / 47.0 ).w;
+	let mcr = macroA * 0.6 + macroB * 0.4;
+	let dN = terDetail( xz / 1.9 );
+	let dM = terDetail( ${ rot2( 'xz', 1.3 ) } / 6.7 + 0.21 );
+	let dF = terDetail( ${ rot2( 'xz', 2.4 ) } / 0.63 + 0.53 );
+	let grain = min( dN.z, 0.62 );
+	let grainF = min( dF.z, 0.62 );
+	let seabedPath = h < -0.8 && nr.z < 0.05 && slope < 0.18;
+	let sw = vec2f( ${ WORLD.swellDir.x }, ${ WORLD.swellDir.y } );
+	let swDir = sw;
+	let rc = vec2f( ${ WORLD.reef.center.x.toFixed( 3 ) }, ${ WORLD.reef.center.z.toFixed( 3 ) } );
+	// ripple phases of both paths (identical there), differentiated in uniform control flow
+	let ph2 = dot( xz, swDir ) * ( 6.2832 / 0.75 ) + dM.w * 16.0 + macroB * 24.0;
+	let fade2 = 1.0 - smoothstep( 0.5, 2.0, fwidth( ph2 ) );
+	let rip2 = pow( sin( ph2 ) * 0.5 + 0.5, 1.4 );
+	let ph3 = dot( xz, swDir ) * ( 6.2832 / 0.16 ) + dM.w * 26.0 + dN.w * 5.0;
+	let fade3 = 1.0 - smoothstep( 0.6, 2.2, fwidth( ph3 ) );
+	let rip3 = pow( sin( ph3 ) * 0.5 + 0.5, 1.5 );
+	// bump height of either path: the surface-gradient bump runs after the branch (its screen-space
+	// derivatives would be undefined in quads that straddle the two paths)
+	var hdOut = 0.0;
+	if ( seabedPath ) {
+
+		let underW = 1.0;
+		let sandW = smoothstep( 0.3, 0.72, sp.x + ( dM.z - 0.5 ) * 0.5 + ( mcr - 0.5 ) * 0.35 );
+		// ---- seabed: sand with ripple fields, seagrass meadows, rubble heads
+		let depth = -h;
+		let reefD = length( xz - rc );
+		let reefW = 1.0 - smoothstep( ${ WORLD.reef.radius * 0.5 }, ${ WORLD.reef.radius * 1.15 }, reefD + ( mcr - 0.5 ) * 30.0 );
+		var under = mix( ${ S( 0.84, 0.78, 0.64 ) }, ${ S( 0.72, 0.7, 0.58 ) }, smoothstep( 1.0, 9.0, depth ) );
+		under = under * ( ( dM.w - 0.5 ) * 0.14 + 1.0 ) * ( ( grain - 0.45 ) * 0.25 + 1.0 );
+		// megaripple fields (~0.75 m) across the swell, troughs collect darker shell hash; not in
+		// the swash zone or the first metre of depth
+		let fieldW = smoothstep( 0.42, 0.62, macroB + ( dM.w - 0.5 ) * 0.35 ) * smoothstep( 0.9, 2.0, depth ) * ( 1.0 - reefW );
+		under = under * ( ( rip2 - 0.55 ) * 0.22 * fieldW * fade2 + 1.0 );
+		// small wave ripples (~0.16 m) everywhere below the swash
+		// seagrass meadows: ragged edges, blade streaks leaning with the wave surge, epiphyte tips
+		// (the fringe breaks up into clumps: noise at three scales thresholds the soft splat edge)
+		let clumps = ( dM.w - 0.5 ) * 0.5 + ( dN.y - 0.45 ) * 0.4 + ( macroB - 0.5 ) * 0.3;
+		let seagrassW = smoothstep( 0.3, 0.55, sp.z + clumps ) * underW * smoothstep( 0.3, 0.9, depth );
+		let swPerp = vec2f( -swDir.y, swDir.x );
+		let blades = terDetail( vec2f( dot( xz, swDir ) / 2.6, dot( xz, swPerp ) / 0.35 ) ).y;
+		var meadow = mix( ${ S( 0.12, 0.16, 0.07 ) }, ${ S( 0.27, 0.29, 0.15 ) }, smoothstep( 0.35, 0.75, blades ) );
+		meadow = mix( meadow, ${ S( 0.24, 0.2, 0.11 ) }, smoothstep( 0.55, 0.8, dM.y + ( macroB - 0.5 ) * 0.4 ) * 0.5 );
+		// sparse at the fringe: sand shows between the blades; thinner, paler patches inside
+		meadow = mix( under, meadow, smoothstep( 0.3, 0.85, sp.z + clumps * 0.5 ) * 0.35 + 0.65 );
+		meadow = mix( meadow, mix( meadow, under, 0.45 ), smoothstep( 0.58, 0.8, macroB + ( dM.w - 0.5 ) * 0.4 ) );
+		under = mix( under, meadow, seagrassW );
+		// rubble heads: coral rubble and rock turfed with algae, pink coralline crusts
+		let rubbleW = smoothstep( 0.3, 0.6, sp.w + ( dN.x - 0.5 ) * 0.4 + ( dM.w - 0.5 ) * 0.3 ) * underW;
+		var rubble = mix( ${ S( 0.2, 0.19, 0.15 ) }, ${ S( 0.36, 0.33, 0.26 ) }, smoothstep( 0.3, 0.7, dN.x ) );
+		rubble = mix( rubble, ${ S( 0.2, 0.24, 0.1 ) }, smoothstep( 0.5, 0.7, dF.y ) * 0.6 );
+		rubble = mix( rubble, ${ S( 0.58, 0.38, 0.44 ) }, smoothstep( 0.62, 0.74, dM.x ) * 0.6 );
+		under = mix( under, rubble, rubbleW );
+		// reef flat: coral rubble and pink crusts toward the reef
+		under = mix( under, mix( ${ S( 0.56, 0.50, 0.44 ) }, ${ S( 0.60, 0.43, 0.46 ) }, smoothstep( 0.45, 0.7, dM.x ) ), reefW * 0.7 * smoothstep( 0.4, 0.6, dN.x ) );
+
+		// damp sand below the berm (wet = 0 under water)
+		let dampMottle = smoothstep( 0.3, 0.7, dM.w + ( dN.y - 0.45 ) * 0.6 + ( macroB - 0.5 ) * 0.4 );
+		let wetK = smoothstep( 1.7, 0.5, h + dM.w * 0.3 ) * sandW * mix( 0.22, 0.5, dampMottle );
+		let wetAlbedo = terrainSaturation( under * mat.wetDarken, 1.15 ) * vec3f( 0.97, 0.98, 1.0 );
+		albedoOut = mix( under, wetAlbedo, wetK );
+		outRough = 0.75;
+		let waveR = rip3 * 0.012 * fade3 * smoothstep( -0.3, -0.9, h ) * ( 1.0 - seagrassW );
+		let megaR = rip2 * 0.035 * fade2 * fieldW * ( 1.0 - seagrassW );
+		let sandH = grain * 0.004 + grainF * 0.003 + waveR + megaR;
+		let seabedH = seagrassW * ( blades * 0.05 + 0.08 ) + rubbleW * ( dN.x * 0.07 + dF.x * 0.015 );
+		hdOut = sandH + seabedH;
+		outAO = nr.w * ( 1.0 - seagrassW * 0.3 ) * ( 1.0 - rubbleW * smoothstep( 0.55, 0.2, dN.x ) * 0.35 );
+		terMeadowW = 0.0;
+
+	} else {
+
+		// ---- detail samples (tileable heights: x rock, y soil, z sand, w fbm)
+		// sand grain without the pebble peaks (pebbles are drawn separately where they belong)
+
+		// ---- downslope streaks (rock flutes, hanging vegetation, landslide scars): the detail
+		// texture stretched vertically on the two vertical projection planes
+		let sw4 = pow( abs( N0.xz ), vec2f( 4.0 ) );
+		let swN = sw4 / ( sw4.x + sw4.y + 1e-5 );
+		let stA = terDetail( vec2f( p.z / 9.3, h / 37.0 ) );
+		let stB = terDetail( vec2f( p.x / 9.3 + 0.5, h / 37.0 + 0.3 ) );
+		let streak = stA.w * swN.x + stB.w * swN.y;
+		let scar = stA.y * swN.x + stB.y * swN.y;
+
+		// ---- rock: only evaluated where the rock mask or the slope allow it. Exposure follows the
+		// form: steep faces, convex spurs and ridges (high AO) go bare, gully floors (low AO,
+		// drainage lines) keep soil and plants; noise and fall-line streaks break the outline up.
+		// Around the bare rock a band of scree / dark soil and moss; plants creep over it.
+		let gully = sp.z * smoothstep( -0.5, 0.5, h );
+		var rockAlbedo = vec3f( 0.2 ); var rockRough = 0.8; var rockHd = 0.0;
+		var rockW = 0.0; var screeW = 0.0;
+		if ( nr.z > 0.06 || slope > 0.3 ) {
+
+			var g: RockGrad;
+			g.dpdx = dpx; g.dpdy = dpy; g.fwY = fwY; g.useGrad = true;
+			let R = terrainRockSurface( p, N0, h, mcr, 0.5, 1.0, g );
+			let cliffK = smoothstep( 0.28, 0.55, slope );
+			let convex = smoothstep( 0.5, 0.85, nr.w );
+			let rv = nr.z * 0.7 + smoothstep( 0.3, 0.62, slope ) * 0.5 + convex * 0.14 - gully * 0.4
+				+ ( R.height - 0.45 ) * 0.35 + ( dM.w - 0.5 ) * 0.34 + ( dN.w - 0.5 ) * 0.22
+				+ ( streak - 0.5 ) * 1.0 * cliffK;
+			// fades to 0 at the branch boundary: no step along the slope / mask iso-lines
+			let branchK = max( smoothstep( 0.06, 0.18, nr.z ), smoothstep( 0.3, 0.42, slope ) );
+			rockW = smoothstep( 0.5, 0.68, rv ) * branchK;
+			screeW = smoothstep( 0.28, 0.52, rv ) * branchK * ( 1.0 - rockW );
+			// weathered basalt: darker and browner than the sea-cliff palette, streaked; moss and
+			// ferns on the ledges and on the less steep parts of the faces
+			// dark wet stains down the fall line, paler dry ribs between them
+			let stain = smoothstep( 0.5, 0.7, streak ) * cliffK;
+			// dark, weathered basalt (the island's inland rock is darker and browner than the pale
+			// sea-cliff palette), stained down the fall line
+			var basalt = R.albedo * vec3f( 0.36, 0.34, 0.31 ) * ( 1.0 - stain * 0.45 ) * ( smoothstep( 0.42, 0.25, streak ) * cliffK * 0.15 + 1.0 );
+			// soil and humus caught in the joints and hollows of the rock (low relief), so the face
+			// reads as fractured stone instead of a smooth plate
+			let joints = smoothstep( 0.42, 0.22, R.height + ( dN.w - 0.5 ) * 0.25 );
+			basalt = mix( basalt, mix( ${ S( 0.13, 0.1, 0.07 ) }, ${ S( 0.2, 0.2, 0.1 ) }, dF.y ), joints * 0.7 );
+			// moss / small plants on every ledge and on the less steep parts, more near the edges
+			let ledgeMoss = smoothstep( 0.4, 0.75, N0.y + ( dN.y - 0.45 ) * 0.6 ) * smoothstep( 0.25, 0.55, macroB + dM.y * 0.4 );
+			let fringe = smoothstep( 0.5, 0.58, rv ) * smoothstep( 0.8, 0.6, rv ) * smoothstep( 0.3, 0.6, dM.w + dN.y * 0.4 );
+			let mossK = sat( max( ledgeMoss * 0.75, fringe * 0.8 ) + R.moss * 0.3 + joints * 0.25 );
+			rockAlbedo = mix( basalt, mix( ${ S( 0.12, 0.17, 0.05 ) }, ${ S( 0.22, 0.26, 0.09 ) }, dF.y ), mossK );
+			rockRough = R.rough;
+			// craggier than the boulders: the big blocks and plates stand out from afar
+			rockHd = R.hd * 2.2 + R.height * 0.6;
+
+		}
+
+		// ---- weights
+		let notRock = 1.0 - rockW;
+		let underW = smoothstep( 0.12, -0.6, h );
+		let landW = 1.0 - underW;
+		let sandW = smoothstep( 0.3, 0.72, sp.x + ( dM.z - 0.5 ) * 0.5 + ( mcr - 0.5 ) * 0.35 ) * notRock;
+		let pathW = smoothstep( 0.28, 0.62, sp.y + ( dN.y - 0.45 ) * 0.4 + ( dM.w - 0.5 ) * 0.25 ) * notRock * landW
+			* ( 1.0 - smoothstep( 50.0, 220.0, camDist ) * 0.85 );
+		// forest on the higher / steeper ground and in the gullies, tall-grass meadow on the valley
+		// floor and around the village (same classification as the vegetation's land cover)
+		let jungleW = sat( smoothstep( 9.0, 24.0, h + ( mcr - 0.5 ) * 18.0 ) + smoothstep( 0.18, 0.36, slope ) + gully * 0.6 );
+		// landslide scars: raw red-brown laterite in streaks down steep slopes, rare
+		let lateriteW = smoothstep( 0.62, 0.74, scar + ( macroB - 0.5 ) * 0.3 ) * smoothstep( 0.3, 0.42, slope )
+			* smoothstep( 0.52, 0.66, mcr ) * notRock * 0.85;
+
+		// ---- beach sand: pale coral sand, drifts of warmer / coarser sand, grain
+		let dryK = smoothstep( 0.8, 3.0, h );
+		var sand = mix( ${ S( 0.83, 0.75, 0.6 ) }, ${ S( 0.9, 0.84, 0.72 ) }, smoothstep( 0.3, 0.72, mcr + dryK * 0.2 ) );
+		sand = mix( sand, ${ S( 0.84, 0.72, 0.55 ) }, smoothstep( 0.55, 0.8, dM.w + ( macroB - 0.5 ) * 0.6 ) * 0.45 );
+		sand = sand * ( ( dM.w - 0.5 ) * 0.16 + 1.0 ) * ( ( dN.w - 0.5 ) * 0.1 + 1.0 );
+		sand = sand * ( ( grain - 0.45 ) * 0.3 + 0.97 ) * ( ( grainF - 0.45 ) * 0.2 + 1.0 );
+		// disturbed / trodden patches: slightly darker, coarser sand (footfall, crabs, wind scour)
+		let trod = smoothstep( 0.52, 0.7, dN.y + ( dM.y - 0.5 ) * 0.6 ) * dryK;
+		sand = sand * ( 1.0 - trod * 0.07 );
+		// the high-water band collects shell grit, coral bits and dried seaweed
+		let hw = h + ( dM.w - 0.5 ) * 0.5;
+		let wrackBand = smoothstep( 1.15, 1.4, hw ) * smoothstep( 2.1, 1.7, hw );
+		let pebDensity = smoothstep( 0.62, 0.85, macroB + dM.w * 0.3 ) * 0.2 + wrackBand * smoothstep( 0.3, 0.6, dM.y );
+		let pebW = smoothstep( 0.66, 0.8, dN.z ) * sat( pebDensity ) * smoothstep( 0.6, 0.9, sp.x ) * landW
+			* ( 1.0 - smoothstep( 12.0, 35.0, camDist ) );
+		let pebCol = mix( mix( ${ S( 0.86, 0.82, 0.74 ) }, ${ S( 0.78, 0.64, 0.6 ) }, smoothstep( 0.45, 0.75, dM.x ) ), ${ S( 0.36, 0.33, 0.3 ) }, smoothstep( 0.74, 0.82, dM.y ) );
+		sand = mix( sand, pebCol, pebW * 0.75 );
+		let wrack = wrackBand * smoothstep( 0.58, 0.72, dN.y ) * smoothstep( 0.4, 0.6, macroB );
+		sand = mix( sand, ${ S( 0.24, 0.18, 0.11 ) }, wrack * 0.8 );
+		// trampled sand along the paths
+		sand = sand * ( 1.0 - pathW * 0.07 );
+
+		// wind ripples on the dry sand: crests across the wind (bent by the fbm), wavelength
+		// 8-13 cm, fading where trodden; visible in the albedo too (finer sand on the crests)
+		let wd = frame.windDir;
+		let ph1 = dot( xz, wd ) * 6.2832 / mix( 0.08, 0.13, macroB ) + dM.w * 24.0 + dN.w * 7.0;
+		let fade1 = 1.0 - smoothstep( 0.6, 2.2, fwidth( ph1 ) );
+		let rip1 = pow( sin( ph1 ) * 0.5 + 0.5, 1.6 );
+		let windK = fade1 * smoothstep( 1.5, 2.2, h ) * ( 1.0 - pathW ) * ( 1.0 - trod * 0.7 )
+			* smoothstep( 0.2, 0.5, macroB + dM.w * 0.3 );
+		sand = sand * ( ( rip1 - 0.5 ) * 0.12 * windK + 1.0 );
+
+		// ---- seabed: sand with ripple fields, seagrass meadows, rubble heads
+		let depth = -h;
+		let reefD = length( xz - rc );
+		let reefW = 1.0 - smoothstep( ${ WORLD.reef.radius * 0.5 }, ${ WORLD.reef.radius * 1.15 }, reefD + ( mcr - 0.5 ) * 30.0 );
+		var under = mix( ${ S( 0.84, 0.78, 0.64 ) }, ${ S( 0.72, 0.7, 0.58 ) }, smoothstep( 1.0, 9.0, depth ) );
+		under = under * ( ( dM.w - 0.5 ) * 0.14 + 1.0 ) * ( ( grain - 0.45 ) * 0.25 + 1.0 );
+		// megaripple fields (~0.75 m) across the swell, troughs collect darker shell hash; not in
+		// the swash zone or the first metre of depth
+		let fieldW = smoothstep( 0.42, 0.62, macroB + ( dM.w - 0.5 ) * 0.35 ) * smoothstep( 0.9, 2.0, depth ) * ( 1.0 - reefW );
+		under = under * ( ( rip2 - 0.55 ) * 0.22 * fieldW * fade2 + 1.0 );
+		// small wave ripples (~0.16 m) everywhere below the swash
+		// seagrass meadows: ragged edges, blade streaks leaning with the wave surge, epiphyte tips
+		// (the fringe breaks up into clumps: noise at three scales thresholds the soft splat edge)
+		let clumps = ( dM.w - 0.5 ) * 0.5 + ( dN.y - 0.45 ) * 0.4 + ( macroB - 0.5 ) * 0.3;
+		let seagrassW = smoothstep( 0.3, 0.55, sp.z + clumps ) * underW * smoothstep( 0.3, 0.9, depth );
+		let swPerp = vec2f( -swDir.y, swDir.x );
+		let blades = terDetail( vec2f( dot( xz, swDir ) / 2.6, dot( xz, swPerp ) / 0.35 ) ).y;
+		var meadow = mix( ${ S( 0.12, 0.16, 0.07 ) }, ${ S( 0.27, 0.29, 0.15 ) }, smoothstep( 0.35, 0.75, blades ) );
+		meadow = mix( meadow, ${ S( 0.24, 0.2, 0.11 ) }, smoothstep( 0.55, 0.8, dM.y + ( macroB - 0.5 ) * 0.4 ) * 0.5 );
+		// sparse at the fringe: sand shows between the blades; thinner, paler patches inside
+		meadow = mix( under, meadow, smoothstep( 0.3, 0.85, sp.z + clumps * 0.5 ) * 0.35 + 0.65 );
+		meadow = mix( meadow, mix( meadow, under, 0.45 ), smoothstep( 0.58, 0.8, macroB + ( dM.w - 0.5 ) * 0.4 ) );
+		under = mix( under, meadow, seagrassW );
+		// rubble heads: coral rubble and rock turfed with algae, pink coralline crusts
+		let rubbleW = smoothstep( 0.3, 0.6, sp.w + ( dN.x - 0.5 ) * 0.4 + ( dM.w - 0.5 ) * 0.3 ) * underW;
+		var rubble = mix( ${ S( 0.2, 0.19, 0.15 ) }, ${ S( 0.36, 0.33, 0.26 ) }, smoothstep( 0.3, 0.7, dN.x ) );
+		rubble = mix( rubble, ${ S( 0.2, 0.24, 0.1 ) }, smoothstep( 0.5, 0.7, dF.y ) * 0.6 );
+		rubble = mix( rubble, ${ S( 0.58, 0.38, 0.44 ) }, smoothstep( 0.62, 0.74, dM.x ) * 0.6 );
+		under = mix( under, rubble, rubbleW );
+		// reef flat: coral rubble and pink crusts toward the reef
+		under = mix( under, mix( ${ S( 0.56, 0.50, 0.44 ) }, ${ S( 0.60, 0.43, 0.46 ) }, smoothstep( 0.45, 0.7, dM.x ) ), reefW * 0.7 * smoothstep( 0.4, 0.6, dN.x ) );
+		sand = mix( sand, under, underW );
+
+		// ---- ground: tall-grass meadow (tone shared with the grass field), forest floor and, from
+		// afar, the forest canopy; laterite scars
+		let V = normalize( frame.cameraPos - p );
+		let NdV = sat( dot( N0, V ) );
+		let mt = terrainMeadowTone( macroA, macroB, slope, N0.z, dM.w * 0.65 + dN.w * 0.35, true );
+		// clumps (1-3 m) and tussocks, blade-scale grain
+		let clump = dM.w * 0.6 + dN.y * 0.4;
+		// seen from afar the tussocks and their shadowed gaps are what makes tall grass read as
+		// grass (not lawn): the clump contrast grows with distance as the blades fade out
+		let clumpK = mix( 0.34, 0.95, smoothstep( 40.0, 140.0, camDist ) );
+		var lawn = mt.tone * ( ( clump - 0.5 ) * clumpK + 1.0 ) * ( ( dF.y - 0.4 ) * 0.22 + 1.0 );
+		lawn = lawn * mix( 1.0, smoothstep( 0.25, 0.55, dN.y * 0.5 + dM.y * 0.5 ) * 0.35 + 0.72, smoothstep( 50.0, 160.0, camDist ) );
+		// grass combed along the wind: long streaks (anisotropic sample of the fbm channel)
+		let combUV = vec2f( dot( xz, frame.windDir ) / 7.5, dot( xz, vec2f( -frame.windDir.y, frame.windDir.x ) ) / 0.9 );
+		let comb = terDetail( combUV + vec2f( 0.31, 0.77 ) ).w;
+		lawn = lawn * ( ( comb - 0.5 ) * 0.3 + 1.0 );
+		// seen from above the dark soil shows between the clumps; at grazing angles blade sides
+		// cover everything (lighter, more saturated)
+		let gapK = smoothstep( 0.3, 0.95, NdV ) * smoothstep( 0.62, 0.3, clump );
+		lawn = mix( lawn, MEADOW_soil, gapK * 0.45 );
+		lawn = mix( lawn, terrainSaturation( lawn * 1.12, 1.15 ), smoothstep( 0.45, 0.1, NdV ) * 0.6 );
+		// travelling gusts flatten the grass: the paler blade backs show as waves (same gust
+		// field as the grass blades)
+		let windStrength = max( frame.windSpeed * 0.1, 0.03 );
+		let gust = terGustAt( xz, mat.gustOffset ) * sat( windStrength * 0.5 );
+		lawn = mix( lawn, lawn * vec3f( 1.25, 1.22, 1.06 ) + 0.01, gust * 0.6 );
+		// bare trodden soil in places, sandy soil toward the beach
+		lawn = mix( lawn, ${ S( 0.4, 0.33, 0.23 ) }, smoothstep( 0.72, 0.84, dN.y + ( dM.y - 0.5 ) * 0.5 ) * 0.25 );
+		lawn = mix( lawn, ${ S( 0.60, 0.52, 0.38 ) }, sat( sp.x * 1.6 ) * smoothstep( 0.45, 0.62, dN.z + dM.y * 0.3 ) * 0.7 );
+		// inside the geometric grass field (GrassField) the ground is only seen between the blades:
+		// the shaded base of the sward, dark and brownish with dead leaves; it hands over to the
+		// sward's own look (above) where the blades thin out
+		let grassHere = smoothstep( 2.5, 4.5, h ) * ( 1.0 - smoothstep( 0.45, 0.85, jungleW ) ) * ( 1.0 - sat( sp.x * 1.6 ) );
+		let fieldK = ( 1.0 - smoothstep( ${ GRASS_FADE[ 0 ].toFixed( 1 ) }, ${ GRASS_FADE[ 1 ].toFixed( 1 ) }, length( p.xz - frame.cameraPos.xz ) ) ) * grassHere;
+		let swardBase = mix( mt.tone * 0.4, MEADOW_soil, 0.4 ) * ( ( dN.y - 0.45 ) * 0.6 + 1.0 ) * ( ( dF.y - 0.4 ) * 0.3 + 1.0 );
+		lawn = mix( lawn, swardBase, fieldK * 0.85 );
+		let litter = mix( ${ S( 0.2, 0.15, 0.09 ) }, ${ S( 0.34, 0.25, 0.13 ) }, dF.y );
+		var jungle = mix( ${ S( 0.1, 0.16, 0.05 ) }, litter, smoothstep( 0.52, 0.7, dN.y ) );
+		jungle = mix( jungle, ${ S( 0.12, 0.1, 0.06 ) }, gully * 0.3 );
+		let far = smoothstep( 40.0, 160.0, camDist );
+		var cover = mix( ${ S( 0.08, 0.13, 0.04 ) }, ${ S( 0.17, 0.24, 0.07 ) }, smoothstep( 0.3, 0.7, mcr ) );
+		cover = mix( cover, ${ S( 0.27, 0.29, 0.12 ) }, smoothstep( 0.66, 0.84, macroB + dM.w * 0.2 ) * 0.45 );
+		jungle = mix( jungle, cover, far * 0.8 );
+		jungle = jungle * ( ( mcr - 0.5 ) * 0.3 + 1.0 );
+		// canopy: seen from a distance (or on slopes too steep for the trees) the forest reads as
+		// a carpet of lumpy crowns with dark gaps
+		let crowns = terDetail( ${ rot2( 'xz', 0.9 ) } / 61.0 ).w;
+		let crownsB = terDetail( ${ rot2( 'xz', 2.3 ) } / 13.0 + 0.37 ).w;
+		let canopyH = smoothstep( 0.32, 0.7, crowns * 0.45 + crownsB * 0.4 + dM.w * 0.15 );
+		let canopyW = jungleW * max( smoothstep( 0.2, 0.4, slope ), smoothstep( 90.0, 260.0, camDist ) ) * smoothstep( 25.0, 70.0, camDist ) * notRock * ( 1.0 - screeW * 0.7 );
+		var canopy = mix( ${ S( 0.05, 0.08, 0.025 ) }, mix( ${ S( 0.14, 0.21, 0.06 ) }, ${ S( 0.22, 0.27, 0.09 ) }, macroB ), canopyH );
+		// steep faces: the canopy hangs in streaks down the fall line
+		canopy = canopy * ( ( streak - 0.5 ) * 0.5 * smoothstep( 0.3, 0.5, slope ) + 1.0 );
+		jungle = mix( jungle, canopy, canopyW );
+		var ground = mix( lawn, jungle, jungleW );
+		// around the bare rock: dark humus, stones and moss, with the surrounding plants creeping
+		// in (a soft, noisy band; no speckle)
+		let creepIn = smoothstep( 0.4, 0.75, dM.w + ( dN.y - 0.45 ) * 0.5 + ( macroB - 0.5 ) * 0.3 );
+		var scree = mix( ${ S( 0.16, 0.13, 0.1 ) }, ${ S( 0.27, 0.24, 0.2 ) }, smoothstep( 0.45, 0.75, dM.x + ( dN.x - 0.5 ) * 0.3 ) );
+		scree = mix( scree, mix( ${ S( 0.13, 0.18, 0.06 ) }, ${ S( 0.22, 0.26, 0.09 ) }, dF.y ), smoothstep( 0.45, 0.7, dM.y + ( dN.y - 0.45 ) * 0.5 ) * 0.7 );
+		ground = mix( ground, scree, screeW * ( 1.0 - creepIn * 0.7 ) );
+		let laterite = mix( ${ S( 0.42, 0.25, 0.16 ) }, ${ S( 0.52, 0.36, 0.24 ) }, dM.w ) * ( ( dN.y - 0.4 ) * 0.3 + 1.0 );
+		ground = mix( ground, laterite, lateriteW );
+
+		// ---- worn dirt paths / trampled ground (darker, redder soil in the forest)
+		var dirt = mix( ${ S( 0.38, 0.31, 0.23 ) }, ${ S( 0.5, 0.43, 0.32 ) }, dM.w ) * ( ( dN.y - 0.4 ) * 0.35 + 0.95 );
+		dirt = mix( dirt, ${ S( 0.3, 0.22, 0.15 ) }, jungleW * 0.7 );
+		dirt = mix( dirt, ${ S( 0.56, 0.53, 0.48 ) }, smoothstep( 0.72, 0.82, dN.z ) * 0.5 );
+		// grass creeping onto the trail, a grassy strip between the two worn ruts
+		let creep = smoothstep( 0.45, 0.7, dN.y + ( dF.y - 0.45 ) * 0.5 ) * smoothstep( 0.9, 0.5, sp.y );
+		dirt = mix( dirt, lawn, creep * 0.8 );
+
+		// ---- combine
+		let meadowW = ( 1.0 - jungleW ) * ( 1.0 - pathW ) * notRock * ( 1.0 - sandW ) * landW * ( 1.0 - screeW );
+		terMeadowW = meadowW;
+		var albedo = mix( ground, dirt, pathW );
+		albedo = mix( albedo, sand, max( sandW, underW * notRock ) );
+		albedo = mix( albedo, rockAlbedo, rockW );
+
+		// ---- wetness (swash zone) from the shore system, else a static damp band
+		let wetFoam = terWetFoam( xz, h );
+		let wet = sat( wetFoam.x ) * ( 1.0 - jungleW * 0.8 ) * landW;
+		// damp sand below the berm: darker in mottled, drying patches even when the swash has not
+		// reached it lately
+		let dampMottle = smoothstep( 0.3, 0.7, dM.w + ( dN.y - 0.45 ) * 0.6 + ( macroB - 0.5 ) * 0.4 );
+		let damp = smoothstep( 1.7, 0.5, h + dM.w * 0.3 ) * sandW * mix( 0.22, 0.5, dampMottle );
+		// sand dries in mottled patches; backwash leaves faint rills down the slope
+		let mottle = smoothstep( 0.25, 0.75, dM.w + ( dN.y - 0.45 ) * 0.5 );
+		let dryEdge = smoothstep( 0.0, 0.6, wet ) * smoothstep( 1.0, 0.6, wet );
+		let wetK = max( wet, damp ) * ( 1.0 - dryEdge * mottle * 0.6 ) * notRock;
+		let slopeDir = normalize( N0.xz + vec2f( 1e-4, 0.0 ) );
+		let rill = terDetail( vec2f( dot( xz, slopeDir ) / 3.2, dot( xz, vec2f( -slopeDir.y, slopeDir.x ) ) / 0.3 ) ).w;
+		let rillK = smoothstep( 0.2, 0.9, wet ) * smoothstep( 0.05, 0.6, h ) * sandW;
+		let wetAlbedo = terrainSaturation( albedo * mat.wetDarken, 1.15 ) * vec3f( 0.97, 0.98, 1.0 ) * ( ( rill - 0.5 ) * 0.25 * rillK + 1.0 );
+		albedo = mix( albedo, wetAlbedo, wetK );
+		// swash marks: thin wavy lines of grit left at the limits of earlier uprushes
+		let sl = ( h + dM.w * 0.18 + dN.w * 0.05 ) / 0.13;
+		let slD = abs( fract( sl ) - 0.5 );
+		let slW = fwidth( sl ) + 1e-4;
+		let swashLine = smoothstep( slW * 1.5 + 0.04, 0.0, slD ) * smoothstep( 0.2, 0.4, h ) * smoothstep( 1.6, 1.2, h )
+			* smoothstep( 0.45, 0.65, dM.y + ( macroB - 0.5 ) * 0.4 ) * sandW * ( 1.0 - smoothstep( 0.8, 2.0, slW * 10.0 ) );
+		albedo = mix( albedo * ( 1.0 - swashLine * 0.3 ), ${ S( 0.9, 0.88, 0.84 ) }, swashLine * smoothstep( 0.6, 0.75, dF.z ) * 0.5 );
+		// foam residue: lacy patterns stranded on the sand
+		let lace = smoothstep( 0.42, 0.18, terDetail( ${ rot2( 'xz', 0.4 ) } / 0.9 ).x ) * 0.7 + 0.3;
+		let residue = sat( wetFoam.y ) * lace * landW * notRock;
+		albedo = mix( albedo, ${ S( 0.88, 0.9, 0.9 ) }, residue );
+
+		// ---- roughness
+		var rough = mix( 0.88, 0.93, sandW );
+		rough = mix( rough, 0.9, pathW );
+		rough = mix( rough, rockRough, rockW );
+		// wet sand has a film of water: glossy while fresh, satin as it drains
+		rough = mix( rough, mix( 0.42, 0.16, wet ), wetK );
+		rough = mix( rough, 0.7, residue );
+		rough = mix( rough, 0.75, underW );
+		outRough = rough;
+
+		// ---- micro relief for the normal
+		let windR = rip1 * 0.005 * windK;
+		let waveR = rip3 * 0.012 * fade3 * smoothstep( -0.3, -0.9, h ) * ( 1.0 - seagrassW );
+		let megaR = rip2 * 0.035 * fade2 * fieldW * ( 1.0 - seagrassW );
+		let sandH = ( grain * 0.004 + grainF * 0.003 + pebW * 0.004 + windR + waveR + megaR ) * ( 1.0 - wet * 0.6 )
+			+ rill * 0.006 * rillK;
+		// seagrass canopy stands proud of the sand with a ragged scarp; rubble is knobbly
+		let seabedH = seagrassW * ( blades * 0.05 + 0.08 ) + rubbleW * ( dN.x * 0.07 + dF.x * 0.015 );
+		let groundH = dN.y * mix( 0.05, 0.035, jungleW ) + dF.y * 0.012 + dM.y * 0.045 + canopyH * canopyW * 2.5
+			+ clump * 0.12 * ( 1.0 - jungleW ) + comb * 0.03 * ( 1.0 - jungleW );
+		let screeH = dN.z * 0.04 + dM.x * 0.06;
+		let dirtH = dN.z * 0.012 + dN.y * 0.01;
+		var hd = mix( mix( groundH, screeH, screeW ), dirtH, pathW );
+		hd = mix( hd, sandH + seabedH, max( sandW, underW * notRock ) );
+		hd = mix( hd, rockHd, rockW );
+		hdOut = hd;
+
+		// ---- ambient occlusion: baked horizon + cavity, plus litter / crevices / seagrass canopy
+		let aoDetail = mix( 1.0, dN.y * 0.5 + 0.7, jungleW * ( 1.0 - sandW ) * notRock * landW )
+			* mix( 1.0, smoothstep( 0.2, 0.7, clump ) * 0.35 + 0.65, meadowW );
+		outAO = nr.w * aoDetail * ( 1.0 - seagrassW * 0.3 ) * ( 1.0 - rubbleW * smoothstep( 0.55, 0.2, dN.x ) * 0.35 )
+			* mix( 1.0, smoothstep( 0.15, 0.6, canopyH ) * 0.6 + 0.4, canopyW );
+
+		albedoOut = albedo;
+
+	}
+
+	outN = terrainPerturbNormal( p, N0, hdOut, 1.0 );
+
+	s.albedo = albedoOut;
+	s.roughness = outRough;
+	s.normal = outN;
+	s.ao = sat( outAO );
+`;

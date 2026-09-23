@@ -477,13 +477,18 @@ export class MeshRenderer {
 			if ( geo.indirect ) {
 
 				const ib = geo.indirect.buffer.getGPU ? geo.indirect.buffer.getGPU() : geo.indirect.buffer;
-				if ( index ) {
+				// `offsets`: several indirect commands (byte offsets) in one buffer, drawn in turn
+				// (three's geometry.setIndirect( attr, offsets ) multi-draw)
+				const offs = geo.indirect.offsets || [ geo.indirect.offset || 0 ];
+				if ( index ) rp.setIndexBuffer( index.buffer, index.format );
+				for ( const off of offs ) {
 
-					rp.setIndexBuffer( index.buffer, index.format );
-					rp.drawIndexedIndirect( ib, geo.indirect.offset || 0 );
+					if ( index ) rp.drawIndexedIndirect( ib, off );
+					else rp.drawIndirect( ib, off );
+					this.stats.draws ++;
 
-				} else rp.drawIndirect( ib, geo.indirect.offset || 0 );
-				this.stats.draws ++;
+				}
+
 				continue;
 
 			}

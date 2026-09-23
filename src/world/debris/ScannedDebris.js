@@ -1,14 +1,14 @@
-import * as THREE from 'three/webgpu';
 import {
-	Fn, float, vec3, vec4, attribute, texture, uv, mix, smoothstep, max, abs, select, positionLocal, positionWorld,
-	normalMap, luminance, saturate, Discard,
-} from 'three/tsl';
-import { bayer4, bandFade } from '../../materials/LODFade.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+	Vector3, Quaternion, Euler, Matrix4, Frustum, Sphere, BufferGeometry, Float32BufferAttribute, Uint16BufferAttribute,
+	Uint32BufferAttribute, InstancedBufferAttribute, InstancedMesh, DynamicDrawUsage,
+} from '../../engine/index.js';
+import { Texture } from '../../engine/gpu/Texture.js';
+import { generateMipmaps } from '../../engine/gpu/Mipmaps.js';
+import { commonModule } from '../../engine/render/wgsl/common.js';
+import { lodFadeModule, bandFade } from '../../materials/LODFade.js';
 import { standard } from '../../materials/Materials.js';
-import { TerrainLightingModel } from '../Terrain.js';
 import { srgb } from '../terrain/TerrainShading.js';
-import { staticVelocityMRT } from '../../post/CameraVelocity.js';
+import { parseGLB } from './GLB.js';
 
 // Photoscanned debris (CC0, Poly Haven; see public/models/debris/CREDITS.md): dead wood (logs,
 // branches) and conch shells, instanced with three LODs.
@@ -19,6 +19,7 @@ import { staticVelocityMRT } from '../../post/CameraVelocity.js';
 // material. The asset textures (1K albedo / normal / AO-rough-metal) are packed into 2K atlases
 // (2 x 2 tiles): 3 samplers.
 // Instances are re-bucketed into the LODs (and distance culled) on the CPU when the camera moves.
+// The .glb files are read by the minimal parser in GLB.js (three's GLTFLoader is gone).
 
 export const SCAN_ASSETS = [ 'dead_quiver_trunk', 'dead_quiver_branch_02', 'dead_quiver_branch_01', 'lambis_shell' ];
 export const SCAN = { TRUNK: 0, BRANCH_A: 1, BRANCH_B: 2, SHELL: 3 };
@@ -27,6 +28,16 @@ export const SCAN_SIZE = [ [ 1.994, 0.306, 0.268 ], [ 0.526, 0.287, 0.201 ], [ 0
 const LOD_DIST = [ 22, 70, 260 ]; // m (+ 6 x instance size): LOD0 | LOD1 | LOD2 | faded out
 const BAND = 0.12; // cross-fade band (Bayer screen-door, see LODFade), share of the switch distance
 const BASE = ( ( import.meta.env && import.meta.env.BASE_URL ) || '/' ) + 'models/debris/';
+
+// bytes of a file (fetch relative to the page). The headless test runner may provide a reader.
+async function loadBytes( url ) {
+
+	if ( globalThis.__debrisFile ) return globalThis.__debrisFile( url );
+	const res = await fetch( url );
+	if ( ! res.ok ) throw new Error( 'ScannedDebris: ' + url + ' ' + res.status );
+	return res.arrayBuffer();
+
+}
 
 // RGBA8 pixels of an image (top row first). The headless test runner may provide a decoder.
 async function loadPixels( url ) {
@@ -52,16 +63,16 @@ export class ScannedDebris {
 		this.parent = parent;
 		this.meshes = [];
 		this.ready = false;
-		this._lastCam = new THREE.Vector3( 1e9, 0, 0 );
-		this._lastQuat = new THREE.Quaternion();
-		this._frustum = new THREE.Frustum();
-		this._m4 = new THREE.Matrix4();
-		this._sphere = new THREE.Sphere();
-		this._v = new THREE.Vector3();
+		this._lastCam = new Vector3( 1e9, 0, 0 );
+		this._lastQuat = new Quaternion();
+		this._frustum = new Frustum();
+		this._m4 = new Matrix4();
+		this._sphere = new Sphere();
+		this._v = new Vector3();
 		for ( const r of instances ) {
 
-			const q = new THREE.Quaternion().setFromEuler( new THREE.Euler( r.roll || 0, r.yaw, r.pitch || 0, 'YXZ' ) );
-			r.matrix = new THREE.Matrix4().compose( new THREE.Vector3( r.x, r.y, r.z ), q, new THREE.Vector3( r.sx, r.sy, r.sz ) );
+			const q = new Quaternion().setFromEuler( new Euler( r.roll || 0, r.yaw, r.pitch || 0, 'YXZ' ) );
+			r.matrix = new Matrix4().compose( new Vector3( r.x, r.y, r.z ), q, new Vector3( r.sx, r.sy, r.sz ) );
 			const s = SCAN_SIZE[ r.asset ];
 			r.radius = Math.hypot( s[ 0 ] * r.sx, s[ 1 ] * r.sy, s[ 2 ] * r.sz ) / 2;
 
@@ -74,8 +85,7 @@ export class ScannedDebris {
 	async _load() {
 
 		const t0 = performance.now();
-		const loader = new GLTFLoader();
-		const gltfs = await Promise.all( SCAN_ASSETS.map( ( id ) => loader.loadAsync( BASE + id + '.glb' ) ) );
+		const glbs = await Promise.all( SCAN_ASSETS.map( async ( id ) => parseGLB( await loadBytes( BASE + id + '.glb' ) ) ) );
 		// 2 x 2 atlas per map
 		const maps = [ 'albedo', 'normal', 'arm' ];
 		const atlases = {};
@@ -90,14 +100,11 @@ export class ScannedDebris {
 				for ( let y = 0; y < T; y ++ ) data.set( t.data.subarray( y * T * 4, ( y + 1 ) * T * 4 ), ( ( oy + y ) * T * 2 + ox ) * 4 );
 
 			} );
-			const tex = new THREE.DataTexture( data, T * 2, T * 2, THREE.RGBAFormat, THREE.UnsignedByteType );
-			tex.colorSpace = m === 'albedo' ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-			tex.magFilter = THREE.LinearFilter;
-			tex.minFilter = THREE.LinearMipmapLinearFilter;
-			tex.generateMipmaps = true;
-			tex.anisotropy = 4;
-			tex.name = 'debrisScan_' + m;
-			tex.needsUpdate = true;
+			// sRGB albedo (decoded to linear by the sampler), linear normal / arm; trilinear +
+			// anisotropic (smpAnisoClamp), full mip chain
+			const tex = new Texture( { label: 'debrisScan_' + m, width: T * 2, height: T * 2, format: m === 'albedo' ? 'rgba8unorm-srgb' : 'rgba8unorm', mips: true, usage: [ 'sample', 'copyDst' ], data } );
+			tex.getGPU();
+			generateMipmaps( tex );
 			atlases[ m ] = tex;
 
 		} ) );
@@ -108,17 +115,12 @@ export class ScannedDebris {
 		for ( let l = 0; l < 3; l ++ ) {
 
 			const pos = [], nor = [], uvs = [], asset = [], idx = [];
-			gltfs.forEach( ( g, k ) => {
+			glbs.forEach( ( g, k ) => {
 
-				let mesh = null;
-				g.scene.traverse( ( o ) => {
-
-					if ( o.isMesh && o.name.startsWith( 'LOD' + l ) ) mesh = o;
-
-				} );
-				if ( ! mesh ) return;
-				mesh.updateMatrixWorld( true );
-				const geo = mesh.geometry.clone().applyMatrix4( mesh.matrixWorld );
+				// (node transforms are already applied by parseGLB)
+				const found = g.meshes.find( ( o ) => o.name.startsWith( 'LOD' + l ) );
+				if ( ! found ) return;
+				const geo = found.geometry;
 				const P = geo.attributes.position, N = geo.attributes.normal, U = geo.attributes.uv;
 				const base = pos.length / 3;
 				const ox = ( k % 2 ) * 0.5, oy = Math.floor( k / 2 ) * 0.5;
@@ -136,12 +138,12 @@ export class ScannedDebris {
 				for ( let i = 0; i < I.count; i ++ ) idx.push( base + I.getX( i ) );
 
 			} );
-			const geo = new THREE.BufferGeometry();
-			geo.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-			geo.setAttribute( 'normal', new THREE.Float32BufferAttribute( nor, 3 ) );
-			geo.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
-			geo.setAttribute( 'aAsset', new THREE.Float32BufferAttribute( asset, 1 ) );
-			geo.setIndex( pos.length / 3 > 65535 ? new THREE.Uint32BufferAttribute( idx, 1 ) : new THREE.Uint16BufferAttribute( idx, 1 ) );
+			const geo = new BufferGeometry();
+			geo.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+			geo.setAttribute( 'normal', new Float32BufferAttribute( nor, 3 ) );
+			geo.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
+			geo.setAttribute( 'aAsset', new Float32BufferAttribute( asset, 1 ) );
+			geo.setIndex( pos.length / 3 > 65535 ? new Uint32BufferAttribute( idx, 1 ) : new Uint16BufferAttribute( idx, 1 ) );
 			lodGeos.push( geo );
 
 		}
@@ -150,16 +152,18 @@ export class ScannedDebris {
 		const n = Math.max( 1, this.instances.length );
 		this.levels = lodGeos.map( ( geo, l ) => {
 
-			const iData = new THREE.InstancedBufferAttribute( new Float32Array( n * 4 ), 4 );
-			iData.setUsage( THREE.DynamicDrawUsage );
+			const iData = new InstancedBufferAttribute( new Float32Array( n * 4 ), 4 );
+			iData.setUsage( DynamicDrawUsage );
 			geo.setAttribute( 'iData', iData );
-			const mesh = new THREE.InstancedMesh( geo, this.material, n );
+			const mesh = new InstancedMesh( geo, this.material, n );
 			mesh.name = 'debris-scan-lod' + l;
 			mesh.count = 0;
 			mesh.castShadow = l === 0;
 			mesh.receiveShadow = true;
 			mesh.frustumCulled = false;
-			mesh.instanceMatrix.setUsage( THREE.DynamicDrawUsage );
+			mesh.instanceMatrix.setUsage( DynamicDrawUsage );
+			// (the TSL material used staticVelocityMRT)
+			mesh.staticVelocity = true;
 			this.parent.add( mesh );
 			this.meshes.push( mesh );
 			return { mesh, iData, tris: geo.index.count / 3 };
@@ -175,56 +179,57 @@ export class ScannedDebris {
 
 		const gpu = this.gpu;
 		const A = this.textures;
-		const mat = standard( { roughness: 0.85, metalness: 0 } );
-		mat.name = 'DebrisScanned';
-		mat.mrtNode = staticVelocityMRT;
-		mat.underwaterLighting = 'lite';
-		mat.setupLightingModel = () => new TerrainLightingModel( mat, gpu.sunShadowAt( positionWorld ) );
-		const iData = attribute( 'iData', 'vec4' ); // asset, random, LOD fade, outgoing
-		// an instance keeps only its own asset's vertices (the rest collapse to a point)
-		mat.positionNode = Fn( () => select( abs( attribute( 'aAsset', 'float' ).sub( iData.x ) ).lessThan( 0.5 ), positionLocal, vec3( 0 ) ) )();
-		mat.castShadowPositionNode = mat.positionNode;
-
-		const st = uv();
-		const albedo = texture( A.albedo, st );
-		const arm = texture( A.arm, st );
-		const rnd = iData.y;
-		const isWood = iData.x.lessThan( 2.5 );
-		mat.colorNode = Fn( () => {
-
-			const t = bayer4();
-			Discard( select( iData.w.greaterThan( 0.5 ), t.lessThan( iData.z ), t.greaterThanEqual( iData.z ) ) );
-			const p = positionWorld;
-			let c = albedo.rgb;
-			// driftwood: sun-bleached toward silver-grey, per instance
-			const grey = vec3( luminance( c ) ).mul( vec3( 1.04, 1.02, 0.98 ) ).mul( 1.12 );
-			c = mix( c, grey, select( isWood, rnd.mul( 0.4 ).add( 0.45 ), float( 0 ) ) );
-			// ground contact: dusted with sand and darker where it touches / is buried
-			const ground = gpu.heightAt( p.xz );
-			const contact = float( 1 ).sub( smoothstep( 0.0, 0.1, p.y.sub( ground ) ) );
-			const sandy = smoothstep( 0.6, 1.6, ground );
-			c = mix( c, srgb( 0.8, 0.72, 0.58 ), contact.mul( sandy ).mul( 0.45 ) );
-			// wet below the swash line: darker (and glossier, see roughness)
-			const wet = float( 1 ).sub( smoothstep( 0.4, 1.1, p.y ) );
-			c = c.mul( float( 1 ).sub( wet.mul( 0.45 ) ) );
-			return vec4( c, 1 );
-
-		} )();
-		mat.roughnessNode = Fn( () => {
-
-			const wet = float( 1 ).sub( smoothstep( 0.4, 1.1, positionWorld.y ) );
-			return mix( max( arm.g, 0.35 ), float( 0.22 ), wet.mul( 0.85 ) );
-
-		} )();
-		mat.metalnessNode = float( 0 );
-		mat.aoNode = Fn( () => {
-
-			const p = positionWorld;
-			const contact = float( 1 ).sub( smoothstep( 0.0, 0.12, p.y.sub( gpu.heightAt( p.xz ) ) ) );
-			return saturate( arm.r.mul( float( 1 ).sub( contact.mul( 0.4 ) ) ) );
-
-		} )();
-		mat.normalNode = normalMap( texture( A.normal, st ) );
+		const mat = standard( {
+			name: 'DebrisScanned',
+			roughness: 0.85, metalness: 0,
+			underwaterLighting: 'lite',
+			// the former TerrainLightingModel (heightfield sun shadow on the key light)
+			modules: [ commonModule, lodFadeModule, gpu.module, gpu.sunModulationModule ],
+			defines: { MATERIAL_SUN_MODULATION: 1 },
+			textures: { scanAlbedo: A.albedo, scanNormal: A.normal, scanArm: A.arm },
+			attributes: { aAsset: 'f32', iData: 'vec4f' }, // iData: asset, random, LOD fade, outgoing
+			varyings: { vIData: 'vec4f' },
+			// an instance keeps only its own asset's vertices (the rest collapse to a point); the
+			// vertex stage runs in the shadow passes too (castShadowPositionNode = positionNode)
+			vertex: /* wgsl */`
+	if ( abs( v.aAsset - v.iData.x ) >= 0.5 ) { v.position = vec3f( 0.0 ); }
+	o.vIData = v.iData;
+`,
+			surface: /* wgsl */`
+	let iData = in.vs.vIData;
+	let st = in.uv;
+	let albedo = textureSample( scanAlbedo, smpAnisoClamp, st );
+	let arm = textureSample( scanArm, smpAnisoClamp, st );
+	let nmap = textureSample( scanNormal, smpAnisoClamp, st ).xyz * 2.0 - 1.0;
+	let rnd = iData.y;
+	let isWood = iData.x < 2.5;
+	if ( ! lodFadeVisible( in.pixel, iData.z, iData.w > 0.5 ) ) { discard; }
+	let p = in.P;
+	var c = albedo.rgb;
+	// driftwood: sun-bleached toward silver-grey, per instance
+	let grey = vec3f( luminance( c ) ) * vec3f( 1.04, 1.02, 0.98 ) * 1.12;
+	c = mix( c, grey, select( 0.0, rnd * 0.4 + 0.45, isWood ) );
+	// ground contact: dusted with sand and darker where it touches / is buried
+	let ground = terrainHeightAt( p.xz );
+	let contact = 1.0 - smoothstep( 0.0, 0.1, p.y - ground );
+	let sandy = smoothstep( 0.6, 1.6, ground );
+	c = mix( c, ${ srgb( 0.8, 0.72, 0.58 ) }, contact * sandy * 0.45 );
+	// wet below the swash line: darker (and glossier, see roughness)
+	let wet = 1.0 - smoothstep( 0.4, 1.1, p.y );
+	c = c * ( 1.0 - wet * 0.45 );
+	s.albedo = c;
+	s.roughness = mix( max( arm.g, 0.35 ), 0.22, wet * 0.85 );
+	s.metalness = 0.0;
+	let contactAO = 1.0 - smoothstep( 0.0, 0.12, p.y - ground );
+	s.ao = sat( arm.r * ( 1.0 - contactAO * 0.4 ) );
+	// tangent-space normal map (derivative TBN, as three's normalMap without tangents)
+	s.normal = perturbNormalByMap( p, in.N, st, nmap );
+`,
+			// the LOD cross-fade discarded in the shadow pass too (three evaluated colorNode.a there)
+			shadow: /* wgsl */`
+	return lodFadeVisible( in.pixel, in.vs.vIData.z, in.vs.vIData.w > 0.5 );
+`,
+		} );
 		return mat;
 
 	}
@@ -300,7 +305,7 @@ export class ScannedDebris {
 		}
 
 		if ( this.material ) this.material.dispose();
-		if ( this.textures ) for ( const k in this.textures ) this.textures[ k ].dispose();
+		if ( this.textures ) for ( const k in this.textures ) this.textures[ k ].destroy();
 
 	}
 

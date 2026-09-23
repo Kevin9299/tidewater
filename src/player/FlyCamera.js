@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../engine/index.js';
 
 // Free-fly debug camera: drag (or pointer lock) to look, WASD + QE to move, Shift = fast.
 export class FlyCamera {

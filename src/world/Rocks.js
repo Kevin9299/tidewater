@@ -1,16 +1,10 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, float, vec4, mix, smoothstep, saturate, select, positionWorld, normalWorld, transformNormalToView,
-	texture, attribute, Discard,
-} from 'three/tsl';
+import * as THREE from '../engine/index.js';
 import { Noise2D, mulberry32, smoothstep as sstep } from '../util/Noise.js';
 import { standard } from '../materials/Materials.js';
 import { WORLD } from './WorldLayout.js';
 import { buildRockGeometry, ROCK_STYLES } from './terrain/RockGeometry.js';
-import { rockSurface, perturbNormal, rot2, srgb } from './terrain/TerrainShading.js';
-import { TerrainLightingModel } from './Terrain.js';
-import { staticVelocityMRT } from '../post/CameraVelocity.js';
-import { bayer4, bandFade } from '../materials/LODFade.js';
+import { rot2, srgb, terrainShadingModule } from './terrain/TerrainShading.js';
+import { lodFadeModule, bandFade } from '../materials/LODFade.js';
 
 // Scattered procedural rocks: boulders and blocks on the rocky shores (some half submerged),
 // talus below cliffs, outcrops breaking through the hillsides, rubble around the sea stacks and a
@@ -75,6 +69,8 @@ export class Rocks {
 				m.castShadow = castShadow && name.endsWith( 'near' );
 				m.receiveShadow = true;
 				m.frustumCulled = false;
+				// re-bucketed every camera move: motion vectors use the static-world reprojection
+				m.staticVelocity = true;
 				m.instanceMatrix.setUsage( THREE.DynamicDrawUsage );
 				this.group.add( m );
 				this.meshes.push( m );
@@ -347,37 +343,38 @@ export class Rocks {
 	_createMaterial( sunShadow ) {
 
 		const gpu = this.terrainGPU;
-		const tex = gpu ? gpu.detailTexture : null;
-		const mat = standard( { roughness: 0.8, metalness: 0 } );
-		mat.name = 'Rocks';
-		mat.mrtNode = staticVelocityMRT;
-		if ( ! tex ) return mat;
-		if ( sunShadow ) mat.setupLightingModel = () => new TerrainLightingModel( mat, gpu.sunShadowAt( positionWorld ) );
-		const p = positionWorld;
-		const N = normalWorld.toVar();
-		const macro = texture( tex, rot2( p.xz, 0.9 ).div( 61 ) ).w.mul( 0.6 ).add( texture( tex, rot2( p.xz, 2.3 ).div( 17 ) ).w.mul( 0.4 ) );
-		const R = rockSurface( { tex, p, N, h: p.y, macro } );
-		// contact with the ground: sand / soil drifted against the base, darker crevice
-		const ground = gpu.heightAt( p.xz );
-		const above = p.y.sub( ground );
-		const sp = gpu.splat( p.xz );
-		const contact = float( 1 ).sub( smoothstep( 0.0, 0.22, above.add( R.height.sub( 0.5 ).mul( 0.15 ) ) ) ).mul( smoothstep( - 0.2, 0.3, ground ) );
-		const drift = mix( srgb( 0.33, 0.27, 0.18 ), srgb( 0.8, 0.72, 0.56 ), sp.x );
-		const albedo = mix( R.albedo, drift, contact.mul( 0.8 ) );
+		const mat = standard( { name: 'Rocks', roughness: 0.8, metalness: 0 } );
+		if ( ! gpu ) return mat;
+		// heightfield sun shadow (the former TerrainLightingModel)
+		mat.modules = [ gpu.module, terrainShadingModule(), lodFadeModule, ...( sunShadow ? [ gpu.sunModulationModule ] : [] ) ];
+		if ( sunShadow ) mat.defines.MATERIAL_SUN_MODULATION = 1;
+		mat.attributes = { iLod: 'vec2f', ao: 'f32' };
+		mat.varyings = { vLod: 'vec2f', vCav: 'f32' };
+		mat.vertex = 'o.vLod = v.iLod; o.vCav = v.ao;';
 		// LOD cross-fade: iLod = (fade, outgoing); the incoming level keeps the dither cells below
 		// `fade`, the outgoing one the others (both levels are drawn only inside the band)
-		const iLod = attribute( 'iLod', 'vec2' );
-		mat.colorNode = Fn( () => {
-
-			const t = bayer4();
-			Discard( select( iLod.y.greaterThan( 0.5 ), t.lessThan( iLod.x ), t.greaterThanEqual( iLod.x ) ) );
-			return vec4( albedo, 1 );
-
-		} )();
-		mat.roughnessNode = mix( R.rough, float( 0.9 ), contact );
-		mat.normalNode = transformNormalToView( perturbNormal( N, R.hd, 1.0 ) );
-		const cav = attribute( 'ao', 'float' );
-		mat.aoNode = saturate( cav.mul( float( 1 ).sub( contact.mul( 0.35 ) ) ).mul( smoothstep( 0.0, 0.35, R.height ).mul( 0.35 ).add( 0.65 ) ) );
+		const lodDiscard = 'if ( ! lodFadeVisible( in.pixel, in.vs.vLod.x, in.vs.vLod.y > 0.5 ) ) { discard; }';
+		mat.shadow = `${ lodDiscard }\n\treturn true;`;
+		mat.surface = /* wgsl */`
+	let p = in.P;
+	let N = in.N;
+	let g = terrainImplicitGrad( p );
+	let mcr = textureSample( terrainDetailTex, smpAniso4Repeat, ${ rot2( 'p.xz', 0.9 ) } / 61.0 ).w * 0.6
+		+ textureSample( terrainDetailTex, smpAniso4Repeat, ${ rot2( 'p.xz', 2.3 ) } / 17.0 ).w * 0.4;
+	let R = terrainRockSurface( p, N, p.y, mcr, 0.5, 1.0, g );
+	// contact with the ground: sand / soil drifted against the base, darker crevice
+	let ground = terrainHeightAt( p.xz );
+	let above = p.y - ground;
+	let sp = terrainSplat( p.xz );
+	let contact = ( 1.0 - smoothstep( 0.0, 0.22, above + ( R.height - 0.5 ) * 0.15 ) ) * smoothstep( -0.2, 0.3, ground );
+	let drift = mix( ${ srgb( 0.33, 0.27, 0.18 ) }, ${ srgb( 0.8, 0.72, 0.56 ) }, sp.x );
+	let nb = terrainPerturbNormal( p, N, R.hd, 1.0 );
+	${ lodDiscard }
+	s.albedo = mix( R.albedo, drift, contact * 0.8 );
+	s.roughness = mix( R.rough, 0.9, contact );
+	s.normal = nb;
+	s.ao = sat( in.vs.vCav * ( 1.0 - contact * 0.35 ) * ( smoothstep( 0.0, 0.35, R.height ) * 0.35 + 0.65 ) );
+`;
 		return mat;
 
 	}

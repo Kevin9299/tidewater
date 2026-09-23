@@ -1,9 +1,9 @@
-import * as THREE from 'three/webgpu';
+import { BufferGeometry, ConeGeometry, CylinderGeometry, Float32BufferAttribute, Vector3 } from '../../engine/index.js';
 import { box, roundedBox, cylinder, rod, sphere, torus, lathe, tube, mat4, alignY, auxVertices } from './GeoKit.js';
 import { foredeckY, PALETTE } from './HullBuilder.js';
 import { lerp } from './HullLines.js';
 
-const V = ( x, y, z ) => new THREE.Vector3( x, y, z );
+const V = ( x, y, z ) => new Vector3( x, y, z );
 
 const STAINLESS = { color: PALETTE.stainless, rough: 0.22, metal: 1 };
 const GALV = { color: 0xa3a7ab, rough: 0.35, metal: 1 };
@@ -43,9 +43,9 @@ export function buildDeckGear( kit, L, parts ) {
 // A face quad (meters UV) for the trap bucket; aux carries the face size for the frame border.
 function trapFace( a, b, c, d, w, h, pattern = 0 ) {
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( [ a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z ], 3 ) );
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( [ 0, 0, w, 0, w, h, 0, h ], 2 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( [ a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z ], 3 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( [ 0, 0, w, 0, w, h, 0, h ], 2 ) );
 	g.setIndex( [ 0, 1, 2, 0, 2, 3 ] );
 	g.computeVertexNormals();
 	return { g, opts: { rough: w, metal: h, pattern } };
@@ -348,7 +348,7 @@ function buildBow( kit, L ) {
 	knuckle.applyMatrix4( mat4( sb.x, sb.y, sb.z, 0, 0, Math.PI / 2 ) );
 	kit.add( 'fittings', knuckle, GALV );
 	const plowDir = V( 0, - 0.85, - 0.4 ).normalize();
-	const plow = new THREE.ConeGeometry( 0.12, 0.34, 4 );
+	const plow = new ConeGeometry( 0.12, 0.34, 4 );
 	plow.rotateY( Math.PI / 4 );
 	plow.scale( 1, 1, 0.38 );
 	plow.applyMatrix4( alignY( sb.clone().add( V( 0, - 0.02, 0.02 ) ).addScaledVector( plowDir, 0.17 ), plowDir ) );
@@ -368,7 +368,7 @@ function buildBow( kit, L ) {
 function buildContainers( kit, L ) {
 
 	// bait tote beside the hauler
-	const tote = new THREE.CylinderGeometry( 0.43, 0.37, 0.36, 4, 1 );
+	const tote = new CylinderGeometry( 0.43, 0.37, 0.36, 4, 1 );
 	tote.rotateY( Math.PI / 4 );
 	tote.scale( 1, 1, 0.62 );
 	tote.translate( - 0.72, L.deckY + 0.18, - 1.45 );
@@ -453,9 +453,9 @@ function buildStern( kit, L, parts ) {
 
 	for ( const flip of [ false, true ] ) {
 
-		const g = new THREE.BufferGeometry();
-		g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-		g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+		const g = new BufferGeometry();
+		g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+		g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 		const ix = flip ? idx.map( ( _, k ) => idx[ k - ( k % 3 ) + ( 2 - ( k % 3 ) ) ] ) : idx.slice();
 		g.setIndex( ix );
 		g.computeVertexNormals();

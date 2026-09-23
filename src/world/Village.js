@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { BufferGeometry, Color, Euler, Group, Mesh, Vector3 } from '../engine/index.js';
 import { mulberry32 } from '../util/Noise.js';
 import { Builder, Batch } from './village/GeoBuilder.js';
 import { createVillageMaterials } from './village/VillageMaterials.js';
@@ -6,7 +6,7 @@ import { VillageTextures } from './village/TextureBaker.js';
 import { buildHouse, buildBoathouse, buildMarketStall, buildShed } from './village/Buildings.js';
 import { buildBoardwalk } from './village/Boardwalk.js';
 import { buildPier, PIER } from './Pier.js';
-import { G } from '../core/Globals.js';
+import { G } from '../engine/render/Frame.js';
 import {
 	InstancedProps, Rand, lin, C, WOOD, rowboat, netRack, fishRack, fence, laundryLine, oar, buoy,
 	bench, ropeCoil, pathLight, lampPost, bucket, wreck,
@@ -57,7 +57,7 @@ const ROOFS = {
 
 const CURTAINS = [ lin( 0xe8d6b0 ), lin( 0xd98c7a ), lin( 0x9cc0d8 ), lin( 0xf0e8d8 ), lin( 0xc9d89a ) ];
 
-const _lanternEuler = new THREE.Euler();
+const _lanternEuler = new Euler();
 
 export class Village {
 
@@ -70,7 +70,7 @@ export class Village {
 		this.footprints = [];
 		this.foundationChecks = [];
 		this.buildings = [];
-		this.group = new THREE.Group();
+		this.group = new Group();
 		this.group.name = 'Village';
 
 		const rand = new Rand( mulberry32( 90210 ) );
@@ -246,11 +246,11 @@ export class Village {
 		// benches, a lamp and some barrels around the market stall
 		const g = ( x, z ) => terrain.heightAt( x, z );
 		bench( B, 36.2, g( 36.2, - 108.2 ), - 108.2, 0.9, 1.6, rand.next(), lin( 0x4f8fa0 ) );
-		colliders.addBox( new THREE.Vector3( 36.2, g( 36.2, - 108.2 ) + 0.45, - 108.2 ), new THREE.Vector3( 0.85, 0.45, 0.3 ), 0.9, { tag: 'bench' } );
+		colliders.addBox( new Vector3( 36.2, g( 36.2, - 108.2 ) + 0.45, - 108.2 ), new Vector3( 0.85, 0.45, 0.3 ), 0.9, { tag: 'bench' } );
 		bench( B, 45.8, g( 45.8, - 108.6 ), - 108.6, - 0.85, 1.6, rand.next(), lin( 0xb05a45 ) );
-		colliders.addBox( new THREE.Vector3( 45.8, g( 45.8, - 108.6 ) + 0.45, - 108.6 ), new THREE.Vector3( 0.85, 0.45, 0.3 ), - 0.85, { tag: 'bench' } );
+		colliders.addBox( new Vector3( 45.8, g( 45.8, - 108.6 ) + 0.45, - 108.6 ), new Vector3( 0.85, 0.45, 0.3 ), - 0.85, { tag: 'bench' } );
 		const lw = lampPost( B, 44.3, g( 44.3, - 106.2 ), - 106.2, - 2.4, 3.3, rand.next() );
-		lights.push( { position: lw, color: new THREE.Color( 1.0, 0.72, 0.42 ), intensity: 5, kind: 'lantern' } );
+		lights.push( { position: lw, color: new Color( 1.0, 0.72, 0.42 ), intensity: 5, kind: 'lantern' } );
 		colliders.addCylinder( 44.3, - 106.2, 0.1, g( 44.3, - 106.2 ), g( 44.3, - 106.2 ) + 3.4, { tag: 'lampPost' } );
 		this.foundationChecks.push( { x: 44.3, y: g( 44.3, - 106.2 ), z: - 106.2 } );
 		for ( const [ x, z ] of [ [ 37.4, - 115.6 ], [ 38.1, - 116.1 ] ] ) {
@@ -270,7 +270,7 @@ export class Village {
 
 		const { B, terrain, colliders, rand } = ctx;
 		const g = ( x, z ) => terrain.heightAt( x, z );
-		const box = ( x, y, z, hx, hy, hz, ry, tag ) => colliders.addBox( new THREE.Vector3( x, y, z ), new THREE.Vector3( hx, hy, hz ), ry, { tag } );
+		const box = ( x, y, z, hx, hy, hz, ry, tag ) => colliders.addBox( new Vector3( x, y, z ), new Vector3( hx, hy, hz ), ry, { tag } );
 
 		// rowboats pulled up on the sand near the pier foot
 		const boats = [
@@ -382,7 +382,7 @@ export class Village {
 			if ( i > 0 ) {
 
 				const px = 57.8 + ( i - 1 ) * 1.6, pz = - 67.8 - ( i - 1 ) * 0.25;
-				B.tube( 'rope', [ new THREE.Vector3( px, g( px, pz ) + 1.15, pz ), new THREE.Vector3( ( px + x ) / 2, ( g( px, pz ) + g( x, z ) ) / 2 + 0.95, ( pz + z ) / 2 ), new THREE.Vector3( x, g( x, z ) + 1.15, z ) ], 0.014, { radial: 4, tint: C.rope, data: [ rand.next(), 0, 0, 0 ] } );
+				B.tube( 'rope', [ new Vector3( px, g( px, pz ) + 1.15, pz ), new Vector3( ( px + x ) / 2, ( g( px, pz ) + g( x, z ) ) / 2 + 0.95, ( pz + z ) / 2 ), new Vector3( x, g( x, z ) + 1.15, z ) ], 0.014, { radial: 4, tint: C.rope, data: [ rand.next(), 0, 0, 0 ] } );
 
 			}
 
@@ -400,7 +400,7 @@ export class Village {
 		// picket fence around house A's side yard and a rail fence near G
 		const fenceAt = ( pts, style, tint ) => {
 
-			fence( B, pts, g, style, tint, rand.next(), colliders, ( x, z ) => new THREE.Vector3( x, 0, z ) );
+			fence( B, pts, g, style, tint, rand.next(), colliders, ( x, z ) => new Vector3( x, 0, z ) );
 			for ( const [ x, z ] of pts ) this.foundationChecks.push( { x, y: g( x, z ) - 0.13, z } );
 
 		};
@@ -427,7 +427,7 @@ export class Village {
 
 		// fish drying rack and scattered gear in the village
 		fishRack( B, 67.0, g( 67.0, - 118.5 ), - 118.5, - 0.25, 2.4, rand.next(), rand );
-		colliders.addBox( new THREE.Vector3( 67.0, g( 67.0, - 118.5 ) + 1.0, - 118.5 ), new THREE.Vector3( 1.35, 1.0, 0.75 ), - 0.25, { tag: 'rack' } );
+		colliders.addBox( new Vector3( 67.0, g( 67.0, - 118.5 ) + 1.0, - 118.5 ), new Vector3( 1.35, 1.0, 0.75 ), - 0.25, { tag: 'rack' } );
 		this.foundationChecks.push( { x: 67.0, y: g( 67.0, - 118.5 ) - 0.2, z: - 118.5 } );
 		netRack( B, 5.5, g( 5.5, - 136.5 ), - 136.5, 0.35, 3.0, lin( 0x6a5a8a ), rand.next(), ( lx, lz ) => g( 5.5 + lx * Math.cos( 0.35 ) + lz * Math.sin( 0.35 ), - 136.5 - lx * Math.sin( 0.35 ) + lz * Math.cos( 0.35 ) ) );
 		for ( const sx of [ - 1.5, 1.5 ] ) {
@@ -454,7 +454,7 @@ export class Village {
 			if ( ! stack ) {
 
 				if ( type === 'barrel' ) colliders.addCylinder( x, z, 0.32, gy, gy + 0.9, { tag: 'barrel' } );
-				else colliders.addBox( new THREE.Vector3( x, gy + 0.25, z ), new THREE.Vector3( type === 'trap' ? 0.48 : 0.33, 0.3, type === 'trap' ? 0.28 : 0.24 ), ry, { tag: type } );
+				else colliders.addBox( new Vector3( x, gy + 0.25, z ), new Vector3( type === 'trap' ? 0.48 : 0.33, 0.3, type === 'trap' ? 0.28 : 0.24 ), ry, { tag: type } );
 
 			}
 
@@ -475,7 +475,7 @@ export class Village {
 
 		}
 
-		colliders.addBox( new THREE.Vector3( 88.2, g( 88.2, - 124.5 ) + 0.6, - 124.5 ), new THREE.Vector3( 0.75, 0.6, 2.0 ), 1.2, { tag: 'rowboat' } );
+		colliders.addBox( new Vector3( 88.2, g( 88.2, - 124.5 ) + 0.6, - 124.5 ), new Vector3( 0.75, 0.6, 2.0 ), 1.2, { tag: 'rowboat' } );
 		this.foundationChecks.push( { x: 88.2, y: g( 88.2, - 124.5 ) - 0.17, z: - 124.5 } );
 		bucket( B, 86.9, g( 86.9, - 122.6 ), - 122.6, C.blue, rand.next() );
 
@@ -483,7 +483,7 @@ export class Village {
 		for ( const [ x, z ] of [ [ 33.5, - 125.5 ], [ 48.0, - 130.5 ], [ 42.0, - 142.0 ] ] ) {
 
 			const w = pathLight( B, x, g( x, z ) - 0.25, z, rand.next() );
-			lights.push( { position: w, color: new THREE.Color( 1.0, 0.7, 0.4 ), intensity: 2.5, kind: 'pathLight' } );
+			lights.push( { position: w, color: new Color( 1.0, 0.7, 0.4 ), intensity: 2.5, kind: 'pathLight' } );
 			colliders.addCylinder( x, z, 0.1, g( x, z ) - 0.25, g( x, z ) + 0.95, { tag: 'pathLight' } );
 			this.foundationChecks.push( { x, y: g( x, z ) - 0.25, z } );
 
@@ -537,31 +537,29 @@ export class Village {
 		this.meshes = [];
 		for ( const key in ranges ) {
 
-			const geo = new THREE.BufferGeometry();
+			const geo = new BufferGeometry();
 			for ( const name in shared.attributes ) geo.setAttribute( name, shared.attributes[ name ] );
 			geo.setIndex( shared.index );
 			geo.boundingBox = shared.boundingBox;
 			geo.boundingSphere = shared.boundingSphere;
 			const r = ranges[ key ];
 			geo.setDrawRange( r.start, r.count );
-			const mesh = new THREE.Mesh( geo, mats[ key ] );
+			const mesh = new Mesh( geo, mats[ key ] );
 			mesh.name = 'village_' + key;
 			mesh.receiveShadow = true;
 			mesh.castShadow = key === 'wood';
 			if ( key === 'wood' ) {
 
+				// the engine has no onBeforeShadow / onAfterShadow: onBeforeRender runs per pass
+				// (before the draw list is built) with that pass's camera; the sun shadow cascade
+				// cameras (render/Shadows.js) are flagged isShadowCamera (and use standard depth)
 				const range = geo.drawRange;
-				mesh.onBeforeShadow = () => {
+				mesh.onBeforeRender = ( renderer, scene, camera ) => {
 
-					range.start = 0;
-					range.count = total;
-
-				};
-
-				mesh.onAfterShadow = () => {
-
-					range.start = r.start;
-					range.count = r.count;
+					this.textures.bake();
+					const shadow = !! camera && ( camera.isShadowCamera === true || camera.reversedDepth === false );
+					range.start = shadow ? 0 : r.start;
+					range.count = shadow ? total : r.count;
 
 				};
 
@@ -575,7 +573,7 @@ export class Village {
 
 		if ( fabric.vcount > 0 ) {
 
-			const mesh = new THREE.Mesh( fabric.build(), mats.fabric );
+			const mesh = new Mesh( fabric.build(), mats.fabric );
 			mesh.name = 'village_fabric';
 			mesh.receiveShadow = true;
 			mesh.castShadow = false;
@@ -585,7 +583,7 @@ export class Village {
 
 		if ( nets.vcount > 0 ) {
 
-			const mesh = new THREE.Mesh( nets.build(), mats.net );
+			const mesh = new Mesh( nets.build(), mats.net );
 			mesh.name = 'village_nets';
 			mesh.receiveShadow = true;
 			mesh.castShadow = false;
@@ -596,6 +594,11 @@ export class Village {
 		// fish, lobsters, ice and banana leaves (market stall, drying racks, cleaning tables): one
 		// instanced mesh with the fish material (fish/FishProps.js)
 		if ( B.fishProps ) this.group.add( B.fishProps.build() );
+
+		// the texture bake is recorded by whichever village mesh is drawn first in a frame
+		// (the TSL version's VillageBakeNode.updateBefore); bake() is a no-op afterwards
+		const bake = () => this.textures.bake();
+		for ( const mesh of this.meshes ) if ( ! mesh.onBeforeRender ) mesh.onBeforeRender = bake;
 
 		for ( const mesh of this.meshes ) {
 
@@ -621,7 +624,7 @@ export class Village {
 		const S = this.signB, pivot = this.pierInfo.signPivot;
 		this.signB = null;
 		if ( ! S || ! pivot ) return;
-		this.sign = new THREE.Group();
+		this.sign = new Group();
 		this.sign.name = 'village_sign';
 		this.sign.position.copy( pivot );
 		this.sign.rotation.order = 'YXZ';
@@ -631,7 +634,7 @@ export class Village {
 			if ( ! b || b.vcount === 0 ) continue;
 			const geo = b.build();
 			geo.translate( - pivot.x, - pivot.y, - pivot.z );
-			const mesh = new THREE.Mesh( geo, this.materials[ key ] );
+			const mesh = new Mesh( geo, this.materials[ key ] );
 			mesh.name = 'village_sign_' + key;
 			mesh.castShadow = true;
 			mesh.receiveShadow = true;
@@ -656,7 +659,7 @@ export class Village {
 
 			const S = h.B;
 			h.B = null;
-			const g = new THREE.Group();
+			const g = new Group();
 			g.name = 'village_lantern';
 			g.position.copy( h.pivot );
 			const glass = S.batches.glass;
@@ -669,7 +672,7 @@ export class Village {
 				const geo = b.build();
 				geo.translate( - h.pivot.x, - h.pivot.y, - h.pivot.z );
 				geo.computeBoundingSphere();
-				const mesh = new THREE.Mesh( geo, mats[ key ] );
+				const mesh = new Mesh( geo, mats[ key ] );
 				mesh.name = 'village_lantern_' + key;
 				mesh.castShadow = false;
 				mesh.receiveShadow = true;

@@ -1,45 +1,48 @@
-import * as THREE from 'three/webgpu';
-import { Fn, uniform, vec4, positionWorld, mrt } from 'three/tsl';
+import { Matrix4 } from '../engine/math/index.js';
 
 // Motion vectors for geometry that doesn't move in the world (only the camera does).
-// three's velocity node tracks previous instance matrices with an extra vertex buffer, which
-// pushes heavily instanced materials (vegetation) past the 8 vertex buffer limit. Static
+// three's velocity node tracked previous instance matrices with an extra vertex buffer, which
+// pushed heavily instanced materials (vegetation) past the 8 vertex buffer limit. Static
 // instances don't need it: reproject the world position with last frame's camera instead.
-const currViewProj = uniform( new THREE.Matrix4() ).setName( 'velCurrViewProj' );
-export const prevViewProj = uniform( new THREE.Matrix4() ).setName( 'velPrevViewProj' );
-const _m = new THREE.Matrix4();
+// In the engine this is a per-object flag (MeshRenderer: previous model matrix = current), and the
+// camera matrices live in the frame uniforms (frame.viewProjNoJitter / frame.prevViewProjNoJitter,
+// written by PostFX.beginFrame). The WGSL equivalent of the former `staticVelocity` node is
+// STATIC_VELOCITY_WGSL (uv-space motion, current - previous, y down: the velocity target convention).
+
+export const STATIC_VELOCITY_WGSL = /* wgsl */`
+fn staticVelocity( P: vec3f ) -> vec2f {
+	let c = frame.viewProjNoJitter * vec4f( P, 1.0 );
+	let q = frame.prevViewProjNoJitter * vec4f( P, 1.0 );
+	return ( c.xy / c.w - q.xy / q.w ) * vec2f( 0.5, -0.5 );
+}
+`;
+
+// last frame's unjittered view-projection (CPU mirror, for systems that reproject on the CPU side)
+export const prevViewProj = { value: new Matrix4() };
+const currViewProj = new Matrix4();
+const _m = new Matrix4();
 let _hasPrev = false;
 
-export const staticVelocity = Fn( () => {
-
-	const p = vec4( positionWorld, 1 );
-	const c = currViewProj.mul( p );
-	const q = prevViewProj.mul( p );
-	return c.xy.div( c.w ).sub( q.xy.div( q.w ) );
-
-} )();
-
-export const staticVelocityMRT = mrt( { velocity: staticVelocity } );
-
-// Call once per frame before the (jittered) scene render, with the unjittered camera.
+// Call once per frame before the (jittered) scene render, with the unjittered camera. The frame
+// uniforms are written by PostFX.beginFrame; this keeps the CPU mirror above.
 export function updateCameraVelocity( camera ) {
 
 	camera.updateMatrixWorld();
+	if ( camera.matrixWorldInverse ) camera.matrixWorldInverse.copy( camera.matrixWorld ).invert();
 	_m.multiplyMatrices( camera.projectionMatrix, camera.matrixWorldInverse );
-	if ( _hasPrev ) prevViewProj.value.copy( currViewProj.value );
+	if ( _hasPrev ) prevViewProj.value.copy( currViewProj );
 	else prevViewProj.value.copy( _m );
-	currViewProj.value.copy( _m );
+	currViewProj.copy( _m );
 	_hasPrev = true;
 
 }
 
-// Use the static velocity for every material under root.
+// Use the static velocity for every mesh under root.
 export function useStaticVelocity( root ) {
 
 	root.traverse( ( o ) => {
 
-		if ( ! o.material ) return;
-		for ( const m of Array.isArray( o.material ) ? o.material : [ o.material ] ) m.mrtNode = staticVelocityMRT;
+		o.staticVelocity = true;
 
 	} );
 

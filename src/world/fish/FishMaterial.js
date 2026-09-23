@@ -1,20 +1,13 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, If, float, vec2, vec3, vec4, attribute, positionLocal, normalLocal, positionView, positionWorld, varyingProperty,
-	sin, cos, mix, smoothstep, abs, fract, floor, length, max, min, select, mrt, cameraProjectionMatrix, cameraViewMatrix,
-	uniformArray, int, fwidth, dot, normalView, positionViewDirection, sign, clamp, pow, luminance, atan, step,
-	interleavedGradientNoise, screenCoordinate, Discard,
-} from 'three/tsl';
-import { G } from '../../core/Globals.js';
-import { bayer4 } from '../../materials/LODFade.js';
-import { physical } from '../../materials/Materials.js';
-import { staticVelocity, staticVelocityMRT } from '../../post/CameraVelocity.js';
-import { rotateQ, bumpNormal } from '../reef/ReefMaterials.js';
+import { Color, Vector4 } from '../../engine/index.js';
+import { Material } from '../../engine/render/Material.js';
+import { ShaderModule, UniformBlock } from '../../engine/gpu/Shader.js';
+import { commonModule } from '../../engine/render/wgsl/common.js';
+import { lodFadeModule } from '../../materials/LODFade.js';
 import { SPECIES, SKIN, PATTERN } from './FishSpecies.js';
 import { PART } from './FishGeometry.js';
 
-// The fish material (TSL), shared by the swimming fish (FishSchools) and the fish on the
-// market stall, drying racks and cleaning tables (FishProps).
+// The fish material (WGSL, ported from TSL), shared by the swimming fish (FishSchools) and the
+// fish on the market stall, drying racks and cleaning tables (FishProps).
 //
 // Everything is procedural: a per-species table of colours and anatomy landmarks (eye, gill
 // cover, lateral line, jaw hinge) and the species' markings in the fragment stage. Body skin:
@@ -26,9 +19,23 @@ import { PART } from './FishGeometry.js';
 // further away). The vertex stage poses the model: a travelling swimming wave with pectoral
 // sculling (swimming fish, with true motion vectors), or an open jaw and a curled / sagging
 // body (props: fish lying on ice or hanging from a hook).
+//
+// Port notes:
+//  - the instance record comes from the ReefBatch module (see recordOf() below and reef/ReefBatch.js);
+//  - motion vectors: the TSL version added the fish's own motion (vFishDelta) to the static
+//    (camera) velocity in the MRT output; here the vertex stage sets the previous world position
+//    ( world - delta ), which the mesh template turns into exactly that velocity;
+//  - bumpNormal (view-space Mikkelsen bump in ReefMaterials) = perturbNormalByHeight in world space;
+//  - the props' maskNode (stochastic fin transparency) is a discard in the surface (and in the
+//    shadow hook, as TSL's maskNode also applied to the shadow pass).
+//
+// WGSL (module `fishModule()`): fishRotateQ, fishRow( pattern, k ), fishHash, fishVnoise,
+// fishOpercleEdge, fishOpercleMask, fishBand, fishPartOf, fishJawOf, fishSwimOffset, fishEyeCol.
 
-const aData = attribute( 'aData', 'vec4' );
 const ROWS = 8; // vec4 rows per species in the table
+
+// see the note at s.specularIntensity in surface()
+export const FISH_SPECULAR = 'reference';
 
 // species order = pattern ids
 const NAMES = Object.keys( PATTERN ).sort( ( a, b ) => PATTERN[ a ] - PATTERN[ b ] );
@@ -36,7 +43,7 @@ const NAMES = Object.keys( PATTERN ).sort( ( a, b ) => PATTERN[ a ] - PATTERN[ b
 function buildTable() {
 
 	const rows = [];
-	const lin = ( hex ) => new THREE.Color( hex );
+	const lin = ( hex ) => new Color( hex );
 	for ( const name of NAMES ) {
 
 		const S = SPECIES[ name ], K = SKIN[ name ];
@@ -45,60 +52,128 @@ function buildTable() {
 		rows.push(
 			// guanine reflection: a metal-like specular layer, kept moderate so that silvery fish
 			// stay bright in the dim underwater environment lighting
-			new THREE.Vector4( b.r, b.g, b.b, S.metal * 0.55 ),
-			new THREE.Vector4( f.r, f.g, f.b, S.irid ),
-			new THREE.Vector4( be.r, be.g, be.b, K.rough ),
-			new THREE.Vector4( fi.r, fi.g, fi.b, S.mouth.tip ),
-			new THREE.Vector4( e.r, e.g, e.b, S.scales ),
-			new THREE.Vector4( ir.r, ir.g, ir.b, S.scaleVis ),
-			new THREE.Vector4( 0.5 - S.eye.u * L, S.eye.y, S.eye.r, 0.5 - S.opercle * L ),
-			new THREE.Vector4( S.lateral, S.arch, 0.5 - S.mouth.corner * L, S.mouth.y ),
+			new Vector4( b.r, b.g, b.b, S.metal * 0.55 ),
+			new Vector4( f.r, f.g, f.b, S.irid ),
+			new Vector4( be.r, be.g, be.b, K.rough ),
+			new Vector4( fi.r, fi.g, fi.b, S.mouth.tip ),
+			new Vector4( e.r, e.g, e.b, S.scales ),
+			new Vector4( ir.r, ir.g, ir.b, S.scaleVis ),
+			new Vector4( 0.5 - S.eye.u * L, S.eye.y, S.eye.r, 0.5 - S.opercle * L ),
+			new Vector4( S.lateral, S.arch, 0.5 - S.mouth.corner * L, S.mouth.y ),
 		);
 
 	}
 
-	return uniformArray( rows, 'vec4' );
+	return new UniformBlock( 'FishSkin', { rows: [ `vec4f[${ rows.length }]`, rows ] }, { label: 'fishSkin' } );
 
 }
 
 let _table = null;
 export const skinTable = () => _table || ( _table = buildTable() );
 
-// varyings shared by the vertex and fragment stages
-function varyings() {
+// float literal of a table constant
+const f = ( x ) => {
 
-	return {
-		local: varyingProperty( 'vec3', 'vFishLocal' ), // rest pose position (model units)
-		data: varyingProperty( 'vec4', 'vFishData' ), // aData
-		info: varyingProperty( 'vec4', 'vFishInfo' ), // pattern, seed, length (m), 0
-		flags: varyingProperty( 'vec4', 'vFishFlags' ), // props: cloudy eye, wet, dried, blood
-		delta: varyingProperty( 'vec3', 'vFishDelta' ), // swimming fish: world motion since the last frame
-		fade: varyingProperty( 'vec2', 'vFishFade' ), // level-of-detail cross-fade: share, outgoing
-	};
+	const s = String( x );
+	return s.includes( '.' ) || s.includes( 'e' ) ? s : s + '.0';
+
+};
+const PT = ( name ) => f( PATTERN[ name ] );
+const PA = ( name ) => f( PART[ name ] );
+
+let _module = null;
+export function fishModule() {
+
+	if ( _module ) return _module;
+	_module = new ShaderModule( {
+		name: 'fish',
+		deps: [ commonModule, lodFadeModule ],
+		uniforms: skinTable(),
+		uniformName: 'fishSkin',
+		code: /* wgsl */`
+fn fishRotateQ( q: vec4f, v: vec3f ) -> vec3f { return v + cross( q.xyz, cross( q.xyz, v ) + v * q.w ) * 2.0; }
+fn fishRow( pattern: f32, k: i32 ) -> vec4f { return fishSkin.rows[ clamp( i32( pattern ), 0, ${ NAMES.length - 1 } ) * ${ ROWS } + k ]; }
+fn fishPartOf( d: vec4f ) -> f32 { return floor( d.y + 0.01 ); }
+fn fishJawOf( d: vec4f ) -> f32 { return max( fract( d.y + 0.01 ) - 0.01, 0.0 ) / 0.9; }
+
+fn fishHash( p: vec2f ) -> f32 { return fract( sin( dot( p, vec2f( 127.1, 311.7 ) ) ) * 43758.5453 ); }
+
+// value noise 2D (cheap, for blotches and skin variation)
+fn fishVnoise( p: vec2f ) -> f32 {
+	let i = floor( p ); let f = fract( p );
+	let w = f * f * ( 3.0 - f * 2.0 );
+	let a = fishHash( i ); let b = fishHash( i + vec2f( 1.0, 0.0 ) ); let c = fishHash( i + vec2f( 0.0, 1.0 ) ); let d = fishHash( i + vec2f( 1.0, 1.0 ) );
+	return mix( mix( a, b, w.x ), mix( c, d, w.x ), w.y );
+}
+
+// posterior edge of the gill cover (local z) at height fraction h: convex backward, sweeping
+// forward under the throat
+fn fishOpercleEdge( zOp: f32, h: f32 ) -> f32 { return zOp - 0.028 * ( 1.0 - h * h ) + smoothstep( -0.35, -1.0, h ) * 0.07; }
+fn fishOpercleMask( h: f32 ) -> f32 { return smoothstep( -0.98, -0.9, h ) * ( 1.0 - smoothstep( 0.45, 0.62, h ) ); }
+
+fn fishBand( x: f32, center: f32, width: f32, soft: f32 ) -> f32 { return 1.0 - smoothstep( width, width + soft, abs( x - center ) ); }
+
+// Deformation as a function of the phase (evaluated for this and the previous frame):
+// fish: travelling body wave (amplitude grows toward the tail) plus the turning bend,
+// sculling pectorals; rays: the disc margins undulate (stingray) or flap (eagle ray);
+// turtle: the front flippers stroke, the hind ones paddle.
+// d = aData, p = rest position, amp = wave amplitude, bend = turning bend at this vertex
+fn fishSwimOffset( ph: f32, d: vec4f, p: vec3f, env: f32, amp: f32, bend: f32, eagle: bool ) -> vec3f {
+	let u = d.x;
+	let part = fishPartOf( d );
+	let isDisc = part == ${ PA( 'DISC' ) };
+	let isFlip = part == ${ PA( 'FLIPPER' ) };
+	let turtle = part > ${ f( PART.WHIP + 0.5 ) };
+	let side = d.z; // rays: distance from the midline; flippers: along the flipper
+	let lat = sin( ph - u * 5.6 ) * env * amp + bend;
+	let flap = select( 0.0, sin( ph * 0.7 + 1.3 ) * d.z * 0.035, part == ${ PA( 'PECTORAL' ) } );
+	let fish = vec3f( lat + flap * sign( p.x ), 0.0, 0.0 );
+	let k = select( 8.0, 1.2, eagle );
+	let disc = vec3f( 0.0, sin( ph - u * k ) * pow( side, 1.6 ) * amp, 0.0 );
+	let front = d.w < 1.5;
+	let stroke = vec3f( 0.0, sin( ph ) * select( 0.07, 0.3, front ), cos( ph ) * select( 0.0, 0.14, front ) ) * side;
+	return select( select( select( fish, vec3f( 0.0 ), turtle ), stroke, isFlip ), disc, isDisc );
+}
+
+// eye colour: pupil, iris with radial streaks, dark rim
+fn fishEyeCol( r: f32, ang: f32, irisC: vec3f, cloudy: f32 ) -> vec3f {
+	let streak = sin( ang * 26.0 ) * 0.5 + 0.5;
+	let iris = irisC * mix( 0.65, 1.15, streak ) * ( smoothstep( 0.4, 0.6, r ) * 0.5 + 0.5 );
+	let ring = smoothstep( 0.78, 0.95, r );
+	var e = mix( iris, vec3f( 0.03, 0.03, 0.03 ), ring );
+	e = mix( e, vec3f( 0.005, 0.006, 0.008 ), 1.0 - smoothstep( 0.4, 0.46, r ) );
+	// cloudy eyes of fish out of the water for a while
+	e = mix( e, vec3f( 0.42, 0.44, 0.46 ), cloudy * 0.55 * ( 1.0 - smoothstep( 0.7, 1.0, r ) ) );
+	return e;
+}
+`,
+	} );
+	return _module;
 
 }
 
-const partOf = ( d ) => floor( d.y.add( 0.01 ) );
-
-// Level-of-detail cross-fade (see ReefBatch fade channel, materials/LODFade.js): the incoming level
-// keeps the Bayer cells below the fade, the outgoing one the others.
-const fadeDiscard = ( f ) => {
-
-	const t = bayer4();
-	Discard( select( f.y.greaterThan( 0.5 ), t.lessThan( f.x ), t.greaterThanEqual( f.x ) ) );
-
+// varyings shared by the vertex and fragment stages
+const VARYINGS = {
+	vFishLocal: 'vec3f', // rest pose position (model units)
+	vFishData: 'vec4f', // aData
+	vFishInfo: 'vec4f', // pattern, seed, length (m), 0
+	vFishFlags: 'vec4f', // props: cloudy eye, wet, dried, blood
+	vFishFade: 'vec2f', // level-of-detail cross-fade: share, outgoing
 };
 
-// record index of this vertex's instance (main or fade channel)
-const recordOf = ( batch, V, fade ) => {
+// Record of this vertex's instance (main or fade channel): WGSL statements defining r0, q, r2, r3
+// (and o.vFishFade). The batch's module (batch.module) holds the instance storage and the lookups.
+function recordOf( batch, fade ) {
 
-	if ( ! fade ) return batch.recordIndex();
-	const e = batch.fadeEntry();
-	V.fade.assign( vec2( e.fade, e.outgoing ) );
-	return e.index;
+	let head;
+	if ( fade ) head = `let fe = ${ batch.fadeEntry() };\n\tlet ri = fe.index;\n\to.vFishFade = vec2f( fe.fade, fe.outgoing );`;
+	else head = `let ri = ${ batch.recordIndex() };\n\to.vFishFade = vec2f( 1.0, 0.0 );`;
+	const r = batch.record( 'ri' );
+	return /* wgsl */`
+	${ head }
+	let r0 = ${ r[ 0 ] }; let q = ${ r[ 1 ] }; let r2 = ${ r[ 2 ] }; let r3 = ${ r[ 3 ] };`;
 
-};
-const jawOf = ( d ) => max( fract( d.y.add( 0.01 ) ).sub( 0.01 ), 0 ).div( 0.9 );
+}
 
 // ---------------------------------------------------------------------------
 // vertex stages
@@ -106,615 +181,534 @@ const jawOf = ( d ) => max( fract( d.y.add( 0.01 ) ).sub( 0.01 ), 0 ).div( 0.9 )
 // Swimming fish. Record: r0 = ( position, length ), r1 = orientation, r2 = ( wave phase,
 // amplitude, turning bend, pattern + seed * 0.9 ), r3 = ( world motion since the last frame,
 // phase change )
-function swimVertex( batch, V, fade ) {
+function swimVertex( batch, fade ) {
 
-	return Fn( () => {
-
-		const rec = batch.record( recordOf( batch, V, fade ) );
-		const r0 = rec[ 0 ], q = rec[ 1 ], r2 = rec[ 2 ], r3 = rec[ 3 ];
-		const u = aData.x;
-		const part = partOf( aData );
-		const p = positionLocal.toVar();
-		V.local.assign( p );
-		V.data.assign( aData );
-		V.info.assign( vec4( floor( r2.w ), fract( r2.w ), r0.w, 0 ) );
-		V.flags.assign( vec4( 0, 0, 0, 0 ) );
-		// Deformation as a function of the phase (evaluated for this and the previous frame):
-		// fish: travelling body wave (amplitude grows toward the tail) plus the turning bend,
-		// sculling pectorals; rays: the disc margins undulate (stingray) or flap (eagle ray);
-		// turtle: the front flippers stroke, the hind ones paddle.
-		const pattern = floor( r2.w );
-		const env = u.mul( u ).mul( 0.85 ).add( 0.08 ).mul( smoothstep( 0.0, 0.25, u ).mul( 0.7 ).add( 0.3 ) );
-		const bend = r2.z.mul( u.mul( u ) );
-		const isDisc = part.equal( PART.DISC ), isFlip = part.equal( PART.FLIPPER );
-		const turtle = part.greaterThan( PART.WHIP + 0.5 );
-		const eagle = pattern.equal( PATTERN.eagleRay );
-		const side = aData.z; // rays: distance from the midline; flippers: along the flipper
-		const offset = ( ph ) => {
-
-			const lat = sin( ph.sub( u.mul( 5.6 ) ) ).mul( env ).mul( r2.y ).add( bend );
-			const flap = select( part.equal( PART.PECTORAL ), sin( ph.mul( 0.7 ).add( 1.3 ) ).mul( aData.z ).mul( 0.035 ), 0 );
-			const fish = vec3( lat.add( flap.mul( sign( p.x ) ) ), 0, 0 );
-			const k = select( eagle, 1.2, 8.0 );
-			const disc = vec3( 0, sin( ph.sub( u.mul( k ) ) ).mul( pow( side, 1.6 ) ).mul( r2.y ), 0 );
-			const front = aData.w.lessThan( 1.5 );
-			const stroke = vec3( 0, sin( ph ).mul( select( front, 0.3, 0.07 ) ), cos( ph ).mul( select( front, 0.14, 0.0 ) ) ).mul( side );
-			return select( isDisc, disc, select( isFlip, stroke, select( turtle, vec3( 0 ), fish ) ) );
-
-		};
-
-		const off = offset( r2.x );
-		p.addAssign( off );
-		V.delta.assign( rotateQ( q, off.sub( offset( r2.x.sub( r3.w ) ) ) ).mul( r0.w ).add( r3.xyz ) );
-		normalLocal.assign( rotateQ( q, normalLocal ) );
-		return rotateQ( q, p.mul( r0.w ) ).add( r0.xyz );
-
-	} )();
+	return /* wgsl */`
+	${ recordOf( batch, fade ) }
+	let d = v.aData;
+	let u = d.x;
+	var p = v.position;
+	o.vFishLocal = p;
+	o.vFishData = d;
+	o.vFishInfo = vec4f( floor( r2.w ), fract( r2.w ), r0.w, 0.0 );
+	o.vFishFlags = vec4f( 0.0 );
+	let pattern = floor( r2.w );
+	let env = ( u * u * 0.85 + 0.08 ) * ( smoothstep( 0.0, 0.25, u ) * 0.7 + 0.3 );
+	let bend = r2.z * ( u * u );
+	let eagle = pattern == ${ PT( 'eagleRay' ) };
+	let off = fishSwimOffset( r2.x, d, p, env, r2.y, bend, eagle );
+	p += off;
+	// the fish's own motion since the last frame (position change + swimming wave): motion vectors
+	let delta = fishRotateQ( q, off - fishSwimOffset( r2.x - r3.w, d, v.position, env, r2.y, bend, eagle ) ) * r0.w + r3.xyz;
+	v.useWorld = true;
+	v.worldNormal = fishRotateQ( q, v.normal );
+	v.worldPos = fishRotateQ( q, p * r0.w ) + r0.xyz;
+	v.prevWorldPos = v.worldPos - delta;`;
 
 }
 
 // Fish props. Record: r0 = ( position, length ), r1 = orientation, r2 = ( pattern + seed * 0.9,
 // lateral curl, dorso-ventral sag (1 / body length), jaw opening (rad) ), r3 = ( cloudy eye, wet,
 // dried, blood )
-function propVertex( batch, V, table, fade ) {
+function propVertex( batch, fade ) {
 
-	return Fn( () => {
+	return /* wgsl */`
+	${ recordOf( batch, fade ) }
+	let d = v.aData;
+	let pattern = floor( r2.x );
+	var p = v.position;
+	var n = v.normal;
+	o.vFishLocal = p;
+	o.vFishData = d;
+	o.vFishInfo = vec4f( pattern, fract( r2.x ), r0.w, 0.0 );
+	o.vFishFlags = r3;
 
-		const rec = batch.record( recordOf( batch, V, fade ) );
-		const r0 = rec[ 0 ], q = rec[ 1 ], r2 = rec[ 2 ], r3 = rec[ 3 ];
-		const pattern = floor( r2.x );
-		const p = positionLocal.toVar(), n = normalLocal.toVar();
-		V.local.assign( p );
-		V.data.assign( aData );
-		V.info.assign( vec4( pattern, fract( r2.x ), r0.w, 0 ) );
-		V.flags.assign( r3 );
-		V.delta.assign( vec3( 0 ) );
+	// lower jaw: rotates down about the hinge at the corner of the mouth
+	let hinge = fishRow( pattern, 7 ).zw;
+	let a = r2.w * fishJawOf( d );
+	let ca = cos( a ); let sa = sin( a );
+	let dy = p.y - hinge.y; let dz = p.z - hinge.x;
+	p.y = hinge.y + dy * ca - dz * sa;
+	p.z = hinge.x + dy * sa + dz * ca;
+	let ny = n.y * ca - n.z * sa; let nz = n.y * sa + n.z * ca;
+	n.y = ny;
+	n.z = nz;
 
-		// lower jaw: rotates down about the hinge at the corner of the mouth
-		const hinge = table.element( int( pattern ).mul( ROWS ).add( 7 ) ).zw;
-		const a = r2.w.mul( jawOf( aData ) );
-		const ca = cos( a ), sa = sin( a );
-		const dy = p.y.sub( hinge.y ).toVar(), dz = p.z.sub( hinge.x ).toVar();
-		p.y.assign( hinge.y.add( dy.mul( ca ) ).sub( dz.mul( sa ) ) );
-		p.z.assign( hinge.x.add( dy.mul( sa ) ).add( dz.mul( ca ) ) );
-		const ny = n.y.mul( ca ).sub( n.z.mul( sa ) ).toVar(), nz = n.y.mul( sa ).add( n.z.mul( ca ) ).toVar();
-		n.y.assign( ny );
-		n.z.assign( nz );
-
-		// body bent along circular arcs about its middle: sideways (curl), then up / down (sag)
-		const k1 = r2.y.add( select( r2.y.greaterThanEqual( 0 ), 1e-4, - 1e-4 ) );
-		const t1 = k1.mul( p.z );
-		const c1 = cos( t1 ), s1 = sin( t1 ), h1 = sin( t1.mul( 0.5 ) );
-		const x1 = h1.mul( h1 ).mul( 2 ).div( k1 ).add( p.x.mul( c1 ) );
-		const z1 = s1.div( k1 ).sub( p.x.mul( s1 ) );
-		const nx1 = n.x.mul( c1 ).add( n.z.mul( s1 ) ), nz1 = n.z.mul( c1 ).sub( n.x.mul( s1 ) );
-		const k2 = r2.z.add( select( r2.z.greaterThanEqual( 0 ), 1e-4, - 1e-4 ) );
-		const t2 = k2.mul( z1 );
-		const c2 = cos( t2 ), s2 = sin( t2 ), h2 = sin( t2.mul( 0.5 ) );
-		const y2 = h2.mul( h2 ).mul( 2 ).div( k2 ).add( p.y.mul( c2 ) );
-		const z2 = s2.div( k2 ).sub( p.y.mul( s2 ) );
-		const ny2 = n.y.mul( c2 ).add( nz1.mul( s2 ) ), nz2 = nz1.mul( c2 ).sub( n.y.mul( s2 ) );
-		normalLocal.assign( rotateQ( q, vec3( nx1, ny2, nz2 ) ) );
-		return rotateQ( q, vec3( x1, y2, z2 ).mul( r0.w ) ).add( r0.xyz );
-
-	} )();
+	// body bent along circular arcs about its middle: sideways (curl), then up / down (sag)
+	let k1 = r2.y + select( -1e-4, 1e-4, r2.y >= 0.0 );
+	let t1 = k1 * p.z;
+	let c1 = cos( t1 ); let s1 = sin( t1 ); let h1 = sin( t1 * 0.5 );
+	let x1 = h1 * h1 * 2.0 / k1 + p.x * c1;
+	let z1 = s1 / k1 - p.x * s1;
+	let nx1 = n.x * c1 + n.z * s1; let nz1 = n.z * c1 - n.x * s1;
+	let k2 = r2.z + select( -1e-4, 1e-4, r2.z >= 0.0 );
+	let t2 = k2 * z1;
+	let c2 = cos( t2 ); let s2 = sin( t2 ); let h2 = sin( t2 * 0.5 );
+	let y2 = h2 * h2 * 2.0 / k2 + p.y * c2;
+	let z2 = s2 / k2 - p.y * s2;
+	let ny2 = n.y * c2 + nz1 * s2; let nz2 = nz1 * c2 - n.y * s2;
+	v.useWorld = true;
+	v.worldNormal = fishRotateQ( q, vec3f( nx1, ny2, nz2 ) );
+	v.worldPos = fishRotateQ( q, vec3f( x1, y2, z2 ) * r0.w ) + r0.xyz;
+	v.prevWorldPos = v.worldPos;`;
 
 }
 
 // ---------------------------------------------------------------------------
 // fragment stage
 
-const hash = ( p ) => fract( sin( dot( p, vec2( 127.1, 311.7 ) ) ).mul( 43758.5453 ) );
+// Level-of-detail cross-fade (see ReefBatch fade channel, materials/LODFade.js): the incoming level
+// keeps the Bayer cells below the fade, the outgoing one the others.
+const FADE_DISCARD = /* wgsl */`
+	if ( ! lodFadeVisible( in.pixel, in.vs.vFishFade.x, in.vs.vFishFade.y > 0.5 ) ) { discard; }`;
 
-// value noise 2D (cheap, for blotches and skin variation)
-const vnoise = ( p ) => {
+// shared by colour and relief (scales), then the relief (bump height, m)
+const COMMON = /* wgsl */`
+	let D = in.vs.vFishData; let Lp = in.vs.vFishLocal; let I = in.vs.vFishInfo;
+	let pattern = floor( I.x + 0.5 );
+	let part = fishPartOf( D );
+	let scaleSize = fishRow( pattern, 4 ).w; let scaleVis = fishRow( pattern, 5 ).w;
+	// scale rows: posterior margins are arcs, rows offset by half a scale
+	let ss = max( scaleSize, 0.004 );
+	let warp = sin( Lp.z * 23.0 + D.z * 31.0 ) * 0.35 + sin( Lp.z * 41.0 - D.z * 17.0 ) * 0.25;
+	let sa = ( 0.5 - Lp.z ) / ss + warp; let sb = D.z / ( ss * 0.8 ) + warp * 0.6;
+	let rowI = floor( sb );
+	let fb = fract( sb ) * 2.0 - 1.0;
+	let sf = fract( sa + rowI * 0.5 + fb * fb * 0.32 );
+	// pixel footprint (m) against the scale size (m): fade out sub-pixel detail
+	let Pv = ( frame.view * vec4f( in.P, 1.0 ) ).xyz;
+	let px = length( fwidth( Pv ) );
+	let sfade = ( 1.0 - smoothstep( 0.25, 0.7, px / ( ss * I.z ) ) ) * select( 0.0, 1.0, scaleSize > 0.001 );
 
-	const i = floor( p ), f = fract( p );
-	const w = f.mul( f ).mul( float( 3 ).sub( f.mul( 2 ) ) );
-	const a = hash( i ), b = hash( i.add( vec2( 1, 0 ) ) ), c = hash( i.add( vec2( 0, 1 ) ) ), d = hash( i.add( vec2( 1, 1 ) ) );
-	return mix( mix( a, b, w.x ), mix( c, d, w.x ), w.y );
-
-};
-
-// posterior edge of the gill cover (local z) at height fraction h: convex backward, sweeping
-// forward under the throat
-const opercleEdge = ( zOp, h ) => zOp.sub( float( 0.028 ).mul( float( 1 ).sub( h.mul( h ) ) ) ).add( smoothstep( - 0.35, - 1.0, h ).mul( 0.07 ) );
-const opercleMask = ( h ) => smoothstep( - 0.98, - 0.9, h ).mul( float( 1 ).sub( smoothstep( 0.45, 0.62, h ) ) );
-
-const band = ( x, center, width, soft ) => float( 1 ).sub( smoothstep( width, width.add( soft ), abs( x.sub( center ) ) ) );
-
-function surface( V, table, prop, lodFade ) {
-
-	const albedo = vec3( 0.5 ).toVar( 'fishAlbedo' );
-	const rough = float( 0.4 ).toVar( 'fishRough' );
-	const metal = float( 0 ).toVar( 'fishMetal' );
-	const transl = float( 0 ).toVar( 'fishTransl' );
-	const coat = float( 0 ).toVar( 'fishCoat' );
-	const spec = float( 0.5 ).toVar( 'fishSpec' );
-	const row = ( pattern, k ) => table.element( int( pattern ).mul( ROWS ).add( k ) );
-
-	// shared by colour and relief
-	const common = () => {
-
-		const D = V.data, Lp = V.local, I = V.info;
-		const pattern = I.x.add( 0.5 ).floor();
-		const part = partOf( D );
-		const scaleSize = row( pattern, 4 ).w, scaleVis = row( pattern, 5 ).w;
-		// scale rows: posterior margins are arcs, rows offset by half a scale
-		const ss = max( scaleSize, 0.004 );
-		const warp = sin( Lp.z.mul( 23 ).add( D.z.mul( 31 ) ) ).mul( 0.35 ).add( sin( Lp.z.mul( 41 ).sub( D.z.mul( 17 ) ) ).mul( 0.25 ) );
-		const a = float( 0.5 ).sub( Lp.z ).div( ss ).add( warp ), b = D.z.div( ss.mul( 0.8 ) ).add( warp.mul( 0.6 ) );
-		const rowI = floor( b );
-		const fb = fract( b ).mul( 2 ).sub( 1 );
-		const f = fract( a.add( rowI.mul( 0.5 ) ).add( fb.mul( fb ).mul( 0.32 ) ) );
-		// pixel footprint (m) against the scale size (m): fade out sub-pixel detail
-		const px = length( fwidth( positionView ) );
-		const fade = float( 1 ).sub( smoothstep( 0.25, 0.7, px.div( ss.mul( I.z ) ) ) ).mul( select( scaleSize.greaterThan( 0.001 ), 1, 0 ) );
-		return { D, Lp, I, pattern, part, a, b, f, px, fade, scaleVis };
-
-	};
-
-	const height = Fn( () => {
-
-		const { D, Lp, I, pattern, part, f, fade, scaleVis } = common();
-		const isBody = part.equal( PART.BODY );
-		const L = I.z;
+	// ---- relief
+	var bumpH = 0.0;
+	{
+		let isBody = part == ${ PA( 'BODY' ) };
+		let L = I.z;
 		// scales: each rises toward its free posterior margin
-		const sc = smoothstep( 0.0, 0.9, f ).mul( float( 1 ).sub( smoothstep( 0.9, 1.0, f ) ) ).mul( fade ).mul( scaleVis );
+		let sc = smoothstep( 0.0, 0.9, sf ) * ( 1.0 - smoothstep( 0.9, 1.0, sf ) ) * sfade * scaleVis;
 		// gill cover: raised in front of its edge
-		const eyeOp = row( pattern, 6 );
-		const h = D.w;
-		const zE = opercleEdge( eyeOp.w, h );
-		const onOp = opercleMask( h );
-		const op = smoothstep( - 0.004, 0.004, Lp.z.sub( zE ) ).mul( onOp );
-		const bodyH = sc.mul( 0.0007 ).add( op.mul( 0.0025 ) );
+		let eyeOp = fishRow( pattern, 6 );
+		let h = D.w;
+		let zE = fishOpercleEdge( eyeOp.w, h );
+		let onOp = fishOpercleMask( h );
+		let op = smoothstep( -0.004, 0.004, Lp.z - zE ) * onOp;
+		let bodyH = sc * 0.0007 + op * 0.0025;
 		// fin rays: ridges
-		const isFin = part.greaterThan( 0.5 ).and( part.lessThan( 7.5 ) );
-		const rd = abs( fract( D.w.add( 0.5 ) ).sub( 0.5 ) );
-		const ray = float( 1 ).sub( smoothstep( 0.0, 0.25, rd ) ).mul( 0.0004 );
-		return select( isBody, bodyH, select( isFin, ray, 0 ) ).mul( L );
-
-	} )();
-
-	const color = Fn( () => {
-
-		if ( lodFade ) fadeDiscard( V.fade );
-		const { D, Lp, I, pattern, part, a, b, f, px, fade, scaleVis } = common();
-		const seed = I.y.toVar(), L = I.z.toVar();
-		const pat = pattern.toVar();
-		const P = part.toVar();
-		const u = D.x.toVar(), h = D.w.toVar(), s = D.z.toVar();
-		const z = Lp.z.toVar(), y = Lp.y.toVar();
-		const t = D.z.toVar(), w = D.w.toVar(); // fins: along / across the rays
-		const isBody = P.equal( PART.BODY ).toVar();
-		const isFin = P.greaterThan( 0.5 ).and( P.lessThan( 7.5 ) ).toVar();
-		const bodyK = select( isBody, 1, 0 ).toVar();
-		const r0 = row( pat, 0 ), r1 = row( pat, 1 ), r2 = row( pat, 2 ), r3 = row( pat, 3 ), r4 = row( pat, 4 ), r5 = row( pat, 5 ), r6 = row( pat, 6 ), r7 = row( pat, 7 );
-		const back = r0.xyz.toVar(), flank = r1.xyz.toVar(), belly = r2.xyz.toVar();
-		const finC = r3.xyz.toVar(), edgeC = r4.xyz.toVar(), irisC = r5.xyz.toVar();
-		const eye = r6.toVar(), lat = r7.toVar();
-		const flags = V.flags.toVar();
-		const n1 = vnoise( vec2( z, y ).mul( 38 ).add( seed.mul( 17 ) ) ).toVar();
-		const n2 = vnoise( vec2( z, s ).mul( 11 ).add( seed.mul( 5 ) ) ).toVar();
-		const fwW = fwidth( w ).toVar(), fwH = fwidth( h ).toVar();
-
-		// ---- counter-shading
-		const tBack = smoothstep( 0.2, 0.75, h ).toVar();
-		const tBelly = float( 1 ).sub( smoothstep( - 0.7, - 0.1, h ) ).toVar();
-		const c = mix( mix( flank, back, tBack ), belly, tBelly ).toVar();
-		const silver = float( 1 ).sub( tBack.mul( 0.75 ) ).toVar(); // guanine reflection weight
-		metal.assign( r0.w.mul( silver ).mul( bodyK ) );
-		rough.assign( r2.w );
-		// scales: a thin shadow line under each free margin, the exposed field slightly brighter
-		// toward the margin
-		const scaleShade = smoothstep( 0.3, 0.9, f ).mul( fade ).mul( scaleVis ).toVar();
-		const pocket = smoothstep( 0.88, 0.97, f ).mul( float( 1 ).sub( smoothstep( 0.97, 1.0, f ) ) ).mul( fade ).mul( scaleVis );
-		const cellK = hash( vec2( floor( a.add( floor( b ).mul( 0.5 ) ) ), floor( b ) ) ).sub( 0.5 ).mul( 0.1 ).mul( fade ).mul( scaleVis );
-		c.mulAssign( mix( float( 1 ), float( 0.96 ).add( scaleShade.mul( 0.07 ) ).sub( pocket.mul( 0.14 ) ).add( cellK ), bodyK ) );
-		c.mulAssign( mix( 1, n1.mul( 0.14 ).add( 0.93 ), bodyK ) );
-
-		// ---- fins: ray-striped membranes, darker and thinner toward the edge
-		If( isFin.and( P.notEqual( PART.FINLET ) ), () => {
-
-			const fin = mix( finC, edgeC, smoothstep( 0.4, 1.0, t ) ).toVar();
-			const rd = abs( fract( w.add( 0.5 ) ).sub( 0.5 ) );
-			const rayW = select( P.equal( PART.DORSAL1 ), 0.1, 0.06 );
-			const ray = float( 1 ).sub( smoothstep( rayW, fwW.mul( 1.2 ).add( rayW ).add( 0.04 ), rd ) ).mul( float( 1 ).sub( smoothstep( 0.2, 0.6, fwW ) ) );
-			fin.mulAssign( mix( 0.9, 1.06, ray ) );
-			// thicker and darker where the fin joins the body, thinnest at the edge
-			fin.mulAssign( smoothstep( 0.0, 0.15, t ).mul( 0.2 ).add( 0.8 ) );
-			c.assign( fin );
-			transl.assign( mix( 0.8, 0.55, ray ).mul( smoothstep( 0.0, 0.3, t ).mul( 0.4 ).add( 0.6 ) ) );
-			// paired fins are pale and nearly clear
-			const paired = P.equal( PART.PECTORAL ).or( P.equal( PART.PELVIC ) );
-			c.assign( select( paired, mix( c, flank.mul( 1.1 ).add( 0.05 ), 0.45 ), c ) );
-			rough.assign( 0.4 );
-
-		} );
-
-		// ---- species markings (body; some on fins)
-		If( pat.equal( PATTERN.silverside ), () => {
-
-			// silver lateral band with a dark upper edge; translucent green back
-			const bandK = band( h, float( 0.02 ), float( 0.1 ), fwH.add( 0.05 ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.78, 0.82, 0.84 ), bandK.mul( 0.8 ) ) );
-			c.assign( mix( c, vec3( 0.12, 0.2, 0.2 ), band( h, float( 0.14 ), float( 0.015 ), fwH.add( 0.02 ) ).mul( bodyK ).mul( 0.6 ) ) );
-			metal.addAssign( bandK.mul( 0.25 ) );
-
-		} ).ElseIf( pat.equal( PATTERN.chromis ), () => {
-
-			// dark margins on the tail lobes, azure line from the snout through the eye
-			const lobe = select( P.equal( PART.CAUDAL ), smoothstep( 5.5, 7.5, abs( w.sub( 8 ) ) ), 0 );
-			c.assign( mix( c, vec3( 0.01, 0.015, 0.03 ), lobe ) );
-			const lineK = band( y.sub( z.sub( eye.x ).mul( 0.35 ) ), eye.y.add( 0.015 ), float( 0.004 ), float( 0.003 ) ).mul( smoothstep( eye.x.sub( 0.02 ), eye.x.add( 0.05 ), z ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.3, 0.6, 0.95 ), lineK.mul( 0.7 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.grunt ), () => {
-
-			// French grunt: yellow with oblique blue-silver stripes (straight above the lateral
-			// line); bluestriped grunt: straight blue stripes. Red mouth.
-			const blue = fract( seed.mul( 3.7 ) ).lessThan( 0.4 );
-			const above = smoothstep( 0.35, 0.45, h );
-			const slope = select( blue, 0, mix( 0.45, 0.0, above ) );
-			const sv = sin( y.sub( z.mul( slope ) ).mul( select( blue, 190, 150 ) ) );
-			const stripe = smoothstep( 0.45, 0.8, sv ).mul( bodyK ).mul( float( 1 ).sub( tBelly.mul( 0.7 ) ) );
-			const lineC = select( blue, vec3( 0.12, 0.26, 0.55 ), vec3( 0.52, 0.6, 0.7 ) );
-			c.assign( mix( c, lineC, stripe.mul( select( blue, 0.9, 0.7 ) ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.yellowtail ), () => {
-
-			// yellow stripe from the snout widening into the yellow tail; yellow spots on the back
-			const wS = mix( 0.006, 0.035, smoothstep( 0.1, - 0.25, z ) );
-			const stripe = band( y.sub( 0.004 ), float( 0 ), wS, float( 0.004 ) ).mul( bodyK );
-			const q = vec2( z, y ).mul( 70 );
-			const cell = floor( q );
-			const j = vec2( hash( cell.add( 3.1 ) ), hash( cell.add( 7.7 ) ) ).sub( 0.5 ).mul( 0.5 );
-			const rr = hash( cell.add( 1.3 ) ).mul( 0.14 ).add( 0.1 );
-			const spots = float( 1 ).sub( smoothstep( rr, rr.add( 0.12 ), length( fract( q ).sub( 0.5 ).sub( j ) ) ) ).mul( step( 0.4, hash( cell.add( seed ) ) ) ).mul( tBack ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.85, 0.62, 0.05 ), max( stripe, spots.mul( 0.8 ) ) ) );
-			c.assign( mix( c, vec3( 0.86, 0.66, 0.06 ), select( P.equal( PART.CAUDAL ), 1, 0 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.tang ), () => {
-
-			// fine dark wavy lines, pale scalpel at the tail base
-			const lines = smoothstep( 0.75, 0.95, sin( y.mul( 170 ).add( z.mul( 30 ) ).add( n1.mul( 3 ) ) ) ).mul( 0.3 ).mul( bodyK );
-			c.mulAssign( float( 1 ).sub( lines ) );
-			const spine = float( 1 ).sub( smoothstep( 0.01, 0.02, length( vec2( z.add( 0.27 ), y.mul( 1.5 ) ) ) ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.85, 0.8, 0.55 ), spine ) );
-			c.assign( mix( c, edgeC, select( isFin, smoothstep( 0.8, 1.0, t ), 0 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.sergeant ), () => {
-
-			// five black bars
-			const bars = smoothstep( 0.35, 0.6, sin( z.sub( 0.28 ).mul( 32 ) ) ).mul( smoothstep( - 0.33, - 0.26, z ) ).mul( float( 1 ).sub( smoothstep( 0.24, 0.3, z ) ) ).mul( float( 1 ).sub( tBelly.mul( 0.8 ) ) );
-			c.assign( mix( c, vec3( 0.02, 0.02, 0.025 ), bars.mul( select( isBody, 0.92, select( isFin, 0.4, 0 ) ) ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.wrasse ), () => {
-
-			// bluehead wrasse: yellow initial phase with a dark midlateral stripe; blue-headed males
-			const male = fract( seed.mul( 7.1 ) ).lessThan( 0.15 );
-			const stripe = band( h, float( 0.05 ), float( 0.1 ), fwH.add( 0.04 ) ).mul( bodyK ).mul( smoothstep( 0.25, 0.1, z ) );
-			const female = mix( c, vec3( 0.04, 0.04, 0.03 ), stripe.mul( 0.9 ) );
-			const head = smoothstep( 0.12, 0.17, z );
-			const collar = band( z, float( 0.13 ), float( 0.012 ), float( 0.006 ) );
-			const maleC = mix( mix( vec3( 0.1, 0.42, 0.28 ), vec3( 0.05, 0.14, 0.62 ), head ), vec3( 0.02, 0.02, 0.02 ), collar.mul( bodyK ) );
-			c.assign( select( male, maleC, female ) );
-
-		} ).ElseIf( pat.equal( PATTERN.parrot ), () => {
-
-			// stoplight (terminal phase: green, pink / orange marks, yellow spot on the gill cover)
-			// or queen parrotfish (blue-green, orange-pink marks around the mouth)
-			const queen = fract( seed.mul( 4.3 ) ).lessThan( 0.4 );
-			const base = select( queen, vec3( 0.06, 0.34, 0.42 ), vec3( 0.1, 0.42, 0.26 ) );
-			c.assign( mix( c, base.mul( mix( 0.8, 1.1, scaleShade ) ), bodyK.mul( 0.75 ) ) );
-			const mark = band( y.sub( z.sub( 0.3 ).mul( 0.4 ) ), float( - 0.03 ), float( 0.008 ), float( 0.008 ) ).mul( smoothstep( 0.18, 0.35, z ) ).mul( bodyK );
-			c.assign( mix( c, select( queen, vec3( 0.75, 0.42, 0.28 ), vec3( 0.85, 0.45, 0.32 ) ), mark ) );
-			const spot = float( 1 ).sub( smoothstep( 0.01, 0.02, length( vec2( z.sub( eye.w ).sub( 0.02 ), y.sub( 0.05 ) ) ) ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.88, 0.72, 0.12 ), spot.mul( select( queen, 0, 1 ) ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.angel ), () => {
-
-			// French angelfish: black, yellow rims on the scales, yellow face and eye ring
-			const rims = smoothstep( 0.72, 0.95, f ).mul( fade.max( 0.35 ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.62, 0.48, 0.06 ), rims.mul( 0.6 ) ) );
-			const face = smoothstep( 0.4, 0.43, z ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.55, 0.45, 0.2 ), face.mul( 0.6 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.barracuda ), () => {
-
-			// dark oblique bars on the upper flank, black blotches on the lower rear flank
-			const bars = smoothstep( 0.35, 0.8, sin( z.mul( 58 ).add( h.mul( 1.5 ) ).add( n1 ) ) ).mul( smoothstep( 0.2, 0.55, h ) ).mul( bodyK );
-			c.mulAssign( float( 1 ).sub( bars.mul( 0.45 ) ) );
-			const bl = smoothstep( 0.6, 0.78, n2 ).mul( smoothstep( 0.1, - 0.25, z ) ).mul( float( 1 ).sub( smoothstep( - 0.3, 0.2, h ) ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.03, 0.03, 0.035 ), bl.mul( 0.9 ) ) );
-			c.assign( mix( c, vec3( 0.75, 0.78, 0.8 ), select( P.equal( PART.CAUDAL ), smoothstep( 0.85, 1.0, t ).mul( smoothstep( 5, 7, abs( w.sub( 8 ) ) ) ), 0 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.redSnapper ), () => {
-
-			// rose red back fading to a silvery pink belly; rows of scales show as fine oblique lines
-			const rows = smoothstep( 0.6, 0.95, sin( y.mul( 210 ).add( z.mul( 120 ) ) ) ).mul( fade.max( 0.3 ) ).mul( bodyK ).mul( 0.15 );
-			c.mulAssign( float( 1 ).sub( rows ) );
-
-		} ).ElseIf( pat.equal( PATTERN.grouper ), () => {
-
-			// Nassau grouper: dark brown bars, a band from the snout through the eye, a black saddle
-			// on the tail stalk, dark spots around the eye
-			const zz = float( 0.5 ).sub( z );
-			const wob = n2.sub( 0.5 ).mul( 0.03 );
-			const bars = smoothstep( 0.2, 0.6, sin( zz.add( wob ).mul( 34 ).sub( 1.2 ) ) ).mul( smoothstep( 0.3, 0.38, zz ) ).mul( smoothstep( 0.86, 0.78, zz ) ).mul( float( 1 ).sub( tBelly.mul( 0.85 ) ) );
-			const stripe = band( y.sub( eye.y ).sub( z.sub( eye.x ).mul( 0.25 ) ), float( 0 ), float( 0.008 ), float( 0.006 ) ).mul( smoothstep( eye.x.sub( 0.08 ), eye.x, z ) ).mul( smoothstep( 0.5, 0.45, z ) );
-			const saddle = smoothstep( 0.4, 0.7, h ).mul( band( zz, float( 0.8 ), float( 0.025 ), float( 0.01 ) ) );
-			const spots = smoothstep( 0.72, 0.85, vnoise( vec2( z, y ).mul( 160 ).add( seed.mul( 3 ) ) ) ).mul( smoothstep( eye.x.sub( 0.12 ), eye.x, z ) );
-			const dark = max( max( bars.mul( 0.75 ), stripe.mul( 0.8 ) ), max( saddle, spots.mul( 0.7 ) ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.2, 0.13, 0.08 ), dark ) );
-			const pale = smoothstep( 0.86, 0.93, vnoise( vec2( z, y ).mul( 150 ).add( 9 ) ) ).mul( bodyK ).mul( 0.2 );
-			c.assign( mix( c, vec3( 0.85, 0.8, 0.72 ), pale ) );
-
-		} ).ElseIf( pat.equal( PATTERN.tuna ), () => {
-
-			// blackfin tuna: sharp dark back, bronze band, pale bars on the belly, dusky yellow finlets
-			const bronze = band( h, float( 0.28 ), float( 0.05 ), fwH.add( 0.06 ) ).mul( smoothstep( 0.3, 0.2, z ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.42, 0.34, 0.14 ), bronze.mul( 0.6 ) ) );
-			c.assign( mix( c, back, smoothstep( 0.28, 0.4, h ).mul( bodyK ) ) );
-			const bars = smoothstep( 0.6, 0.9, sin( z.mul( 95 ) ) ).mul( smoothstep( 0.0, - 0.3, h ) ).mul( smoothstep( 0.2, 0.1, z ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.85, 0.88, 0.9 ), bars.mul( 0.35 ) ) );
-			c.assign( mix( c, vec3( 0.55, 0.48, 0.16 ), select( P.equal( PART.FINLET ), 0.85, 0 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.mahi ), () => {
-
-			// mahi-mahi: blue-green back, golden flanks with scattered blue spots
-			const cell = floor( vec2( z, y ).mul( 55 ) );
-			const fc = fract( vec2( z, y ).mul( 55 ) ).sub( 0.5 );
-			const spots = float( 1 ).sub( smoothstep( 0.16, 0.3, length( fc ) ) ).mul( step( 0.5, hash( cell.add( seed.mul( 7 ) ) ) ) ).mul( bodyK ).mul( float( 1 ).sub( tBelly ) );
-			c.assign( mix( c, vec3( 0.08, 0.22, 0.5 ), spots.mul( 0.75 ) ) );
-			c.assign( mix( c, vec3( 0.2, 0.5, 0.3 ), smoothstep( 0.0, 0.5, h ).mul( bodyK ).mul( 0.35 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.mullet ), () => {
-
-			// faint dark stripes along the scale rows of the upper flank
-			const lines = smoothstep( 0.7, 0.95, sin( s.mul( 280 ) ) ).mul( smoothstep( - 0.1, 0.3, h ) ).mul( bodyK ).mul( 0.25 );
-			c.mulAssign( float( 1 ).sub( lines ) );
-
-		} ).ElseIf( pat.equal( PATTERN.needlefish ), () => {
-
-			// dark blue lateral stripe, dark beak
-			const stripe = band( h, float( 0.0 ), float( 0.06 ), fwH.add( 0.05 ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.12, 0.25, 0.45 ), stripe.mul( 0.6 ) ) );
-			c.assign( mix( c, vec3( 0.12, 0.16, 0.16 ), smoothstep( 0.32, 0.36, z ).mul( bodyK ).mul( 0.7 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.jack ), () => {
-
-			// bar jack: black stripe along the base of the dorsal fin into the lower tail lobe,
-			// electric blue below it
-			const top = band( h, float( 0.82 ), float( 0.06 ), fwH.add( 0.05 ) ).mul( smoothstep( 0.2, 0.05, z ) ).mul( bodyK );
-			const blue = band( h, float( 0.68 ), float( 0.05 ), fwH.add( 0.05 ) ).mul( smoothstep( 0.2, 0.05, z ) ).mul( bodyK );
-			c.assign( mix( c, vec3( 0.15, 0.45, 0.9 ), blue.mul( 0.5 ) ) );
-			c.assign( mix( c, vec3( 0.02, 0.03, 0.05 ), top.mul( 0.85 ) ) );
-			const lobe = select( P.equal( PART.CAUDAL ), smoothstep( 7.5, 5.5, w ).mul( smoothstep( 0.1, 0.3, t ) ), 0 );
-			c.assign( mix( c, vec3( 0.02, 0.03, 0.05 ), lobe.mul( 0.8 ) ) );
-
-		} ).ElseIf( pat.equal( PATTERN.tarpon ), () => {
-
-			// huge scales with dark edges
-			const rims = smoothstep( 0.8, 0.97, f ).mul( fade ).mul( bodyK );
-			c.mulAssign( float( 1 ).sub( rims.mul( 0.35 ) ) );
-
-		} );
-
-		// ---- lateral line (a row of pores along a dark line)
-		const hl = lat.x.add( lat.y.mul( float( 1 ).sub( smoothstep( 0.12, 0.55, u ) ) ) );
-		const lineK = band( h, hl, fwH.mul( 0.5 ).add( 0.012 ), fwH.add( 0.008 ) ).mul( bodyK ).mul( smoothstep( 0.18, 0.25, u ) ).mul( smoothstep( 0.9, 0.8, u ) );
-		c.mulAssign( float( 1 ).sub( lineK.mul( 0.3 ) ) );
-
-		// ---- gill cover edge and the preopercle (dark creases); gills show red on dead fish
-		const zE = opercleEdge( eye.w, h );
-		const dOp = z.sub( zE );
-		const onOp = opercleMask( h ).mul( bodyK );
-		const crease = float( 1 ).sub( smoothstep( 0.0015, 0.004, abs( dOp ) ) ).mul( onOp );
-		c.mulAssign( float( 1 ).sub( crease.mul( 0.45 ) ) );
-		const pre = float( 1 ).sub( smoothstep( 0.001, 0.003, abs( dOp.sub( 0.04 ) ) ) ).mul( onOp ).mul( smoothstep( 0.6, 0.2, h ) );
-		c.mulAssign( float( 1 ).sub( pre.mul( 0.2 ) ) );
-		const gill = smoothstep( 0.0, - 0.0015, dOp ).mul( smoothstep( - 0.007, - 0.003, dOp ) ).mul( onOp ).mul( smoothstep( 0.0, - 0.5, h ) ).mul( flags.w );
-		c.assign( mix( c, vec3( 0.3, 0.03, 0.035 ), gill.mul( 0.8 ) ) );
-
-		// ---- lips (the mouth line from the snout to the corner), the edge of the upper jaw bone
-		// and the nostrils
-		const hz = lat.z, hy = lat.w, tipY = r3.w;
-		const mt = clamp( z.sub( hz ).div( float( 0.5 ).sub( hz ) ), 0, 1 );
-		const yLip = mix( hy, tipY, mt );
-		const lips = float( 1 ).sub( smoothstep( 0.0015, 0.0035, abs( y.sub( yLip ) ) ) ).mul( step( hz.sub( 0.004 ), z ) ).mul( bodyK );
-		c.mulAssign( float( 1 ).sub( lips.mul( 0.55 ) ) );
-		const maxZ = hz.add( 0.006 ).sub( y.sub( hy ).mul( 0.35 ) );
-		const maxilla = float( 1 ).sub( smoothstep( 0.001, 0.0025, abs( z.sub( maxZ ) ) ) ).mul( smoothstep( hy.sub( 0.002 ), hy.add( 0.002 ), y ) ).mul( smoothstep( hy.add( 0.04 ), hy.add( 0.025 ), y ) ).mul( bodyK );
-		c.mulAssign( float( 1 ).sub( maxilla.mul( 0.3 ) ) );
-		const nostril = float( 1 ).sub( smoothstep( 0.1, 0.2, length( vec2( z.sub( eye.x ).sub( eye.z.mul( 1.7 ) ), y.sub( eye.y ).sub( eye.z.mul( 0.25 ) ) ) ).div( eye.z ) ) ).mul( bodyK );
-		c.mulAssign( float( 1 ).sub( nostril.mul( 0.6 ) ) );
-
-		// ---- painted eye (under the dome where there is one)
-		const er = length( vec2( z.sub( eye.x ), y.sub( eye.y ) ) ).div( eye.z );
-		const eyeCol = ( r, ang ) => {
-
-			const streak = sin( ang.mul( 26 ) ).mul( 0.5 ).add( 0.5 );
-			const iris = irisC.mul( mix( 0.65, 1.15, streak ) ).mul( smoothstep( 0.4, 0.6, r ).mul( 0.5 ).add( 0.5 ) );
-			const ring = smoothstep( 0.78, 0.95, r );
-			const e = mix( iris, vec3( 0.03, 0.03, 0.03 ), ring ).toVar();
-			e.assign( mix( e, vec3( 0.005, 0.006, 0.008 ), float( 1 ).sub( smoothstep( 0.4, 0.46, r ) ) ) );
-			// cloudy eyes of fish out of the water for a while
-			e.assign( mix( e, vec3( 0.42, 0.44, 0.46 ), flags.x.mul( 0.55 ).mul( float( 1 ).sub( smoothstep( 0.7, 1.0, r ) ) ) ) );
-			return e;
-
-		};
-
-		const painted = float( 1 ).sub( smoothstep( 0.95, 1.1, er ) ).mul( bodyK );
-		c.assign( mix( c, eyeCol( er, atan( y.sub( eye.y ), z.sub( eye.x ) ) ), painted ) );
-		metal.mulAssign( float( 1 ).sub( painted ) );
-
-		// ---- eye dome: pupil, iris, glossy cornea
-		If( P.equal( PART.EYE ), () => {
-
-			const r = length( vec2( t, w ) );
-			c.assign( eyeCol( r, atan( w, t ) ) );
-			c.assign( mix( c, flank.mul( 0.6 ), smoothstep( 0.93, 1.0, r ) ) );
-			rough.assign( mix( 0.04, 0.3, flags.x ) );
-			spec.assign( 1.0 );
-			metal.assign( 0 );
-
-		} ).ElseIf( P.equal( PART.MOUTH ), () => {
-
-			// inside of the mouth: pale pink lips to a dark throat (grunts are red inside)
-			const lip = select( pat.equal( PATTERN.grunt ), vec3( 0.6, 0.08, 0.06 ), vec3( 0.5, 0.3, 0.3 ) );
-			c.assign( mix( lip, vec3( 0.03, 0.012, 0.012 ), smoothstep( 0.05, 0.85, t ) ) );
-			metal.assign( 0 );
-			rough.assign( 0.35 );
-
-		} ).ElseIf( P.equal( PART.FLESH ), () => {
-
-			// cut face: muscle rings around the backbone, bone and blood at the centre
-			const r = length( vec2( t, w.mul( 1.2 ) ) );
-			const dark = select( pat.equal( PATTERN.tuna ), 1, 0 );
-			const meat = mix( vec3( 0.62, 0.36, 0.32 ), vec3( 0.3, 0.035, 0.035 ), dark );
-			const rings = smoothstep( 0.6, 0.95, sin( r.mul( 520 ).add( atan( w, abs( t ) ).mul( 2 ) ) ) ).mul( 0.12 );
-			const m = meat.mul( float( 1 ).sub( rings ) ).toVar();
-			const bone = float( 1 ).sub( smoothstep( 0.006, 0.009, length( vec2( t, w.sub( 0.004 ) ) ) ) );
-			m.assign( mix( m, vec3( 0.75, 0.68, 0.58 ), bone ) );
-			m.assign( mix( m, vec3( 0.3, 0.02, 0.02 ), float( 1 ).sub( smoothstep( 0.01, 0.03, r ) ).mul( 0.5 ).mul( float( 1 ).sub( bone ) ) ) );
-			// skin rim
-			c.assign( m );
-			metal.assign( 0 );
-			rough.assign( 0.3 );
-			transl.assign( 0.3 );
-
-		} ).ElseIf( P.equal( PART.FILLET ), () => {
-
-			// salted, sun dried flesh: pale and translucent at the thin edges, muscle chevrons,
-			// salt crystals
-			const ax = abs( t );
-			const chev = smoothstep( 0.55, 0.9, sin( w.add( ax.mul( 0.35 ) ).mul( 160 ) ) ).mul( 0.1 );
-			const m = mix( vec3( 0.36, 0.26, 0.13 ), vec3( 0.52, 0.42, 0.26 ), smoothstep( 0.35, 1.0, ax ) ).mul( float( 1 ).sub( chev ) ).toVar();
-			const salt = step( 0.94, hash( floor( vec2( t, w ).mul( 900 ) ) ) );
-			m.assign( mix( m, vec3( 0.8, 0.8, 0.78 ), salt.mul( 0.6 ) ) );
-			m.mulAssign( mix( 0.9, 1.05, n1 ) );
-			c.assign( m );
-			metal.assign( 0 );
-			rough.assign( 0.6 );
-			transl.assign( mix( 0.25, 0.8, smoothstep( 0.5, 1.0, ax ) ) );
-
-		} ).ElseIf( P.equal( PART.ICE ), () => {
-
-			// glassy crushed ice: dim albedo (light passes into it), sharp glints
-			c.assign( vec3( 0.3, 0.4, 0.46 ).mul( mix( 0.8, 1.15, fract( t.mul( 7.3 ) ) ) ) );
-			rough.assign( mix( 0.04, 0.2, fract( w.mul( 5.1 ) ) ) );
-			metal.assign( 0 );
-			transl.assign( 0.9 );
-			spec.assign( 1.0 );
-
-		} ).ElseIf( P.equal( PART.LEAF ), () => {
-
-			// banana leaf: glossy green, pale midrib, fine parallel veins
-			const ax = abs( t );
-			const veins = smoothstep( 0.6, 0.95, sin( w.mul( 420 ).add( ax.mul( 60 ) ) ) ).mul( 0.12 );
-			const lc = mix( vec3( 0.025, 0.08, 0.015 ), vec3( 0.05, 0.13, 0.025 ), n2 ).mul( float( 1 ).sub( veins ) ).toVar();
-			lc.assign( mix( lc, vec3( 0.25, 0.3, 0.1 ), float( 1 ).sub( smoothstep( 0.015, 0.03, ax ) ) ) );
-			lc.assign( mix( lc, vec3( 0.25, 0.22, 0.08 ), smoothstep( 0.9, 1.0, ax ).mul( 0.6 ) ) );
-			c.assign( lc );
-			metal.assign( 0 );
-			rough.assign( 0.28 );
-			transl.assign( 0.25 );
-
-		} ).ElseIf( P.equal( PART.DISC ).or( P.equal( PART.WHIP ) ), () => {
-
-			// rays: sandy, finely mottled back (stingray) or black with white rings (eagle ray);
-			// white belly
-			const top = w.greaterThan( 0 );
-			const eagleK = select( pat.equal( PATTERN.eagleRay ), 1, 0 );
-			const q = vec2( Lp.x, Lp.z ).mul( 20 );
-			const cell = floor( q );
-			const jit = vec2( hash( cell.add( 1.7 ) ), hash( cell.add( 5.3 ) ) ).sub( 0.5 ).mul( 0.4 );
-			const rad = hash( cell.add( 9.1 ) ).mul( 0.14 ).add( 0.12 );
-			const ring = abs( length( fract( q ).sub( 0.5 ).sub( jit ) ).sub( rad ) );
-			const spots = float( 1 ).sub( smoothstep( 0.035, 0.075, ring ) ).mul( step( 0.45, hash( cell ) ) );
-			const mottle = vnoise( vec2( Lp.x, Lp.z ).mul( 60 ) ).mul( 0.25 ).add( n2.mul( 0.2 ) ).add( 0.7 );
-			const dorsal = mix( back.mul( mottle ), mix( back, vec3( 0.75, 0.78, 0.8 ), spots.mul( 0.85 ) ), eagleK ).toVar();
-			dorsal.assign( mix( dorsal, edgeC, smoothstep( 0.8, 1.0, t ).mul( 0.4 ).mul( float( 1 ).sub( eagleK ) ) ) );
-			c.assign( select( top, dorsal, belly ) );
-			c.assign( select( P.equal( PART.WHIP ), finC, c ) );
-			metal.assign( 0 );
-			rough.assign( r2.w );
-
-		} ).ElseIf( P.equal( PART.CARAPACE ), () => {
-
-			// green turtle shell: scutes (vertebral row, costals, marginals) with dark seams and
-			// radiating olive / brown / amber streaks
-			const X = t, Y = w;
-			const ax = abs( X );
-			const rr = length( vec2( X, Y ) );
-			const vert = ax.lessThan( 0.3 );
-			const ySeams = select( vert, vec4( - 0.58, - 0.22, 0.14, 0.5 ), vec4( - 0.42, - 0.02, 0.36, 2.0 ) );
-			const yc = Y.add( ax.mul( ax ).mul( 0.25 ) );
-			const dY = min( min( abs( yc.sub( ySeams.x ) ), abs( yc.sub( ySeams.y ) ) ), min( abs( yc.sub( ySeams.z ) ), abs( yc.sub( ySeams.w ) ) ) );
-			const dX = abs( ax.sub( 0.3 ) );
-			const marg = rr.greaterThan( 0.84 );
-			const angle = atan( Y, X );
-			const dM = min( abs( rr.sub( 0.84 ) ), abs( fract( angle.mul( 12 / Math.PI ) ).sub( 0.5 ) ).mul( 0.25 ) );
-			const seam = min( select( marg, dM, min( dY, dX ) ), abs( rr.sub( 0.84 ) ) );
-			const streak = sin( atan( yc.sub( floor( yc.mul( 2.8 ) ).add( 0.5 ).div( 2.8 ) ), X.sub( sign( X ).mul( 0.55 ) ) ).mul( 11 ).add( n2.mul( 6 ) ) ).mul( 0.5 ).add( 0.5 );
-			const blotch = smoothstep( 0.45, 0.8, vnoise( vec2( X, Y ).mul( 9 ) ) );
-			const shell = mix( back, flank, streak.mul( 0.55 ).add( blotch.mul( 0.45 ) ) ).toVar();
-			shell.assign( mix( shell, vec3( 0.2, 0.14, 0.06 ), smoothstep( 0.6, 0.9, n1 ).mul( 0.4 ) ) );
-			shell.mulAssign( mix( 0.45, 1, smoothstep( 0.003, 0.012, seam ) ) );
-			c.assign( shell );
-			metal.assign( 0 );
-			rough.assign( 0.35 );
-
-		} ).ElseIf( P.equal( PART.SKIN ).or( P.equal( PART.FLIPPER ) ), () => {
-
-			// scaly grey-brown skin with pale scale margins; pale yellow plastron
-			const q = vec2( Lp.x.add( Lp.y ), Lp.z ).mul( 55 );
-			const rowS = floor( q.y );
-			const qq = q.add( vec2( rowS.mul( 0.5 ), 0 ) );
-			const f = fract( qq ).sub( 0.5 );
-			const scale = smoothstep( 0.32, 0.47, max( abs( f.x ), abs( f.y ) ) );
-			const tone = hash( floor( qq ) ).mul( 0.35 ).add( 0.8 );
-			const skin = mix( finC.mul( tone ), edgeC, scale.mul( 0.45 ) );
-			c.assign( select( w.greaterThan( 1.5 ).and( P.equal( PART.SKIN ) ), belly.mul( mix( 0.85, 1.05, n1 ) ), skin ) );
-			metal.assign( 0 );
-			rough.assign( 0.5 );
-
-		} ).ElseIf( P.equal( PART.SHELL ), () => {
-
-			// spiny lobster: red-brown carapace with cream spots, banded legs
-			const sp = vec2( t, w ).mul( 12 );
-			const spots = float( 1 ).sub( smoothstep( 0.18, 0.3, length( fract( sp ).sub( 0.5 ) ) ) ).mul( step( 0.6, hash( floor( sp ) ) ) );
-			const sh = mix( vec3( 0.16, 0.045, 0.03 ), vec3( 0.32, 0.1, 0.04 ), n1 ).toVar();
-			sh.assign( mix( sh, vec3( 0.7, 0.55, 0.22 ), spots.mul( 0.85 ) ) );
-			c.assign( sh );
-			metal.assign( 0 );
-			rough.assign( 0.35 );
-
-		} );
-
-		// ---- props: dull, drying skin; wet sheen; salted skin
-		if ( prop ) {
-
-			c.assign( mix( c, vec3( luminance( c ) ), flags.z.mul( 0.55 ).mul( bodyK ) ) );
-			c.mulAssign( mix( 1, 0.85, flags.z.mul( bodyK ) ) );
-			metal.mulAssign( float( 1 ).sub( flags.z ) );
-			rough.assign( mix( rough, rough.mul( 0.55 ), flags.y ) );
-			coat.assign( flags.y.mul( select( isBody.or( isFin ), 0.9, 0 ) ) );
-
-		}
-
-		// iridescent sheen on silvery skin at grazing angles
-		const cosV = abs( dot( normalView, positionViewDirection ) );
-		const irid = r1.w.mul( bodyK ).mul( silver ).mul( float( 1 ).sub( cosV ) );
-		const hueA = vec3( 0.55, 0.95, 0.8 ), hueB = vec3( 0.95, 0.6, 1.0 );
-		c.assign( mix( c, c.mul( mix( hueA, hueB, cosV ) ).mul( 1.25 ), irid.mul( 0.6 ) ) );
-		albedo.assign( c );
-		return c;
-
-	} )();
-
-	return { color, height, albedo, rough, metal, transl, coat, spec };
+		let isFin = part > 0.5 && part < 7.5;
+		let rd = abs( fract( D.w + 0.5 ) - 0.5 );
+		let ray = ( 1.0 - smoothstep( 0.0, 0.25, rd ) ) * 0.0004;
+		bumpH = select( select( 0.0, ray, isFin ), bodyH, isBody ) * L;
+	}
+	let dhdx = dpdx( bumpH ); let dhdy = dpdy( bumpH );`;
+
+function surface( prop, lodFade ) {
+
+	return /* wgsl */`
+	${ COMMON }
+	${ lodFade ? FADE_DISCARD : '' }
+	var rough = 0.4;
+	var metal = 0.0;
+	var transl = 0.0;
+	var coat = 0.0;
+	var spec = 0.5;
+	let seed = I.y; let L = I.z;
+	let pat = pattern;
+	let P = part;
+	let u = D.x; let h = D.w; let sd = D.z;
+	let z = Lp.z; let y = Lp.y;
+	let t = D.z; let w = D.w; // fins: along / across the rays
+	let isBody = P == ${ PA( 'BODY' ) };
+	let isFin = P > 0.5 && P < 7.5;
+	let bodyK = select( 0.0, 1.0, isBody );
+	let r0 = fishRow( pat, 0 ); let r1 = fishRow( pat, 1 ); let r2 = fishRow( pat, 2 ); let r3 = fishRow( pat, 3 );
+	let r4 = fishRow( pat, 4 ); let r5 = fishRow( pat, 5 ); let r6 = fishRow( pat, 6 ); let r7 = fishRow( pat, 7 );
+	let back = r0.xyz; let flank = r1.xyz; let belly = r2.xyz;
+	let finC = r3.xyz; let edgeC = r4.xyz; let irisC = r5.xyz;
+	let eye = r6; let lat = r7;
+	let flags = in.vs.vFishFlags;
+	let n1 = fishVnoise( vec2f( z, y ) * 38.0 + seed * 17.0 );
+	let n2 = fishVnoise( vec2f( z, sd ) * 11.0 + seed * 5.0 );
+	let fwW = fwidth( w ); let fwH = fwidth( h );
+
+	// ---- counter-shading
+	let tBack = smoothstep( 0.2, 0.75, h );
+	let tBelly = 1.0 - smoothstep( -0.7, -0.1, h );
+	var c = mix( mix( flank, back, tBack ), belly, tBelly );
+	let silver = 1.0 - tBack * 0.75; // guanine reflection weight
+	metal = r0.w * silver * bodyK;
+	rough = r2.w;
+	// scales: a thin shadow line under each free margin, the exposed field slightly brighter
+	// toward the margin
+	let scaleShade = smoothstep( 0.3, 0.9, sf ) * sfade * scaleVis;
+	let pocket = smoothstep( 0.88, 0.97, sf ) * ( 1.0 - smoothstep( 0.97, 1.0, sf ) ) * sfade * scaleVis;
+	let cellK = ( fishHash( vec2f( floor( sa + floor( sb ) * 0.5 ), floor( sb ) ) ) - 0.5 ) * 0.1 * sfade * scaleVis;
+	c *= mix( 1.0, 0.96 + scaleShade * 0.07 - pocket * 0.14 + cellK, bodyK );
+	c *= mix( 1.0, n1 * 0.14 + 0.93, bodyK );
+
+	// ---- fins: ray-striped membranes, darker and thinner toward the edge
+	if ( isFin && P != ${ PA( 'FINLET' ) } ) {
+		var fin = mix( finC, edgeC, smoothstep( 0.4, 1.0, t ) );
+		let rd = abs( fract( w + 0.5 ) - 0.5 );
+		let rayW = select( 0.06, 0.1, P == ${ PA( 'DORSAL1' ) } );
+		let ray = ( 1.0 - smoothstep( rayW, fwW * 1.2 + rayW + 0.04, rd ) ) * ( 1.0 - smoothstep( 0.2, 0.6, fwW ) );
+		fin *= mix( 0.9, 1.06, ray );
+		// thicker and darker where the fin joins the body, thinnest at the edge
+		fin *= smoothstep( 0.0, 0.15, t ) * 0.2 + 0.8;
+		c = fin;
+		transl = mix( 0.8, 0.55, ray ) * ( smoothstep( 0.0, 0.3, t ) * 0.4 + 0.6 );
+		// paired fins are pale and nearly clear
+		let paired = P == ${ PA( 'PECTORAL' ) } || P == ${ PA( 'PELVIC' ) };
+		c = select( c, mix( c, flank * 1.1 + 0.05, 0.45 ), paired );
+		rough = 0.4;
+	}
+
+	// ---- species markings (body; some on fins)
+	if ( pat == ${ PT( 'silverside' ) } ) {
+		// silver lateral band with a dark upper edge; translucent green back
+		let bandK = fishBand( h, 0.02, 0.1, fwH + 0.05 ) * bodyK;
+		c = mix( c, vec3f( 0.78, 0.82, 0.84 ), bandK * 0.8 );
+		c = mix( c, vec3f( 0.12, 0.2, 0.2 ), fishBand( h, 0.14, 0.015, fwH + 0.02 ) * bodyK * 0.6 );
+		metal += bandK * 0.25;
+	} else if ( pat == ${ PT( 'chromis' ) } ) {
+		// dark margins on the tail lobes, azure line from the snout through the eye
+		let lobe = select( 0.0, smoothstep( 5.5, 7.5, abs( w - 8.0 ) ), P == ${ PA( 'CAUDAL' ) } );
+		c = mix( c, vec3f( 0.01, 0.015, 0.03 ), lobe );
+		let lineK = fishBand( y - ( z - eye.x ) * 0.35, eye.y + 0.015, 0.004, 0.003 ) * smoothstep( eye.x - 0.02, eye.x + 0.05, z ) * bodyK;
+		c = mix( c, vec3f( 0.3, 0.6, 0.95 ), lineK * 0.7 );
+	} else if ( pat == ${ PT( 'grunt' ) } ) {
+		// French grunt: yellow with oblique blue-silver stripes (straight above the lateral
+		// line); bluestriped grunt: straight blue stripes. Red mouth.
+		let blue = fract( seed * 3.7 ) < 0.4;
+		let above = smoothstep( 0.35, 0.45, h );
+		let slope = select( mix( 0.45, 0.0, above ), 0.0, blue );
+		let sv = sin( ( y - z * slope ) * select( 150.0, 190.0, blue ) );
+		let stripe = smoothstep( 0.45, 0.8, sv ) * bodyK * ( 1.0 - tBelly * 0.7 );
+		let lineC = select( vec3f( 0.52, 0.6, 0.7 ), vec3f( 0.12, 0.26, 0.55 ), blue );
+		c = mix( c, lineC, stripe * select( 0.7, 0.9, blue ) );
+	} else if ( pat == ${ PT( 'yellowtail' ) } ) {
+		// yellow stripe from the snout widening into the yellow tail; yellow spots on the back
+		let wS = mix( 0.006, 0.035, smoothstep( 0.1, -0.25, z ) );
+		let stripe = fishBand( y - 0.004, 0.0, wS, 0.004 ) * bodyK;
+		let qq = vec2f( z, y ) * 70.0;
+		let cell = floor( qq );
+		let j = ( vec2f( fishHash( cell + 3.1 ), fishHash( cell + 7.7 ) ) - 0.5 ) * 0.5;
+		let rr = fishHash( cell + 1.3 ) * 0.14 + 0.1;
+		let spots = ( 1.0 - smoothstep( rr, rr + 0.12, length( fract( qq ) - 0.5 - j ) ) ) * step( 0.4, fishHash( cell + seed ) ) * tBack * bodyK;
+		c = mix( c, vec3f( 0.85, 0.62, 0.05 ), max( stripe, spots * 0.8 ) );
+		c = mix( c, vec3f( 0.86, 0.66, 0.06 ), select( 0.0, 1.0, P == ${ PA( 'CAUDAL' ) } ) );
+	} else if ( pat == ${ PT( 'tang' ) } ) {
+		// fine dark wavy lines, pale scalpel at the tail base
+		let lines = smoothstep( 0.75, 0.95, sin( y * 170.0 + z * 30.0 + n1 * 3.0 ) ) * 0.3 * bodyK;
+		c *= 1.0 - lines;
+		let spine = ( 1.0 - smoothstep( 0.01, 0.02, length( vec2f( z + 0.27, y * 1.5 ) ) ) ) * bodyK;
+		c = mix( c, vec3f( 0.85, 0.8, 0.55 ), spine );
+		c = mix( c, edgeC, select( 0.0, smoothstep( 0.8, 1.0, t ), isFin ) );
+	} else if ( pat == ${ PT( 'sergeant' ) } ) {
+		// five black bars
+		let bars = smoothstep( 0.35, 0.6, sin( ( z - 0.28 ) * 32.0 ) ) * smoothstep( -0.33, -0.26, z ) * ( 1.0 - smoothstep( 0.24, 0.3, z ) ) * ( 1.0 - tBelly * 0.8 );
+		c = mix( c, vec3f( 0.02, 0.02, 0.025 ), bars * select( select( 0.0, 0.4, isFin ), 0.92, isBody ) );
+	} else if ( pat == ${ PT( 'wrasse' ) } ) {
+		// bluehead wrasse: yellow initial phase with a dark midlateral stripe; blue-headed males
+		let male = fract( seed * 7.1 ) < 0.15;
+		let stripe = fishBand( h, 0.05, 0.1, fwH + 0.04 ) * bodyK * smoothstep( 0.25, 0.1, z );
+		let female = mix( c, vec3f( 0.04, 0.04, 0.03 ), stripe * 0.9 );
+		let head = smoothstep( 0.12, 0.17, z );
+		let collar = fishBand( z, 0.13, 0.012, 0.006 );
+		let maleC = mix( mix( vec3f( 0.1, 0.42, 0.28 ), vec3f( 0.05, 0.14, 0.62 ), head ), vec3f( 0.02, 0.02, 0.02 ), collar * bodyK );
+		c = select( female, maleC, male );
+	} else if ( pat == ${ PT( 'parrot' ) } ) {
+		// stoplight (terminal phase: green, pink / orange marks, yellow spot on the gill cover)
+		// or queen parrotfish (blue-green, orange-pink marks around the mouth)
+		let queen = fract( seed * 4.3 ) < 0.4;
+		let base = select( vec3f( 0.1, 0.42, 0.26 ), vec3f( 0.06, 0.34, 0.42 ), queen );
+		c = mix( c, base * mix( 0.8, 1.1, scaleShade ), bodyK * 0.75 );
+		let mark = fishBand( y - ( z - 0.3 ) * 0.4, -0.03, 0.008, 0.008 ) * smoothstep( 0.18, 0.35, z ) * bodyK;
+		c = mix( c, select( vec3f( 0.85, 0.45, 0.32 ), vec3f( 0.75, 0.42, 0.28 ), queen ), mark );
+		let spot = ( 1.0 - smoothstep( 0.01, 0.02, length( vec2f( z - eye.w - 0.02, y - 0.05 ) ) ) ) * bodyK;
+		c = mix( c, vec3f( 0.88, 0.72, 0.12 ), spot * select( 1.0, 0.0, queen ) );
+	} else if ( pat == ${ PT( 'angel' ) } ) {
+		// French angelfish: black, yellow rims on the scales, yellow face and eye ring
+		let rims = smoothstep( 0.72, 0.95, sf ) * max( sfade, 0.35 ) * bodyK;
+		c = mix( c, vec3f( 0.62, 0.48, 0.06 ), rims * 0.6 );
+		let face = smoothstep( 0.4, 0.43, z ) * bodyK;
+		c = mix( c, vec3f( 0.55, 0.45, 0.2 ), face * 0.6 );
+	} else if ( pat == ${ PT( 'barracuda' ) } ) {
+		// dark oblique bars on the upper flank, black blotches on the lower rear flank
+		let bars = smoothstep( 0.35, 0.8, sin( z * 58.0 + h * 1.5 + n1 ) ) * smoothstep( 0.2, 0.55, h ) * bodyK;
+		c *= 1.0 - bars * 0.45;
+		let bl = smoothstep( 0.6, 0.78, n2 ) * smoothstep( 0.1, -0.25, z ) * ( 1.0 - smoothstep( -0.3, 0.2, h ) ) * bodyK;
+		c = mix( c, vec3f( 0.03, 0.03, 0.035 ), bl * 0.9 );
+		c = mix( c, vec3f( 0.75, 0.78, 0.8 ), select( 0.0, smoothstep( 0.85, 1.0, t ) * smoothstep( 5.0, 7.0, abs( w - 8.0 ) ), P == ${ PA( 'CAUDAL' ) } ) );
+	} else if ( pat == ${ PT( 'redSnapper' ) } ) {
+		// rose red back fading to a silvery pink belly; rows of scales show as fine oblique lines
+		let rows = smoothstep( 0.6, 0.95, sin( y * 210.0 + z * 120.0 ) ) * max( sfade, 0.3 ) * bodyK * 0.15;
+		c *= 1.0 - rows;
+	} else if ( pat == ${ PT( 'grouper' ) } ) {
+		// Nassau grouper: dark brown bars, a band from the snout through the eye, a black saddle
+		// on the tail stalk, dark spots around the eye
+		let zz = 0.5 - z;
+		let wob = ( n2 - 0.5 ) * 0.03;
+		let bars = smoothstep( 0.2, 0.6, sin( ( zz + wob ) * 34.0 - 1.2 ) ) * smoothstep( 0.3, 0.38, zz ) * smoothstep( 0.86, 0.78, zz ) * ( 1.0 - tBelly * 0.85 );
+		let stripe = fishBand( y - eye.y - ( z - eye.x ) * 0.25, 0.0, 0.008, 0.006 ) * smoothstep( eye.x - 0.08, eye.x, z ) * smoothstep( 0.5, 0.45, z );
+		let saddle = smoothstep( 0.4, 0.7, h ) * fishBand( zz, 0.8, 0.025, 0.01 );
+		let spots = smoothstep( 0.72, 0.85, fishVnoise( vec2f( z, y ) * 160.0 + seed * 3.0 ) ) * smoothstep( eye.x - 0.12, eye.x, z );
+		let dark = max( max( bars * 0.75, stripe * 0.8 ), max( saddle, spots * 0.7 ) ) * bodyK;
+		c = mix( c, vec3f( 0.2, 0.13, 0.08 ), dark );
+		let pale = smoothstep( 0.86, 0.93, fishVnoise( vec2f( z, y ) * 150.0 + 9.0 ) ) * bodyK * 0.2;
+		c = mix( c, vec3f( 0.85, 0.8, 0.72 ), pale );
+	} else if ( pat == ${ PT( 'tuna' ) } ) {
+		// blackfin tuna: sharp dark back, bronze band, pale bars on the belly, dusky yellow finlets
+		let bronze = fishBand( h, 0.28, 0.05, fwH + 0.06 ) * smoothstep( 0.3, 0.2, z ) * bodyK;
+		c = mix( c, vec3f( 0.42, 0.34, 0.14 ), bronze * 0.6 );
+		c = mix( c, back, smoothstep( 0.28, 0.4, h ) * bodyK );
+		let bars = smoothstep( 0.6, 0.9, sin( z * 95.0 ) ) * smoothstep( 0.0, -0.3, h ) * smoothstep( 0.2, 0.1, z ) * bodyK;
+		c = mix( c, vec3f( 0.85, 0.88, 0.9 ), bars * 0.35 );
+		c = mix( c, vec3f( 0.55, 0.48, 0.16 ), select( 0.0, 0.85, P == ${ PA( 'FINLET' ) } ) );
+	} else if ( pat == ${ PT( 'mahi' ) } ) {
+		// mahi-mahi: blue-green back, golden flanks with scattered blue spots
+		let cell = floor( vec2f( z, y ) * 55.0 );
+		let fc = fract( vec2f( z, y ) * 55.0 ) - 0.5;
+		let spots = ( 1.0 - smoothstep( 0.16, 0.3, length( fc ) ) ) * step( 0.5, fishHash( cell + seed * 7.0 ) ) * bodyK * ( 1.0 - tBelly );
+		c = mix( c, vec3f( 0.08, 0.22, 0.5 ), spots * 0.75 );
+		c = mix( c, vec3f( 0.2, 0.5, 0.3 ), smoothstep( 0.0, 0.5, h ) * bodyK * 0.35 );
+	} else if ( pat == ${ PT( 'mullet' ) } ) {
+		// faint dark stripes along the scale rows of the upper flank
+		let lines = smoothstep( 0.7, 0.95, sin( sd * 280.0 ) ) * smoothstep( -0.1, 0.3, h ) * bodyK * 0.25;
+		c *= 1.0 - lines;
+	} else if ( pat == ${ PT( 'needlefish' ) } ) {
+		// dark blue lateral stripe, dark beak
+		let stripe = fishBand( h, 0.0, 0.06, fwH + 0.05 ) * bodyK;
+		c = mix( c, vec3f( 0.12, 0.25, 0.45 ), stripe * 0.6 );
+		c = mix( c, vec3f( 0.12, 0.16, 0.16 ), smoothstep( 0.32, 0.36, z ) * bodyK * 0.7 );
+	} else if ( pat == ${ PT( 'jack' ) } ) {
+		// bar jack: black stripe along the base of the dorsal fin into the lower tail lobe,
+		// electric blue below it
+		let top = fishBand( h, 0.82, 0.06, fwH + 0.05 ) * smoothstep( 0.2, 0.05, z ) * bodyK;
+		let blue = fishBand( h, 0.68, 0.05, fwH + 0.05 ) * smoothstep( 0.2, 0.05, z ) * bodyK;
+		c = mix( c, vec3f( 0.15, 0.45, 0.9 ), blue * 0.5 );
+		c = mix( c, vec3f( 0.02, 0.03, 0.05 ), top * 0.85 );
+		let lobe = select( 0.0, smoothstep( 7.5, 5.5, w ) * smoothstep( 0.1, 0.3, t ), P == ${ PA( 'CAUDAL' ) } );
+		c = mix( c, vec3f( 0.02, 0.03, 0.05 ), lobe * 0.8 );
+	} else if ( pat == ${ PT( 'tarpon' ) } ) {
+		// huge scales with dark edges
+		let rims = smoothstep( 0.8, 0.97, sf ) * sfade * bodyK;
+		c *= 1.0 - rims * 0.35;
+	}
+
+	// ---- lateral line (a row of pores along a dark line)
+	let hl = lat.x + lat.y * ( 1.0 - smoothstep( 0.12, 0.55, u ) );
+	let lineK = fishBand( h, hl, fwH * 0.5 + 0.012, fwH + 0.008 ) * bodyK * smoothstep( 0.18, 0.25, u ) * smoothstep( 0.9, 0.8, u );
+	c *= 1.0 - lineK * 0.3;
+
+	// ---- gill cover edge and the preopercle (dark creases); gills show red on dead fish
+	let zE = fishOpercleEdge( eye.w, h );
+	let dOp = z - zE;
+	let onOp = fishOpercleMask( h ) * bodyK;
+	let crease = ( 1.0 - smoothstep( 0.0015, 0.004, abs( dOp ) ) ) * onOp;
+	c *= 1.0 - crease * 0.45;
+	let pre = ( 1.0 - smoothstep( 0.001, 0.003, abs( dOp - 0.04 ) ) ) * onOp * smoothstep( 0.6, 0.2, h );
+	c *= 1.0 - pre * 0.2;
+	let gill = smoothstep( 0.0, -0.0015, dOp ) * smoothstep( -0.007, -0.003, dOp ) * onOp * smoothstep( 0.0, -0.5, h ) * flags.w;
+	c = mix( c, vec3f( 0.3, 0.03, 0.035 ), gill * 0.8 );
+
+	// ---- lips (the mouth line from the snout to the corner), the edge of the upper jaw bone
+	// and the nostrils
+	let hz = lat.z; let hy = lat.w; let tipY = r3.w;
+	let mt = clamp( ( z - hz ) / ( 0.5 - hz ), 0.0, 1.0 );
+	let yLip = mix( hy, tipY, mt );
+	let lips = ( 1.0 - smoothstep( 0.0015, 0.0035, abs( y - yLip ) ) ) * step( hz - 0.004, z ) * bodyK;
+	c *= 1.0 - lips * 0.55;
+	let maxZ = hz + 0.006 - ( y - hy ) * 0.35;
+	let maxilla = ( 1.0 - smoothstep( 0.001, 0.0025, abs( z - maxZ ) ) ) * smoothstep( hy - 0.002, hy + 0.002, y ) * smoothstep( hy + 0.04, hy + 0.025, y ) * bodyK;
+	c *= 1.0 - maxilla * 0.3;
+	let nostril = ( 1.0 - smoothstep( 0.1, 0.2, length( vec2f( z - eye.x - eye.z * 1.7, y - eye.y - eye.z * 0.25 ) ) / eye.z ) ) * bodyK;
+	c *= 1.0 - nostril * 0.6;
+
+	// ---- painted eye (under the dome where there is one)
+	let er = length( vec2f( z - eye.x, y - eye.y ) ) / eye.z;
+	let painted = ( 1.0 - smoothstep( 0.95, 1.1, er ) ) * bodyK;
+	c = mix( c, fishEyeCol( er, atan2( y - eye.y, z - eye.x ), irisC, flags.x ), painted );
+	metal *= 1.0 - painted;
+
+	// ---- eye dome: pupil, iris, glossy cornea
+	if ( P == ${ PA( 'EYE' ) } ) {
+		let r = length( vec2f( t, w ) );
+		c = fishEyeCol( r, atan2( w, t ), irisC, flags.x );
+		c = mix( c, flank * 0.6, smoothstep( 0.93, 1.0, r ) );
+		rough = mix( 0.04, 0.3, flags.x );
+		spec = 1.0;
+		metal = 0.0;
+	} else if ( P == ${ PA( 'MOUTH' ) } ) {
+		// inside of the mouth: pale pink lips to a dark throat (grunts are red inside)
+		let lip = select( vec3f( 0.5, 0.3, 0.3 ), vec3f( 0.6, 0.08, 0.06 ), pat == ${ PT( 'grunt' ) } );
+		c = mix( lip, vec3f( 0.03, 0.012, 0.012 ), smoothstep( 0.05, 0.85, t ) );
+		metal = 0.0;
+		rough = 0.35;
+	} else if ( P == ${ PA( 'FLESH' ) } ) {
+		// cut face: muscle rings around the backbone, bone and blood at the centre
+		let r = length( vec2f( t, w * 1.2 ) );
+		let dark = select( 0.0, 1.0, pat == ${ PT( 'tuna' ) } );
+		let meat = mix( vec3f( 0.62, 0.36, 0.32 ), vec3f( 0.3, 0.035, 0.035 ), dark );
+		let rings = smoothstep( 0.6, 0.95, sin( r * 520.0 + atan2( w, abs( t ) ) * 2.0 ) ) * 0.12;
+		var m = meat * ( 1.0 - rings );
+		let bone = 1.0 - smoothstep( 0.006, 0.009, length( vec2f( t, w - 0.004 ) ) );
+		m = mix( m, vec3f( 0.75, 0.68, 0.58 ), bone );
+		m = mix( m, vec3f( 0.3, 0.02, 0.02 ), ( 1.0 - smoothstep( 0.01, 0.03, r ) ) * 0.5 * ( 1.0 - bone ) );
+		// skin rim
+		c = m;
+		metal = 0.0;
+		rough = 0.3;
+		transl = 0.3;
+	} else if ( P == ${ PA( 'FILLET' ) } ) {
+		// salted, sun dried flesh: pale and translucent at the thin edges, muscle chevrons,
+		// salt crystals
+		let ax = abs( t );
+		let chev = smoothstep( 0.55, 0.9, sin( ( w + ax * 0.35 ) * 160.0 ) ) * 0.1;
+		var m = mix( vec3f( 0.36, 0.26, 0.13 ), vec3f( 0.52, 0.42, 0.26 ), smoothstep( 0.35, 1.0, ax ) ) * ( 1.0 - chev );
+		let salt = step( 0.94, fishHash( floor( vec2f( t, w ) * 900.0 ) ) );
+		m = mix( m, vec3f( 0.8, 0.8, 0.78 ), salt * 0.6 );
+		m *= mix( 0.9, 1.05, n1 );
+		c = m;
+		metal = 0.0;
+		rough = 0.6;
+		transl = mix( 0.25, 0.8, smoothstep( 0.5, 1.0, ax ) );
+	} else if ( P == ${ PA( 'ICE' ) } ) {
+		// glassy crushed ice: dim albedo (light passes into it), sharp glints
+		c = vec3f( 0.3, 0.4, 0.46 ) * mix( 0.8, 1.15, fract( t * 7.3 ) );
+		rough = mix( 0.04, 0.2, fract( w * 5.1 ) );
+		metal = 0.0;
+		transl = 0.9;
+		spec = 1.0;
+	} else if ( P == ${ PA( 'LEAF' ) } ) {
+		// banana leaf: glossy green, pale midrib, fine parallel veins
+		let ax = abs( t );
+		let veins = smoothstep( 0.6, 0.95, sin( w * 420.0 + ax * 60.0 ) ) * 0.12;
+		var lc = mix( vec3f( 0.025, 0.08, 0.015 ), vec3f( 0.05, 0.13, 0.025 ), n2 ) * ( 1.0 - veins );
+		lc = mix( lc, vec3f( 0.25, 0.3, 0.1 ), 1.0 - smoothstep( 0.015, 0.03, ax ) );
+		lc = mix( lc, vec3f( 0.25, 0.22, 0.08 ), smoothstep( 0.9, 1.0, ax ) * 0.6 );
+		c = lc;
+		metal = 0.0;
+		rough = 0.28;
+		transl = 0.25;
+	} else if ( P == ${ PA( 'DISC' ) } || P == ${ PA( 'WHIP' ) } ) {
+		// rays: sandy, finely mottled back (stingray) or black with white rings (eagle ray);
+		// white belly
+		let top = w > 0.0;
+		let eagleK = select( 0.0, 1.0, pat == ${ PT( 'eagleRay' ) } );
+		let qq = vec2f( Lp.x, Lp.z ) * 20.0;
+		let cell = floor( qq );
+		let jit = ( vec2f( fishHash( cell + 1.7 ), fishHash( cell + 5.3 ) ) - 0.5 ) * 0.4;
+		let rad = fishHash( cell + 9.1 ) * 0.14 + 0.12;
+		let ring = abs( length( fract( qq ) - 0.5 - jit ) - rad );
+		let spots = ( 1.0 - smoothstep( 0.035, 0.075, ring ) ) * step( 0.45, fishHash( cell ) );
+		let mottle = fishVnoise( vec2f( Lp.x, Lp.z ) * 60.0 ) * 0.25 + n2 * 0.2 + 0.7;
+		var dorsal = mix( back * mottle, mix( back, vec3f( 0.75, 0.78, 0.8 ), spots * 0.85 ), eagleK );
+		dorsal = mix( dorsal, edgeC, smoothstep( 0.8, 1.0, t ) * 0.4 * ( 1.0 - eagleK ) );
+		c = select( belly, dorsal, top );
+		c = select( c, finC, P == ${ PA( 'WHIP' ) } );
+		metal = 0.0;
+		rough = r2.w;
+	} else if ( P == ${ PA( 'CARAPACE' ) } ) {
+		// green turtle shell: scutes (vertebral row, costals, marginals) with dark seams and
+		// radiating olive / brown / amber streaks
+		let X = t; let Y = w;
+		let ax = abs( X );
+		let rr = length( vec2f( X, Y ) );
+		let vert = ax < 0.3;
+		let ySeams = select( vec4f( -0.42, -0.02, 0.36, 2.0 ), vec4f( -0.58, -0.22, 0.14, 0.5 ), vert );
+		let yc = Y + ax * ax * 0.25;
+		let dY = min( min( abs( yc - ySeams.x ), abs( yc - ySeams.y ) ), min( abs( yc - ySeams.z ), abs( yc - ySeams.w ) ) );
+		let dX = abs( ax - 0.3 );
+		let marg = rr > 0.84;
+		let angle = atan2( Y, X );
+		let dM = min( abs( rr - 0.84 ), abs( fract( angle * ${ f( 12 / Math.PI ) } ) - 0.5 ) * 0.25 );
+		let seam = min( select( min( dY, dX ), dM, marg ), abs( rr - 0.84 ) );
+		let streak = sin( atan2( yc - ( floor( yc * 2.8 ) + 0.5 ) / 2.8, X - sign( X ) * 0.55 ) * 11.0 + n2 * 6.0 ) * 0.5 + 0.5;
+		let blotch = smoothstep( 0.45, 0.8, fishVnoise( vec2f( X, Y ) * 9.0 ) );
+		var shell = mix( back, flank, streak * 0.55 + blotch * 0.45 );
+		shell = mix( shell, vec3f( 0.2, 0.14, 0.06 ), smoothstep( 0.6, 0.9, n1 ) * 0.4 );
+		shell *= mix( 0.45, 1.0, smoothstep( 0.003, 0.012, seam ) );
+		c = shell;
+		metal = 0.0;
+		rough = 0.35;
+	} else if ( P == ${ PA( 'SKIN' ) } || P == ${ PA( 'FLIPPER' ) } ) {
+		// scaly grey-brown skin with pale scale margins; pale yellow plastron
+		let qq = vec2f( Lp.x + Lp.y, Lp.z ) * 55.0;
+		let rowS = floor( qq.y );
+		let q2 = qq + vec2f( rowS * 0.5, 0.0 );
+		let ff = fract( q2 ) - 0.5;
+		let scale = smoothstep( 0.32, 0.47, max( abs( ff.x ), abs( ff.y ) ) );
+		let tone = fishHash( floor( q2 ) ) * 0.35 + 0.8;
+		let skin = mix( finC * tone, edgeC, scale * 0.45 );
+		c = select( skin, belly * mix( 0.85, 1.05, n1 ), w > 1.5 && P == ${ PA( 'SKIN' ) } );
+		metal = 0.0;
+		rough = 0.5;
+	} else if ( P == ${ PA( 'SHELL' ) } ) {
+		// spiny lobster: red-brown carapace with cream spots, banded legs
+		let sp = vec2f( t, w ) * 12.0;
+		let spots = ( 1.0 - smoothstep( 0.18, 0.3, length( fract( sp ) - 0.5 ) ) ) * step( 0.6, fishHash( floor( sp ) ) );
+		var sh = mix( vec3f( 0.16, 0.045, 0.03 ), vec3f( 0.32, 0.1, 0.04 ), n1 );
+		sh = mix( sh, vec3f( 0.7, 0.55, 0.22 ), spots * 0.85 );
+		c = sh;
+		metal = 0.0;
+		rough = 0.35;
+	}
+${ prop ? /* wgsl */`
+	// ---- props: dull, drying skin; wet sheen; salted skin
+	c = mix( c, vec3f( luminance( c ) ), flags.z * 0.55 * bodyK );
+	c *= mix( 1.0, 0.85, flags.z * bodyK );
+	metal *= 1.0 - flags.z;
+	rough = mix( rough, rough * 0.55, flags.y );
+	coat = flags.y * select( 0.0, 0.9, isBody || isFin );
+` : '' }
+	// iridescent sheen on silvery skin at grazing angles
+	let cosV = abs( dot( in.N, in.V ) );
+	let irid = r1.w * bodyK * silver * ( 1.0 - cosV );
+	let hueA = vec3f( 0.55, 0.95, 0.8 ); let hueB = vec3f( 0.95, 0.6, 1.0 );
+	c = mix( c, c * mix( hueA, hueB, cosV ) * 1.25, irid * 0.6 );
+
+	s.albedo = c;
+	s.roughness = rough;
+	s.metalness = metal;
+	// The reference (three r186) reads specularIntensityNode (the 'fishSpec' var) before the colour
+	// function assigns it, so the var reads its zero default there: the fish have no dielectric
+	// specular in the reference (only metal / grazing reflections). Verified headless against
+	// the reference (test/life-ref.mjs: with a constant 0.5 the reference gains exactly the port's
+	// highlights). FISH_SPECULAR selects: 'reference' (look of the three.js app) or 'intended' (0.5,
+	// 1.0 on eyes and ice, as the code was written).
+	s.specularIntensity = ${ FISH_SPECULAR === 'reference' ? '0.0 * spec' : 'spec' };
+	s.normal = perturbNormalByHeight( in.P, in.N, dhdx, dhdy, 1.0 );
+	// translucencyNode: lightColor * albedo * transl * 0.5 (the engine multiplies by the light)
+	s.translucency = c * ( transl * 0.5 );
+${ prop ? '\ts.clearcoat = coat;\n\ts.clearcoatRoughness = 0.12;\n' : '' }`;
+
+}
+
+// props: thin fin membranes let some light through: stochastic transparency, resolved by the
+// temporal anti-aliasing (the rays stay opaque)
+const PROP_MASK = /* wgsl */`
+	{
+		let Dm = in.vs.vFishData;
+		let partM = fishPartOf( Dm );
+		let finM = partM > 0.5 && partM < 6.5;
+		let rayM = 1.0 - smoothstep( 0.07, 0.14, abs( fract( Dm.w + 0.5 ) - 0.5 ) );
+		let alphaM = select( 1.0, max( mix( 0.9, 0.55, smoothstep( 0.25, 1.0, Dm.z ) ), rayM ), finM );
+		let dither = interleavedGradientNoise( in.pixel + fract( frame.time * 7.3 ) * 97.0 );
+		if ( ! ( dither < alphaM ) ) { discard; }
+	}`;
+
+function baseMaterial( batch, name, extra ) {
+
+	return new Material( {
+		name,
+		roughness: 0.4,
+		metalness: 0,
+		modules: [ fishModule(), batch.module ],
+		attributes: { aData: 'vec4f', aKind: 'f32' },
+		varyings: VARYINGS,
+		...extra,
+	} );
 
 }
 
@@ -722,65 +716,24 @@ function surface( V, table, prop, lodFade ) {
 
 // Material of the swimming fish (batch: ReefBatch with the fish kinds).
 // fade: the material of the batch's level-of-detail cross-fade channel
+// Motion vectors: camera motion (as for static geometry) plus the fish's own motion (vertex stage).
 export function createSwimMaterial( batch, { fade = false } = {} ) {
 
-	const V = varyings();
-	const table = skinTable();
-	const mat = physical( { roughness: 0.4, metalness: 0 } );
-	mat.name = fade ? 'FishFade' : 'Fish';
-	mat.positionNode = swimVertex( batch, V, fade );
-	const S = surface( V, table, false, fade );
-	mat.colorNode = S.color;
-	mat.roughnessNode = S.rough;
-	mat.metalnessNode = S.metal;
-	mat.normalNode = bumpNormal( S.height );
-	mat.specularIntensityNode = S.spec;
-	mat.translucencyNode = ( lightColor ) => lightColor.mul( S.albedo ).mul( S.transl.mul( 0.5 ) );
-	// motion vectors: camera motion (as for static geometry) plus the fish's own motion
-	const own = Fn( () => {
-
-		const vp = cameraProjectionMatrix.mul( cameraViewMatrix );
-		const c = vp.mul( vec4( positionWorld, 1 ) );
-		const q = vp.mul( vec4( positionWorld.sub( V.delta ), 1 ) );
-		return c.xy.div( c.w ).sub( q.xy.div( q.w ) );
-
-	} )();
-	mat.mrtNode = mrt( { velocity: staticVelocity.add( own ) } );
-	return mat;
+	return baseMaterial( batch, fade ? 'FishFade' : 'Fish', {
+		vertex: swimVertex( batch, fade ),
+		surface: surface( false, fade ),
+	} );
 
 }
 
 // Material of the fish props: wet, glossy (clear coat), static.
 export function createPropMaterial( batch, { fade = false } = {} ) {
 
-	const V = varyings();
-	const table = skinTable();
-	const mat = physical( { roughness: 0.4, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.12 } );
-	mat.name = fade ? 'FishPropsFade' : 'FishProps';
-	mat.positionNode = propVertex( batch, V, table, fade );
-	const S = surface( V, table, true, fade );
-	mat.colorNode = S.color;
-	mat.roughnessNode = S.rough;
-	mat.metalnessNode = S.metal;
-	mat.normalNode = bumpNormal( S.height );
-	mat.specularIntensityNode = S.spec;
-	mat.clearcoatNode = S.coat;
-	mat.clearcoatRoughnessNode = float( 0.12 );
-	mat.translucencyNode = ( lightColor ) => lightColor.mul( S.albedo ).mul( S.transl.mul( 0.5 ) );
-	mat.mrtNode = staticVelocityMRT;
-	// thin fin membranes let some light through: stochastic transparency, resolved by the
-	// temporal anti-aliasing (the rays stay opaque)
-	mat.maskNode = Fn( () => {
-
-		const D = V.data;
-		const part = partOf( D );
-		const fin = part.greaterThan( 0.5 ).and( part.lessThan( 6.5 ) );
-		const ray = float( 1 ).sub( smoothstep( 0.07, 0.14, abs( fract( D.w.add( 0.5 ) ).sub( 0.5 ) ) ) );
-		const alpha = select( fin, max( mix( 0.9, 0.55, smoothstep( 0.25, 1.0, D.z ) ), ray ), 1 );
-		const dither = interleavedGradientNoise( screenCoordinate.xy.add( fract( G.time.mul( 7.3 ) ).mul( 97 ) ) );
-		return dither.lessThan( alpha );
-
-	} )();
-	return mat;
+	return baseMaterial( batch, fade ? 'FishPropsFade' : 'FishProps', {
+		vertex: propVertex( batch, fade ),
+		surface: PROP_MASK + surface( true, fade ),
+		shadow: PROP_MASK + '\n\treturn true;',
+		defines: { CLEARCOAT: 1 },
+	} );
 
 }

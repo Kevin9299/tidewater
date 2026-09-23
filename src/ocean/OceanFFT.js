@@ -1,11 +1,6 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, uniform, uniformArray, instancedArray, workgroupArray, workgroupBarrier,
-	localId, workgroupId, globalId, float, int, uint, vec2, vec4, uvec2,
-	If, select, cos, sin, sqrt, exp, pow, abs, atan, tanh, cosh, min, max, clamp, log, length,
-	storageTexture, textureStore, texture, mix, saturate,
-} from 'three/tsl';
-import { G, GRAVITY } from '../core/Globals.js';
+import { Vector4, MathUtils } from '../engine/index.js';
+import { GPU, UniformBlock, Texture, StorageBuffer, ShaderModule, ComputeKernel, GRAVITY } from '../engine/webgpu.js';
+import { commonModule } from '../engine/render/wgsl/common.js';
 
 // Multi-cascade FFT ocean (Tessendorf) with a Horvath/JONSWAP spectrum.
 //
@@ -18,6 +13,15 @@ import { G, GRAVITY } from '../core/Globals.js';
 // Packed complex fields (two real fields per complex IFFT):
 //   c0 = Dx  + i Dz        c1 = Dy   + i dDx/dz
 //   c2 = dDy/dx + i dDy/dz c3 = dDx/dx + i dDz/dz
+//
+// WGSL module (`fft.module`, prefix `ocean`):
+//   bindings  oceanDisplacement: texture_2d_array<f32>  (Dx, Dy, Dz, foam) per cascade layer, mipmapped
+//             oceanDerivatives:  texture_2d_array<f32>  (dDy/dx, dDy/dz, dDx/dx, dDz/dz)
+//   uniforms  ocean: OceanParams — sizes[ c ].x (cascade tile size, m), cuts[ c ].xy (spectrum band),
+//             choppiness, foamBias, foamGain, foamDecay, foamAdd, time, depth, seed, sysA[ 2 ], sysB[ 2 ]
+//   const     OCEAN_CASCADES: i32, OCEAN_FFT_SIZE: f32
+//   fn oceanSampleDisplacement( xz: vec2f, level: f32 ) -> vec3f   sum of all cascades (explicit lod)
+//   fn oceanSampleDisplacementWeighted( xz: vec2f, level: f32, w: vec4f ) -> vec3f   per-cascade weights
 
 export const FFT_SIZE = 256;
 const N = FFT_SIZE;
@@ -28,35 +32,6 @@ const HALF = N / 2;
 export const DEFAULT_CASCADE_SIZES = [ 733, 157, 33.3, 7.1 ];
 
 const TWO_PI = Math.PI * 2;
-
-function bitReverse8( v ) {
-
-	let r = v;
-	r = r.bitAnd( 0x55 ).shiftLeft( 1 ).bitOr( r.shiftRight( 1 ).bitAnd( 0x55 ) );
-	r = r.bitAnd( 0x33 ).shiftLeft( 2 ).bitOr( r.shiftRight( 2 ).bitAnd( 0x33 ) );
-	r = r.bitAnd( 0x0F ).shiftLeft( 4 ).bitOr( r.shiftRight( 4 ).bitAnd( 0x0F ) );
-	return r;
-
-}
-
-// complex multiply of two packed complex numbers (v.xy, v.zw) by scalar complex w
-const cmul2 = ( v, w ) => vec4(
-	v.x.mul( w.x ).sub( v.y.mul( w.y ) ),
-	v.x.mul( w.y ).add( v.y.mul( w.x ) ),
-	v.z.mul( w.x ).sub( v.w.mul( w.y ) ),
-	v.z.mul( w.y ).add( v.w.mul( w.x ) )
-);
-
-// PCG hash
-const pcg = ( v ) => {
-
-	const state = v.mul( uint( 747796405 ) ).add( uint( 2891336453 ) );
-	const word = state.shiftRight( state.shiftRight( uint( 28 ) ).add( uint( 4 ) ) ).bitXor( state ).mul( uint( 277803737 ) );
-	return word.shiftRight( uint( 22 ) ).bitXor( word );
-
-};
-
-const toUnit = ( h ) => float( h.shiftRight( uint( 8 ) ) ).mul( 1 / 16777216 ).add( 0.5 / 16777216 );
 
 export class WaveSystem {
 
@@ -75,6 +50,34 @@ export class WaveSystem {
 
 }
 
+// WGSL shared by the kernels: PCG hash, complex helpers
+const FFT_COMMON = /* wgsl */`
+const FFT_N: u32 = ${ N }u;
+const FFT_HALF: u32 = ${ HALF }u;
+const FFT_G: f32 = ${ GRAVITY };
+
+fn fftBitReverse8( v: u32 ) -> u32 {
+	var r = v;
+	r = ( ( r & 0x55u ) << 1u ) | ( ( r >> 1u ) & 0x55u );
+	r = ( ( r & 0x33u ) << 2u ) | ( ( r >> 2u ) & 0x33u );
+	r = ( ( r & 0x0Fu ) << 4u ) | ( ( r >> 4u ) & 0x0Fu );
+	return r;
+}
+
+// complex multiply of two packed complex numbers (v.xy, v.zw) by scalar complex w
+fn fftCmul2( v: vec4f, w: vec2f ) -> vec4f {
+	return vec4f( v.x * w.x - v.y * w.y, v.x * w.y + v.y * w.x, v.z * w.x - v.w * w.y, v.z * w.y + v.w * w.x );
+}
+
+// PCG hash
+fn fftPcg( v: u32 ) -> u32 {
+	let state = v * 747796405u + 2891336453u;
+	let word = ( ( state >> ( ( state >> 28u ) + 4u ) ) ^ state ) * 277803737u;
+	return ( word >> 22u ) ^ word;
+}
+fn fftToUnit( h: u32 ) -> f32 { return f32( h >> 8u ) * ( 1.0 / 16777216.0 ) + ( 0.5 / 16777216.0 ); }
+`;
+
 export class OceanFFT {
 
 	constructor( renderer, options = {} ) {
@@ -87,55 +90,89 @@ export class OceanFFT {
 		this.local = new WaveSystem( options.local ?? { windSpeed: 7, windDirection: 25, fetch: 120, spreadBlend: 0.85, swell: 0.05 } );
 		this.swell = new WaveSystem( options.swell ?? { scale: 0.48, windSpeed: 6, windDirection: 5, fetch: 1200, spreadBlend: 1.0, swell: 0.9, shortWavesFade: 0.1 } );
 
-		this.choppiness = uniform( options.choppiness ?? 0.9 ).setName( 'fftChop' );
-		// foam starts where a cascade compresses the surface below this Jacobian (per-cascade J
-		// stays close to 1: 0.85 gives ~0.3% whitecap cover at 7 m/s, 0.9 several % in fresh wind)
-		this.foamBias = uniform( 0.58 ).setName( 'foamBias' );
-		this.foamGain = uniform( 3.0 ).setName( 'foamGain' );
-		this.foamDecay = uniform( 0.35 ).setName( 'foamDecay' );
-		this.foamAdd = uniform( 2.5 ).setName( 'foamAdd' );
-		this.timeScale = 1;
-		this.time = uniform( 0 ).setName( 'fftTime' );
-
 		const C = this.cascades;
+		this.params = new UniformBlock( 'OceanParams', {
+			// per cascade: x = tile size (m)
+			sizes: [ 'vec4f[4]', [ 0, 1, 2, 3 ].map( ( i ) => new Vector4( this.sizes[ i ] ?? 1, 0, 0, 0 ) ) ],
+			// per cascade: x = low wavenumber cut, y = high cut
+			cuts: [ 'vec4f[4]', [ 0, 1, 2, 3 ].map( () => new Vector4() ) ],
+			// per system: [scale, angle, spreadBlend, swell] [alpha, peakOmega, gamma, shortWavesFade]
+			sysA: [ 'vec4f[2]', [ new Vector4(), new Vector4() ] ],
+			sysB: [ 'vec4f[2]', [ new Vector4(), new Vector4() ] ],
+			choppiness: [ 'f32', options.choppiness ?? 0.9 ],
+			// foam starts where a cascade compresses the surface below this Jacobian (per-cascade J
+			// stays close to 1: 0.85 gives ~0.3% whitecap cover at 7 m/s, 0.9 several % in fresh wind)
+			foamBias: [ 'f32', 0.58 ],
+			foamGain: [ 'f32', 3.0 ],
+			foamDecay: [ 'f32', 0.35 ],
+			foamAdd: [ 'f32', 2.5 ],
+			time: [ 'f32', 0 ],
+			depth: [ 'f32', this.depth ],
+			seed: [ 'u32', 1337 ],
+		}, { label: 'ocean' } );
+		const F = this.params.fields;
+		// three-style { value } handles (same names as the TSL version)
+		this.choppiness = F.choppiness;
+		this.foamBias = F.foamBias;
+		this.foamGain = F.foamGain;
+		this.foamDecay = F.foamDecay;
+		this.foamAdd = F.foamAdd;
+		this.time = F.time;
+		this.uDepth = F.depth;
+		this.uSeed = F.seed;
+		this.timeScale = 1;
+
 		const total = N * N * C;
 
-		this.h0 = instancedArray( total, 'vec4' ).setName( 'fftH0' );
-		this.waveData = instancedArray( total, 'vec4' ).setName( 'fftWave' );
-		this.tmp = instancedArray( total * 2, 'vec4' ).setName( 'fftTmp' );
-		this.foam = instancedArray( total, 'float' ).setName( 'fftFoam' );
+		this.h0 = new StorageBuffer( { label: 'fftH0', count: total, type: 'vec4f' } );
+		this.waveData = new StorageBuffer( { label: 'fftWave', count: total, type: 'vec4f' } );
+		this.tmp = new StorageBuffer( { label: 'fftTmp', count: total * 2, type: 'vec4f' } );
+		this.foam = new StorageBuffer( { label: 'fftFoam', count: total, type: 'f32' } );
 		// level 0 of both textures (interleaved) for the compute mip chain, and the 8x8 level 5
-		this.mipSrc = instancedArray( total * 2, 'vec4' ).setName( 'fftMipSrc' );
-		this.mipMid = instancedArray( 64 * C * 2, 'vec4' ).setName( 'fftMipMid' );
+		this.mipSrc = new StorageBuffer( { label: 'fftMipSrc', count: total * 2, type: 'vec4f' } );
+		this.mipMid = new StorageBuffer( { label: 'fftMipMid', count: 64 * C * 2, type: 'vec4f' } );
 
-		const makeTex = ( name ) => {
-
-			const t = new THREE.StorageArrayTexture( N, N, C );
-			t.name = name;
-			t.type = THREE.HalfFloatType;
-			t.format = THREE.RGBAFormat;
-			t.wrapS = t.wrapT = THREE.RepeatWrapping;
-			t.magFilter = THREE.LinearFilter;
-			t.minFilter = THREE.LinearMipmapLinearFilter;
-			t.generateMipmaps = true; // allocate the full chain; filled by the compute mip kernels
-			t.mipmapsAutoUpdate = false;
-			t.anisotropy = 4;
-			return t;
-
-		};
+		const makeTex = ( name ) => new Texture( {
+			label: name, width: N, height: N, depth: C, dimension: '2d-array', format: 'rgba16float',
+			// allocate the full chain; filled by the compute mip kernels (sampled repeat + trilinear)
+			mips: true, usage: [ 'sample', 'storage', 'copyDst', 'copySrc' ], sampler: 'linearRepeat',
+		} );
 
 		this.displacementTexture = makeTex( 'oceanDisplacement' ); // (Dx, Dy, Dz, foam)
 		this.derivativeTexture = makeTex( 'oceanDerivatives' ); // (dDy/dx, dDy/dz, dDx/dx, dDz/dz)
 
-		// spectrum uniforms
-		this.uSizes = uniformArray( this.sizes.slice(), 'float' ).setName( 'fftSizes' );
-		this.uCutLow = uniformArray( new Array( C ).fill( 0 ), 'float' ).setName( 'fftCutLow' );
-		this.uCutHigh = uniformArray( new Array( C ).fill( 0 ), 'float' ).setName( 'fftCutHigh' );
-		this.uDepth = uniform( this.depth ).setName( 'fftDepth' );
-		this.uSeed = uniform( 1337, 'uint' ).setName( 'fftSeed' );
-		// per system: [scale, angle, spreadBlend, swell] [alpha, peakOmega, gamma, shortWavesFade]
-		this.uSysA = uniformArray( [ new THREE.Vector4(), new THREE.Vector4() ], 'vec4' ).setName( 'fftSysA' );
-		this.uSysB = uniformArray( [ new THREE.Vector4(), new THREE.Vector4() ], 'vec4' ).setName( 'fftSysB' );
+		this.module = new ShaderModule( {
+			name: 'ocean',
+			deps: [ commonModule ],
+			uniforms: this.params,
+			uniformName: 'ocean',
+			bindings: {
+				oceanDisplacement: { texture: this.displacementTexture, viewDimension: '2d-array' },
+				oceanDerivatives: { texture: this.derivativeTexture, viewDimension: '2d-array' },
+			},
+			code: /* wgsl */`
+const OCEAN_CASCADES: i32 = ${ C };
+const OCEAN_FFT_SIZE: f32 = ${ N }.0;
+
+// Sample all cascades' displacement at world xz (explicit mip level).
+fn oceanSampleDisplacement( xz: vec2f, level: f32 ) -> vec3f {
+	var sum = vec3f( 0.0 );
+	for ( var c = 0; c < OCEAN_CASCADES; c++ ) {
+		sum += textureSampleLevel( oceanDisplacement, smpLinearRepeat, xz / ocean.sizes[ c ].x, c, level ).xyz;
+	}
+	return sum;
+}
+
+// ... with a weight per cascade
+fn oceanSampleDisplacementWeighted( xz: vec2f, level: f32, w: vec4f ) -> vec3f {
+	var sum = vec3f( 0.0 );
+	for ( var c = 0; c < OCEAN_CASCADES; c++ ) {
+		sum += textureSampleLevel( oceanDisplacement, smpLinearRepeat, xz / ocean.sizes[ c ].x, c, level ).xyz * w[ c ];
+	}
+	return sum;
+}
+`,
+		} );
 
 		this._buildKernels();
 		this.updateSpectrumUniforms();
@@ -143,32 +180,35 @@ export class OceanFFT {
 
 	}
 
+	// the per-cascade tile sizes (three version: uniformArray; `.array` kept for callers)
+	get uSizes() {
+
+		return { array: this.sizes };
+
+	}
+
 	setCascadeSizes( sizes ) {
 
 		this.sizes = sizes.slice( 0, this.cascades );
-		this.uSizes.array = this.sizes.slice();
-		this.needsSpectrum = true;
+		this.updateSpectrumUniforms();
 
 	}
 
 	updateSpectrumUniforms() {
 
 		const C = this.cascades;
-		const cutLow = [], cutHigh = [];
+		const P = this.params.fields;
 
 		for ( let i = 0; i < C; i ++ ) {
 
 			const low = i === 0 ? 0.0001 : ( TWO_PI / this.sizes[ i ] ) * 6;
 			const high = i === C - 1 ? 9999 : ( TWO_PI / this.sizes[ i + 1 ] ) * 6;
-			cutLow.push( low );
-			cutHigh.push( high );
+			P.cuts.value[ i ].set( low, high, 0, 0 );
+			P.sizes.value[ i ].set( this.sizes[ i ], 0, 0, 0 );
 
 		}
 
-		this.uCutLow.array = cutLow;
-		this.uCutHigh.array = cutHigh;
-		this.uSizes.array = this.sizes.slice();
-		this.uDepth.value = this.depth;
+		P.depth.value = this.depth;
 
 		const sys = [ this.local, this.swell ];
 
@@ -179,11 +219,15 @@ export class OceanFFT {
 			const U = Math.max( 0.1, s.windSpeed );
 			const alpha = 0.076 * Math.pow( GRAVITY * fetchM / ( U * U ), - 0.22 );
 			const peakOmega = 22 * Math.pow( U * fetchM / ( GRAVITY * GRAVITY ), - 0.33 );
-			this.uSysA.array[ i ].set( s.scale, THREE.MathUtils.degToRad( s.windDirection ), s.spreadBlend, s.swell );
-			this.uSysB.array[ i ].set( alpha, peakOmega, s.peakEnhancement, s.shortWavesFade );
+			P.sysA.value[ i ].set( s.scale, MathUtils.degToRad( s.windDirection ), s.spreadBlend, s.swell );
+			P.sysB.value[ i ].set( alpha, peakOmega, s.peakEnhancement, s.shortWavesFade );
 
 		}
 
+		this.params.set( 'cuts', P.cuts.value );
+		this.params.set( 'sizes', P.sizes.value );
+		this.params.set( 'sysA', P.sysA.value );
+		this.params.set( 'sysB', P.sysB.value );
 		this.needsSpectrum = true;
 
 	}
@@ -191,401 +235,421 @@ export class OceanFFT {
 	_buildKernels() {
 
 		const C = this.cascades;
-		const { h0, waveData, tmp, foam } = this;
-		const { uSizes, uCutLow, uCutHigh, uDepth, uSeed, uSysA, uSysB } = this;
+		const oceanU = { ocean: { uniform: this.params } };
+		const rw = ( b ) => ( { storage: b, access: 'read_write' } );
 
 		// ---------- spectrum helpers ----------
 
-		const dispersion = ( k ) => sqrt( k.mul( GRAVITY ).mul( tanh( min( k.mul( uDepth ), 20 ) ) ) );
+		const SPECTRUM = /* wgsl */`
+fn dispersion( k: f32 ) -> f32 { return sqrt( k * FFT_G * tanh( min( k * ocean.depth, 20.0 ) ) ); }
 
-		const dispersionDerivative = ( k ) => {
+fn dispersionDerivative( k: f32 ) -> f32 {
+	let kd = min( k * ocean.depth, 20.0 );
+	let th = tanh( kd );
+	let ch = cosh( kd );
+	return FFT_G * ( ocean.depth * k / ( ch * ch ) + th ) / dispersion( k ) * 0.5;
+}
 
-			const kd = min( k.mul( uDepth ), 20 );
-			const th = tanh( kd );
-			const ch = cosh( kd );
-			return float( GRAVITY ).mul( uDepth.mul( k ).div( ch.mul( ch ) ).add( th ) ).div( dispersion( k ) ).mul( 0.5 );
+fn tmaCorrection( omega: f32 ) -> f32 {
+	let omegaH = omega * sqrt( ocean.depth / FFT_G );
+	let a = omegaH * omegaH * 0.5;
+	let b = 1.0 - pow( 2.0 - omegaH, 2.0 ) * 0.5;
+	return select( select( 1.0, b, omegaH < 2.0 ), a, omegaH <= 1.0 );
+}
 
-		};
+fn jonswap( omega: f32, sysA: vec4f, sysB: vec4f ) -> f32 {
+	let alpha = sysB.x; let peakOmega = sysB.y; let gamma = sysB.z;
+	let sigma = select( 0.09, 0.07, omega <= peakOmega );
+	let d = omega - peakOmega;
+	let r = exp( - d * d / ( sigma * sigma * peakOmega * peakOmega * 2.0 ) );
+	let inv = 1.0 / omega;
+	let po = peakOmega * inv;
+	return sysA.x * tmaCorrection( omega ) * alpha * ( FFT_G * FFT_G )
+		* pow( inv, 5.0 )
+		* exp( pow( po, 4.0 ) * -1.25 )
+		* pow( abs( gamma ), r );
+}
 
-		const tmaCorrection = ( omega ) => {
+fn normalisationFactor( s: f32 ) -> f32 {
+	let s2 = s * s; let s3 = s2 * s; let s4 = s3 * s;
+	let lo = s4 * -0.000564 + s3 * 0.00776 - s2 * 0.044 + s * 0.192 + 0.163;
+	let hi = s4 * -4.80e-08 + s3 * 1.07e-05 - s2 * 9.53e-04 + s * 5.90e-02 + 3.93e-01;
+	return select( hi, lo, s < 5.0 );
+}
 
-			const omegaH = omega.mul( sqrt( uDepth.div( GRAVITY ) ) );
-			const a = omegaH.mul( omegaH ).mul( 0.5 );
-			const b = float( 1 ).sub( float( 2 ).sub( omegaH ).pow( 2 ).mul( 0.5 ) );
-			return select( omegaH.lessThanEqual( 1 ), a, select( omegaH.lessThan( 2 ), b, float( 1 ) ) );
+fn directionSpectrum( theta: f32, omega: f32, sysA: vec4f, sysB: vec4f ) -> f32 {
+	let peakOmega = sysB.y;
+	let ratio = omega / peakOmega;
+	let spreadPower = select( pow( abs( ratio ), 5.0 ) * 6.97, pow( abs( ratio ), -2.5 ) * 9.77, omega > peakOmega );
+	let s = spreadPower + tanh( min( ratio, 20.0 ) ) * 16.0 * sysA.w * sysA.w;
+	let dTheta = theta - sysA.y;
+	let cos2s = normalisationFactor( s ) * pow( abs( cos( dTheta * 0.5 ) ), s * 2.0 );
+	let cosT = cos( dTheta );
+	let base = cosT * cosT * ( 2.0 / PI ) * select( 0.0, 1.0, cosT > 0.0 );
+	return mix( base, cos2s, sysA.z );
+}
 
-		};
-
-		const jonswap = ( omega, sysA, sysB ) => {
-
-			const alpha = sysB.x, peakOmega = sysB.y, gamma = sysB.z;
-			const sigma = select( omega.lessThanEqual( peakOmega ), float( 0.07 ), float( 0.09 ) );
-			const d = omega.sub( peakOmega );
-			const r = exp( d.mul( d ).negate().div( sigma.mul( sigma ).mul( peakOmega ).mul( peakOmega ).mul( 2 ) ) );
-			const inv = float( 1 ).div( omega );
-			const po = peakOmega.mul( inv );
-			return sysA.x.mul( tmaCorrection( omega ) ).mul( alpha ).mul( GRAVITY * GRAVITY )
-				.mul( inv.pow( 5 ) )
-				.mul( exp( po.pow( 4 ).mul( - 1.25 ) ) )
-				.mul( pow( abs( gamma ), r ) );
-
-		};
-
-		const normalisationFactor = ( s ) => {
-
-			const s2 = s.mul( s ), s3 = s2.mul( s ), s4 = s3.mul( s );
-			const lo = s4.mul( - 0.000564 ).add( s3.mul( 0.00776 ) ).sub( s2.mul( 0.044 ) ).add( s.mul( 0.192 ) ).add( 0.163 );
-			const hi = s4.mul( - 4.80e-08 ).add( s3.mul( 1.07e-05 ) ).sub( s2.mul( 9.53e-04 ) ).add( s.mul( 5.90e-02 ) ).add( 3.93e-01 );
-			return select( s.lessThan( 5 ), lo, hi );
-
-		};
-
-		const directionSpectrum = ( theta, omega, sysA, sysB ) => {
-
-			const peakOmega = sysB.y;
-			const ratio = omega.div( peakOmega );
-			const spreadPower = select( omega.greaterThan( peakOmega ), pow( abs( ratio ), - 2.5 ).mul( 9.77 ), pow( abs( ratio ), 5 ).mul( 6.97 ) );
-			const s = spreadPower.add( tanh( min( ratio, 20 ) ).mul( 16 ).mul( sysA.w ).mul( sysA.w ) );
-			const dTheta = theta.sub( sysA.y );
-			const cos2s = normalisationFactor( s ).mul( pow( abs( cos( dTheta.mul( 0.5 ) ) ), s.mul( 2 ) ) );
-			const cosT = cos( dTheta );
-			const base = cosT.mul( cosT ).mul( 2 / Math.PI ).mul( select( cosT.greaterThan( 0 ), float( 1 ), float( 0.0 ) ) );
-			return mix( base, cos2s, sysA.z );
-
-		};
-
-		const shortWavesFade = ( k, sysB ) => exp( sysB.w.mul( sysB.w ).mul( k ).mul( k ).negate() );
+fn shortWavesFade( k: f32, sysB: vec4f ) -> f32 { return exp( - sysB.w * sysB.w * k * k ); }
+`;
 
 		// ---------- init spectrum ----------
 
-		this.initSpectrumKernel = Fn( () => {
+		this.initSpectrumKernel = new ComputeKernel( {
+			label: 'Ocean Init Spectrum',
+			modules: [ commonModule ],
+			bindings: { ...oceanU, h0: rw( this.h0 ), waveData: rw( this.waveData ) },
+			workgroupSize: [ 16, 16, 1 ],
+			code: FFT_COMMON + SPECTRUM + /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let x = i32( gid.x ); let y = i32( gid.y ); let c = i32( gid.z );
+	let idx = c * ${ N * N } + y * ${ N } + x;
 
-			const x = int( globalId.x ), y = int( globalId.y ), c = int( globalId.z );
-			const idx = c.mul( N * N ).add( y.mul( N ) ).add( x );
+	let L = ocean.sizes[ c ].x;
+	let dk = TWO_PI / L;
+	let kx = f32( x - ${ HALF } ) * dk;
+	let kz = f32( y - ${ HALF } ) * dk;
+	let kLen = length( vec2f( kx, kz ) );
 
-			const L = uSizes.element( c );
-			const dk = float( TWO_PI ).div( L );
-			const kx = float( x.sub( HALF ) ).mul( dk );
-			const kz = float( y.sub( HALF ) ).mul( dk );
-			const kLen = length( vec2( kx, kz ) ).toVar();
+	var outH = vec4f( 0.0 );
+	var outW = vec4f( kx, kz, 0.0, 0.0 );
 
-			const outH = vec4( 0 ).toVar();
-			const outW = vec4( kx, kz, 0, 0 ).toVar();
+	if ( kLen >= ocean.cuts[ c ].x && kLen <= ocean.cuts[ c ].y ) {
+		let omega = dispersion( kLen );
+		let dOmega = dispersionDerivative( kLen );
+		let theta = atan2( kz, kx );
 
-			If( kLen.greaterThanEqual( uCutLow.element( c ) ).and( kLen.lessThanEqual( uCutHigh.element( c ) ) ), () => {
+		let sa0 = ocean.sysA[ 0 ]; let sb0 = ocean.sysB[ 0 ];
+		let sa1 = ocean.sysA[ 1 ]; let sb1 = ocean.sysB[ 1 ];
 
-				const omega = dispersion( kLen ).toVar();
-				const dOmega = dispersionDerivative( kLen );
-				const theta = atan( kz, kx );
+		let S0 = jonswap( omega, sa0, sb0 ) * directionSpectrum( theta, omega, sa0, sb0 ) * shortWavesFade( kLen, sb0 );
+		let S1 = jonswap( omega, sa1, sb1 ) * directionSpectrum( theta, omega, sa1, sb1 ) * shortWavesFade( kLen, sb1 );
+		let S = max( S0 + S1, 0.0 );
 
-				const sa0 = uSysA.element( 0 ), sb0 = uSysB.element( 0 );
-				const sa1 = uSysA.element( 1 ), sb1 = uSysB.element( 1 );
+		// E|h0|^2 = S(k) dk^2 / 2 so that var(height) = sum S(k) dk^2 (h has both +k and -k terms)
+		let amp = sqrt( S * abs( dOmega ) / kLen * dk * dk ) * 0.5;
 
-				const S0 = jonswap( omega, sa0, sb0 ).mul( directionSpectrum( theta, omega, sa0, sb0 ) ).mul( shortWavesFade( kLen, sb0 ) );
-				const S1 = jonswap( omega, sa1, sb1 ).mul( directionSpectrum( theta, omega, sa1, sb1 ) ).mul( shortWavesFade( kLen, sb1 ) );
-				const S = max( S0.add( S1 ), 0 );
+		// gaussian random pair (Box-Muller)
+		let seed = u32( idx ) * 4u + ocean.seed * 7919u;
+		let u1 = fftToUnit( fftPcg( seed ) );
+		let u2 = fftToUnit( fftPcg( seed + 1u ) );
+		let r = sqrt( log( u1 ) * -2.0 );
+		let g0 = r * cos( u2 * TWO_PI );
+		let g1 = r * sin( u2 * TWO_PI );
 
-				// E|h0|^2 = S(k) dk^2 / 2 so that var(height) = sum S(k) dk^2 (h has both +k and -k terms)
-				const amp = sqrt( S.mul( abs( dOmega ) ).div( kLen ).mul( dk ).mul( dk ) ).mul( 0.5 );
+		outH = vec4f( g0 * amp, g1 * amp, 0.0, 0.0 );
+		outW = vec4f( kx, kz, 1.0 / kLen, omega );
+	}
 
-				// gaussian random pair (Box-Muller)
-				const seed = uint( idx ).mul( uint( 4 ) ).add( uSeed.mul( uint( 7919 ) ) );
-				const u1 = toUnit( pcg( seed ) );
-				const u2 = toUnit( pcg( seed.add( uint( 1 ) ) ) );
-				const r = sqrt( log( u1 ).mul( - 2 ) );
-				const g0 = r.mul( cos( u2.mul( TWO_PI ) ) );
-				const g1 = r.mul( sin( u2.mul( TWO_PI ) ) );
+	h0[ idx ] = outH;
+	waveData[ idx ] = outW;
+}`,
+		} );
 
-				outH.assign( vec4( g0.mul( amp ), g1.mul( amp ), 0, 0 ) );
-				outW.assign( vec4( kx, kz, float( 1 ).div( kLen ), omega ) );
+		this.conjugateKernel = new ComputeKernel( {
+			label: 'Ocean Conjugate',
+			bindings: { h0: rw( this.h0 ), tmp: rw( this.tmp ) },
+			workgroupSize: [ 16, 16, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let x = i32( gid.x ); let y = i32( gid.y ); let c = i32( gid.z );
+	let base = c * ${ N * N };
+	let idx = base + y * ${ N } + x;
+	let xm = ( ${ N } - x ) % ${ N };
+	let ym = ( ${ N } - y ) % ${ N };
+	let idxm = base + ym * ${ N } + xm;
+	let hm = h0[ idxm ].xy;
+	let cur = h0[ idx ].xy;
+	tmp[ idx ] = vec4f( cur.x, cur.y, hm.x, - hm.y );
+}`,
+		} );
 
-			} );
-
-			h0.element( idx ).assign( outH );
-			waveData.element( idx ).assign( outW );
-
-		} )().computeKernel( [ 16, 16, 1 ] ).setName( 'Ocean Init Spectrum' );
-
-		this.conjugateKernel = Fn( () => {
-
-			const x = int( globalId.x ), y = int( globalId.y ), c = int( globalId.z );
-			const base = c.mul( N * N );
-			const idx = base.add( y.mul( N ) ).add( x );
-			const xm = int( N ).sub( x ).mod( N );
-			const ym = int( N ).sub( y ).mod( N );
-			const idxm = base.add( ym.mul( N ) ).add( xm );
-			const hm = h0.element( idxm ).xy;
-			const cur = h0.element( idx ).xy;
-			tmp.element( idx ).assign( vec4( cur.x, cur.y, hm.x, hm.y.negate() ) );
-
-		} )().computeKernel( [ 16, 16, 1 ] ).setName( 'Ocean Conjugate' );
-
-		this.copyH0Kernel = Fn( () => {
-
-			const x = int( globalId.x ), y = int( globalId.y ), c = int( globalId.z );
-			const idx = c.mul( N * N ).add( y.mul( N ) ).add( x );
-			h0.element( idx ).assign( tmp.element( idx ) );
-			foam.element( idx ).assign( 0 );
-
-		} )().computeKernel( [ 16, 16, 1 ] ).setName( 'Ocean Copy H0' );
+		this.copyH0Kernel = new ComputeKernel( {
+			label: 'Ocean Copy H0',
+			bindings: { h0: rw( this.h0 ), tmp: rw( this.tmp ), foam: rw( this.foam ) },
+			workgroupSize: [ 16, 16, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let idx = gid.z * ${ N * N }u + gid.y * ${ N }u + gid.x;
+	h0[ idx ] = tmp[ idx ];
+	foam[ idx ] = 0.0;
+}`,
+		} );
 
 		// ---------- IFFT ----------
 
-		const shared = workgroupArray( 'vec4', N * 2 );
+		let stages = '';
+		for ( let s = 0; s < LOG2N; s ++ ) {
 
-		const fftStages = ( t ) => {
+			const half = 1 << s;
+			stages += /* wgsl */`
+	{
+		let pos = t & ${ half - 1 }u;
+		let i = ( ( t >> ${ s }u ) << ${ s + 1 }u ) | pos;
+		let j = i + ${ half }u;
+		let ang = f32( pos ) * ${ ( Math.PI / half ).toFixed( 12 ) };
+		let w = vec2f( cos( ang ), sin( ang ) );
+		let i2 = i * 2u; let j2 = j * 2u;
+		let a0 = fftShared[ i2 ]; let a1 = fftShared[ i2 + 1u ];
+		let b0 = fftCmul2( fftShared[ j2 ], w ); let b1 = fftCmul2( fftShared[ j2 + 1u ], w );
+		fftShared[ i2 ] = a0 + b0;
+		fftShared[ i2 + 1u ] = a1 + b1;
+		fftShared[ j2 ] = a0 - b0;
+		fftShared[ j2 + 1u ] = a1 - b1;
+		workgroupBarrier();
+	}`;
 
-			for ( let s = 0; s < LOG2N; s ++ ) {
+		}
 
-				const half = 1 << s;
-				const pos = t.bitAnd( uint( half - 1 ) );
-				const i = t.shiftRight( uint( s ) ).shiftLeft( uint( s + 1 ) ).bitOr( pos );
-				const j = i.add( uint( half ) );
-				const ang = float( pos ).mul( Math.PI / half );
-				const w = vec2( cos( ang ), sin( ang ) ).toVar();
-				const i2 = i.mul( uint( 2 ) ).toVar();
-				const j2 = j.mul( uint( 2 ) ).toVar();
-				const a0 = shared.element( i2 ).toVar();
-				const a1 = shared.element( i2.add( uint( 1 ) ) ).toVar();
-				const b0 = cmul2( shared.element( j2 ).toVar(), w ).toVar();
-				const b1 = cmul2( shared.element( j2.add( uint( 1 ) ) ).toVar(), w ).toVar();
-				shared.element( i2 ).assign( a0.add( b0 ) );
-				shared.element( i2.add( uint( 1 ) ) ).assign( a1.add( b1 ) );
-				shared.element( j2 ).assign( a0.sub( b0 ) );
-				shared.element( j2.add( uint( 1 ) ) ).assign( a1.sub( b1 ) );
-				workgroupBarrier();
+		const SHARED = `var<workgroup> fftShared: array<vec4f, ${ N * 2 }>;\n`;
 
-			}
+		this.rowKernel = new ComputeKernel( {
+			label: 'Ocean FFT Rows',
+			modules: [ commonModule ],
+			bindings: { ...oceanU, h0: rw( this.h0 ), waveData: rw( this.waveData ), tmp: rw( this.tmp ) },
+			workgroupSize: [ HALF, 1, 1 ],
+			code: FFT_COMMON + SHARED + /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( local_invocation_id ) lid: vec3u, @builtin( workgroup_id ) wid: vec3u ) {
+	let t = lid.x;
+	let row = wid.x;
+	let c = wid.y;
+	let base = c * ${ N * N }u + row * ${ N }u;
+	let time = ocean.time;
 
-		};
+	for ( var e = 0u; e < 2u; e++ ) {
+		let x = t + e * FFT_HALF;
+		let idx = base + x;
+		let w = waveData[ idx ];
+		let hv = h0[ idx ];
+		let ph = w.w * time;
+		let cs = cos( ph ); let sn = sin( ph );
 
-		const time = this.time;
+		// h = h0 * e^{i w t} + conj(h0(-k)) * e^{-i w t}
+		let hr = hv.x * cs - hv.y * sn + hv.z * cs + hv.w * sn;
+		let hi = hv.x * sn + hv.y * cs - hv.z * sn + hv.w * cs;
 
-		this.rowKernel = Fn( () => {
+		let kx = w.x; let kz = w.y; let ik = w.z;
+		let fx = kx * ik; let fz = kz * ik;
 
-			const t = localId.x;
-			const row = workgroupId.x;
-			const c = workgroupId.y;
-			const base = c.mul( uint( N * N ) ).add( row.mul( uint( N ) ) ).toVar();
+		// Dx_hat = i kx/k h, Dz_hat = i kz/k h  ->  c0 = Dx + i Dz
+		let c0 = vec2f( - ( fx * hi + fz * hr ), fx * hr - fz * hi );
+		// c1 = Dy + i dDx/dz,  dDx/dz_hat = -kx kz / k h
+		let q = - ( kx * kz * ik );
+		let c1 = vec2f( hr - q * hi, hi + q * hr );
+		// c2 = dDy/dx + i dDy/dz
+		let c2 = vec2f( - ( kx * hi + kz * hr ), kx * hr - kz * hi );
+		// c3 = dDx/dx + i dDz/dz
+		let a = - ( kx * kx * ik ); let b = - ( kz * kz * ik );
+		let c3 = vec2f( a * hr - b * hi, a * hi + b * hr );
 
-			for ( let e = 0; e < 2; e ++ ) {
+		let r = fftBitReverse8( x ) * 2u;
+		fftShared[ r ] = vec4f( c0, c1 );
+		fftShared[ r + 1u ] = vec4f( c2, c3 );
+	}
 
-				const x = t.add( uint( e * HALF ) );
-				const idx = base.add( x );
-				const w = waveData.element( idx ).toVar();
-				const hv = h0.element( idx ).toVar();
-				const ph = w.w.mul( time );
-				const cs = cos( ph ).toVar(), sn = sin( ph ).toVar();
+	workgroupBarrier();
+${ stages }
 
-				// h = h0 * e^{i w t} + conj(h0(-k)) * e^{-i w t}
-				const hr = hv.x.mul( cs ).sub( hv.y.mul( sn ) ).add( hv.z.mul( cs ) ).add( hv.w.mul( sn ) ).toVar();
-				const hi = hv.x.mul( sn ).add( hv.y.mul( cs ) ).sub( hv.z.mul( sn ) ).add( hv.w.mul( cs ) ).toVar();
+	for ( var e = 0u; e < 2u; e++ ) {
+		let x = t + e * FFT_HALF;
+		let o = ( base + x ) * 2u;
+		tmp[ o ] = fftShared[ x * 2u ];
+		tmp[ o + 1u ] = fftShared[ x * 2u + 1u ];
+	}
+}`,
+		} );
 
-				const kx = w.x, kz = w.y, ik = w.z;
-				const fx = kx.mul( ik ), fz = kz.mul( ik );
+		const level = ( tex, l ) => ( { storageTexture: tex, access: 'write', view: { dimension: '2d-array', baseMipLevel: l, mipLevelCount: 1 } } );
 
-				// Dx_hat = i kx/k h, Dz_hat = i kz/k h  ->  c0 = Dx + i Dz
-				const c0 = vec2( fx.mul( hi ).add( fz.mul( hr ) ).negate(), fx.mul( hr ).sub( fz.mul( hi ) ) );
-				// c1 = Dy + i dDx/dz,  dDx/dz_hat = -kx kz / k h
-				const q = kx.mul( kz ).mul( ik ).negate();
-				const c1 = vec2( hr.sub( q.mul( hi ) ), hi.add( q.mul( hr ) ) );
-				// c2 = dDy/dx + i dDy/dz
-				const c2 = vec2( kx.mul( hi ).add( kz.mul( hr ) ).negate(), kx.mul( hr ).sub( kz.mul( hi ) ) );
-				// c3 = dDx/dx + i dDz/dz
-				const a = kx.mul( kx ).mul( ik ).negate(), b = kz.mul( kz ).mul( ik ).negate();
-				const c3 = vec2( a.mul( hr ).sub( b.mul( hi ) ), a.mul( hi ).add( b.mul( hr ) ) );
+		this.columnKernel = new ComputeKernel( {
+			label: 'Ocean FFT Columns',
+			modules: [ commonModule ],
+			bindings: {
+				...oceanU, tmp: rw( this.tmp ), foam: rw( this.foam ), mipSrc: rw( this.mipSrc ),
+				dispOut: level( this.displacementTexture, 0 ), derivOut: level( this.derivativeTexture, 0 ),
+			},
+			workgroupSize: [ HALF, 1, 1 ],
+			code: FFT_COMMON + SHARED + /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( local_invocation_id ) lid: vec3u, @builtin( workgroup_id ) wid: vec3u ) {
+	let t = lid.x;
+	let col = wid.x;
+	let c = wid.y;
+	let base = c * ${ N * N }u;
 
-				const r = bitReverse8( x ).mul( uint( 2 ) );
-				shared.element( r ).assign( vec4( c0, c1 ) );
-				shared.element( r.add( uint( 1 ) ) ).assign( vec4( c2, c3 ) );
+	for ( var e = 0u; e < 2u; e++ ) {
+		let y = t + e * FFT_HALF;
+		let idx = base + y * ${ N }u + col;
+		let r = fftBitReverse8( y ) * 2u;
+		fftShared[ r ] = tmp[ idx * 2u ];
+		fftShared[ r + 1u ] = tmp[ idx * 2u + 1u ];
+	}
 
-			}
+	workgroupBarrier();
+${ stages }
 
-			workgroupBarrier();
-			fftStages( t );
+	let lambda = ocean.choppiness;
+	for ( var e = 0u; e < 2u; e++ ) {
+		let y = t + e * FFT_HALF;
+		let idx = base + y * ${ N }u + col;
+		let sign = select( -1.0, 1.0, ( ( col + y ) & 1u ) == 0u );
+		let A = fftShared[ y * 2u ] * sign;
+		let B = fftShared[ y * 2u + 1u ] * sign;
 
-			for ( let e = 0; e < 2; e ++ ) {
+		let Dx = A.x; let Dz = A.y; let Dy = A.z; let Dxz = A.w;
+		let Dyx = B.x; let Dyz = B.y; let Dxx = B.z; let Dzz = B.w;
 
-				const x = t.add( uint( e * HALF ) );
-				const o = base.add( x ).mul( uint( 2 ) );
-				tmp.element( o ).assign( shared.element( x.mul( uint( 2 ) ) ) );
-				tmp.element( o.add( uint( 1 ) ) ).assign( shared.element( x.mul( uint( 2 ) ).add( uint( 1 ) ) ) );
+		let jxx = lambda * Dxx + 1.0;
+		let jzz = lambda * Dzz + 1.0;
+		let jxz = lambda * Dxz;
+		let J = jxx * jzz - jxz * jxz;
 
-			}
+		// Persistent foam: generated where the surface compresses (J < bias),
+		// then slowly decays so whitecaps leave trailing foam patches.
+		let prev = foam[ idx ];
+		let gen = sat( ( ocean.foamBias - J ) * ocean.foamGain );
+		let f = prev * exp( - ocean.foamDecay * frame.dt ) + gen * ocean.foamAdd * frame.dt;
+		let fNew = clamp( max( f, gen * 0.5 ), 0.0, 1.5 );
+		foam[ idx ] = fNew;
 
-		} )().computeKernel( [ HALF, 1, 1 ] ).setName( 'Ocean FFT Rows' );
-
-		const dispTex = this.displacementTexture;
-		const derivTex = this.derivativeTexture;
-		const mipSrc = this.mipSrc;
-		const lambda = this.choppiness;
-		const { foamBias, foamGain, foamDecay, foamAdd } = this;
-
-		this.columnKernel = Fn( () => {
-
-			const t = localId.x;
-			const col = workgroupId.x;
-			const c = workgroupId.y;
-			const base = c.mul( uint( N * N ) ).toVar();
-
-			for ( let e = 0; e < 2; e ++ ) {
-
-				const y = t.add( uint( e * HALF ) );
-				const idx = base.add( y.mul( uint( N ) ) ).add( col );
-				const r = bitReverse8( y ).mul( uint( 2 ) );
-				shared.element( r ).assign( tmp.element( idx.mul( uint( 2 ) ) ) );
-				shared.element( r.add( uint( 1 ) ) ).assign( tmp.element( idx.mul( uint( 2 ) ).add( uint( 1 ) ) ) );
-
-			}
-
-			workgroupBarrier();
-			fftStages( t );
-
-			for ( let e = 0; e < 2; e ++ ) {
-
-				const y = t.add( uint( e * HALF ) );
-				const idx = base.add( y.mul( uint( N ) ) ).add( col );
-				const sign = select( col.add( y ).bitAnd( uint( 1 ) ).equal( uint( 0 ) ), float( 1 ), float( - 1 ) );
-				const A = shared.element( y.mul( uint( 2 ) ) ).mul( sign ).toVar();
-				const B = shared.element( y.mul( uint( 2 ) ).add( uint( 1 ) ) ).mul( sign ).toVar();
-
-				const Dx = A.x, Dz = A.y, Dy = A.z, Dxz = A.w;
-				const Dyx = B.x, Dyz = B.y, Dxx = B.z, Dzz = B.w;
-
-				const jxx = lambda.mul( Dxx ).add( 1 );
-				const jzz = lambda.mul( Dzz ).add( 1 );
-				const jxz = lambda.mul( Dxz );
-				const J = jxx.mul( jzz ).sub( jxz.mul( jxz ) );
-
-				// Persistent foam: generated where the surface compresses (J < bias),
-				// then slowly decays so whitecaps leave trailing foam patches.
-				const prev = foam.element( idx );
-				const gen = saturate( foamBias.sub( J ).mul( foamGain ) );
-				const f = prev.mul( exp( foamDecay.mul( G.dt ).negate() ) ).add( gen.mul( foamAdd ).mul( G.dt ) );
-				const fNew = clamp( max( f, gen.mul( 0.5 ) ), 0, 1.5 ).toVar();
-				prev.assign( fNew );
-
-				const uv = uvec2( col, y );
-				const vDisp = vec4( lambda.mul( Dx ), Dy, lambda.mul( Dz ), fNew ).toVar();
-				const vDeriv = vec4( Dyx, Dyz, lambda.mul( Dxx ), lambda.mul( Dzz ) ).toVar();
-				textureStore( storageTexture( dispTex ).depth( int( c ) ), uv, vDisp );
-				textureStore( storageTexture( derivTex ).depth( int( c ) ), uv, vDeriv );
-				mipSrc.element( idx.mul( uint( 2 ) ) ).assign( vDisp );
-				mipSrc.element( idx.mul( uint( 2 ) ).add( uint( 1 ) ) ).assign( vDeriv );
-
-			}
-
-		} )().computeKernel( [ HALF, 1, 1 ] ).setName( 'Ocean FFT Columns' );
+		let uv = vec2u( col, y );
+		let vDisp = vec4f( lambda * Dx, Dy, lambda * Dz, fNew );
+		let vDeriv = vec4f( Dyx, Dyz, lambda * Dxx, lambda * Dzz );
+		textureStore( dispOut, uv, c, vDisp );
+		textureStore( derivOut, uv, c, vDeriv );
+		mipSrc[ idx * 2u ] = vDisp;
+		mipSrc[ idx * 2u + 1u ] = vDeriv;
+	}
+}`,
+		} );
 
 		// ---- mip chains in compute (instead of 2 textures x 4 layers x 8 levels of render passes)
 		// A: 16x16 threads per 32x32 texel tile of level 0 -> levels 1..5 through workgroup memory
 		// B: one 8x8 workgroup per layer -> levels 6..8
-		const mipMid = this.mipMid;
-		const avg4 = ( a, b, c, d ) => a.add( b ).add( c ).add( d ).mul( 0.25 );
-		const store = ( tex, level, layer, x, y, v ) => textureStore( storageTexture( tex ).setMipLevel( level ).depth( int( layer ) ), uvec2( x, y ), v );
-		const reduce = ( tex, from, to, width, level, layer, ox, oy, lx, ly ) => {
 
-			// threads (lx, ly) < width reduce a 2x2 block of `from` (row length 2*width) into `to`
-			If( lx.lessThan( uint( width ) ).and( ly.lessThan( uint( width ) ) ), () => {
+		// threads (lx, ly) < width reduce a 2x2 block of `from` (row length 2*width) into `to`
+		const reduce = ( from, to, width, lvl, t ) => {
 
-				const w2 = width * 2;
-				const i = ly.mul( uint( 2 * w2 ) ).add( lx.mul( uint( 2 ) ) );
-				const v = avg4( from.element( i ), from.element( i.add( uint( 1 ) ) ), from.element( i.add( uint( w2 ) ) ), from.element( i.add( uint( w2 + 1 ) ) ) ).toVar();
-				store( tex, level, layer, ox.mul( uint( width ) ).add( lx ), oy.mul( uint( width ) ).add( ly ), v );
-				if ( to ) to.element( ly.mul( uint( width ) ).add( lx ) ).assign( v );
-				else mipMid.element( layer.mul( uint( 64 ) ).add( oy.mul( uint( 8 ) ) ).add( ox ).mul( uint( 2 ) ).add( uint( tex === dispTex ? 0 : 1 ) ) ).assign( v );
-
-			} );
+			const w2 = width * 2;
+			let dst = '';
+			if ( to ) dst = `${ to }[ ly * ${ width }u + lx ] = v;`;
+			else if ( lvl === 5 ) dst = `mipMid[ ( c * 64u + gy * 8u + gx ) * 2u + ${ t }u ] = v;`;
+			return /* wgsl */`
+	if ( lx < ${ width }u && ly < ${ width }u ) {
+		let i = ly * ${ 2 * w2 }u + lx * 2u;
+		let v = ( ${ from }[ i ] + ${ from }[ i + 1u ] + ${ from }[ i + ${ w2 }u ] + ${ from }[ i + ${ w2 + 1 }u ] ) * 0.25;
+		textureStore( out${ lvl }, vec2u( gx * ${ width }u + lx, gy * ${ width }u + ly ), c, v );
+		${ dst }
+	}`;
 
 		};
 
-		const mipA = ( tex, t ) => Fn( () => {
+		const mipA = ( tex, t ) => new ComputeKernel( {
+			label: 'Ocean Mips A',
+			bindings: {
+				mipSrc: rw( this.mipSrc ), mipMid: rw( this.mipMid ),
+				out1: level( tex, 1 ), out2: level( tex, 2 ), out3: level( tex, 3 ), out4: level( tex, 4 ), out5: level( tex, 5 ),
+			},
+			workgroupSize: [ 16, 16, 1 ],
+			code: /* wgsl */`
+var<workgroup> s1: array<vec4f, 256>;
+var<workgroup> s2: array<vec4f, 64>;
+var<workgroup> s3: array<vec4f, 16>;
+var<workgroup> s4: array<vec4f, 4>;
+fn src( c: u32, x: u32, y: u32 ) -> vec4f { return mipSrc[ ( c * ${ N * N }u + y * ${ N }u + x ) * 2u + ${ t }u ]; }
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( local_invocation_id ) lid: vec3u, @builtin( workgroup_id ) wid: vec3u ) {
+	let lx = lid.x; let ly = lid.y;
+	let gx = wid.x; let gy = wid.y; let c = wid.z;
+	let x1 = gx * 16u + lx; let y1 = gy * 16u + ly;
+	let x0 = x1 * 2u; let y0 = y1 * 2u;
+	let v1 = ( src( c, x0, y0 ) + src( c, x0 + 1u, y0 ) + src( c, x0, y0 + 1u ) + src( c, x0 + 1u, y0 + 1u ) ) * 0.25;
+	textureStore( out1, vec2u( x1, y1 ), c, v1 );
+	s1[ ly * 16u + lx ] = v1;
+	workgroupBarrier();
+${ reduce( 's1', 's2', 8, 2, t ) }
+	workgroupBarrier();
+${ reduce( 's2', 's3', 4, 3, t ) }
+	workgroupBarrier();
+${ reduce( 's3', 's4', 2, 4, t ) }
+	workgroupBarrier();
+${ reduce( 's4', null, 1, 5, t ) }
+}`,
+		} );
 
-			const lx = localId.x, ly = localId.y;
-			const gx = workgroupId.x, gy = workgroupId.y, c = workgroupId.z;
-			const s1 = workgroupArray( 'vec4', 256 );
-			const s2 = workgroupArray( 'vec4', 64 );
-			const s3 = workgroupArray( 'vec4', 16 );
-			const s4 = workgroupArray( 'vec4', 4 );
-			const x1 = gx.mul( uint( 16 ) ).add( lx ), y1 = gy.mul( uint( 16 ) ).add( ly );
-			const src = ( x, y ) => mipSrc.element( c.mul( uint( N * N ) ).add( y.mul( uint( N ) ) ).add( x ).mul( uint( 2 ) ).add( uint( t ) ) );
-			const x0 = x1.mul( uint( 2 ) ), y0 = y1.mul( uint( 2 ) );
-			const v1 = avg4( src( x0, y0 ), src( x0.add( uint( 1 ) ), y0 ), src( x0, y0.add( uint( 1 ) ) ), src( x0.add( uint( 1 ) ), y0.add( uint( 1 ) ) ) ).toVar();
-			store( tex, 1, c, x1, y1, v1 );
-			s1.element( ly.mul( uint( 16 ) ).add( lx ) ).assign( v1 );
-			workgroupBarrier();
-			reduce( tex, s1, s2, 8, 2, c, gx, gy, lx, ly );
-			workgroupBarrier();
-			reduce( tex, s2, s3, 4, 3, c, gx, gy, lx, ly );
-			workgroupBarrier();
-			reduce( tex, s3, s4, 2, 4, c, gx, gy, lx, ly );
-			workgroupBarrier();
-			reduce( tex, s4, null, 1, 5, c, gx, gy, lx, ly );
+		const mipB = ( tex, t ) => new ComputeKernel( {
+			label: 'Ocean Mips B',
+			bindings: { mipMid: rw( this.mipMid ), out6: level( tex, 6 ), out7: level( tex, 7 ), out8: level( tex, 8 ) },
+			workgroupSize: [ 8, 8, 1 ],
+			code: /* wgsl */`
+var<workgroup> s5: array<vec4f, 64>;
+var<workgroup> s6: array<vec4f, 16>;
+var<workgroup> s7: array<vec4f, 4>;
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( local_invocation_id ) lid: vec3u, @builtin( workgroup_id ) wid: vec3u ) {
+	let lx = lid.x; let ly = lid.y; let c = wid.z;
+	let gx = 0u; let gy = 0u;
+	s5[ ly * 8u + lx ] = mipMid[ ( c * 64u + ly * 8u + lx ) * 2u + ${ t }u ];
+	workgroupBarrier();
+${ reduce( 's5', 's6', 4, 6, t ) }
+	workgroupBarrier();
+${ reduce( 's6', 's7', 2, 7, t ) }
+	workgroupBarrier();
+${ reduce( 's7', null, 1, 8, t ) }
+}`,
+		} );
 
-		} )().computeKernel( [ 16, 16, 1 ] ).setName( 'Ocean Mips A' );
-
-		const mipB = ( tex, t ) => Fn( () => {
-
-			const lx = localId.x, ly = localId.y, c = workgroupId.z;
-			const zero = uint( 0 );
-			const s5 = workgroupArray( 'vec4', 64 );
-			const s6 = workgroupArray( 'vec4', 16 );
-			const s7 = workgroupArray( 'vec4', 4 );
-			s5.element( ly.mul( uint( 8 ) ).add( lx ) ).assign( mipMid.element( c.mul( uint( 64 ) ).add( ly.mul( uint( 8 ) ) ).add( lx ).mul( uint( 2 ) ).add( uint( t ) ) ) );
-			workgroupBarrier();
-			reduce( tex, s5, s6, 4, 6, c, zero, zero, lx, ly );
-			workgroupBarrier();
-			reduce( tex, s6, s7, 2, 7, c, zero, zero, lx, ly );
-			workgroupBarrier();
-			reduce( tex, s7, s7, 1, 8, c, zero, zero, lx, ly );
-
-		} )().computeKernel( [ 8, 8, 1 ] ).setName( 'Ocean Mips B' );
-
-		this.mipKernelsA = [ mipA( dispTex, 0 ), mipA( derivTex, 1 ) ];
-		this.mipKernelsB = [ mipB( dispTex, 0 ), mipB( derivTex, 1 ) ];
+		this.mipKernelsA = [ mipA( this.displacementTexture, 0 ), mipA( this.derivativeTexture, 1 ) ];
+		this.mipKernelsB = [ mipB( this.displacementTexture, 0 ), mipB( this.derivativeTexture, 1 ) ];
 
 	}
 
 	update( dt ) {
 
-		const renderer = this.renderer;
 		const C = this.cascades;
 
 		if ( this.needsSpectrum ) {
 
 			this.needsSpectrum = false;
 			const d = [ N / 16, N / 16, C ];
-			renderer.compute( this.initSpectrumKernel, d );
-			renderer.compute( this.conjugateKernel, d );
-			renderer.compute( this.copyH0Kernel, d );
+			this.initSpectrumKernel.dispatch( d );
+			this.conjugateKernel.dispatch( d );
+			this.copyH0Kernel.dispatch( d );
 
 		}
 
 		this.time.value += dt * this.timeScale;
-		renderer.compute( [ this.rowKernel, this.columnKernel ], [ N, C, 1 ] );
-		renderer.compute( this.mipKernelsA, [ N / 32, N / 32, C ] );
-		renderer.compute( this.mipKernelsB, [ 1, 1, C ] );
+		GPU.computePass( 'Ocean FFT', ( pass ) => {
+
+			this.rowKernel.dispatch( [ N, C, 1 ], { pass } );
+			this.columnKernel.dispatch( [ N, C, 1 ], { pass } );
+			for ( const k of this.mipKernelsA ) k.dispatch( [ N / 32, N / 32, C ], { pass } );
+			for ( const k of this.mipKernelsB ) k.dispatch( [ 1, 1, C ], { pass } );
+
+		} );
 
 	}
 
-	// ---------- sampling helpers (TSL) ----------
+	// ---------- sampling helpers ----------
 
-	// Sample all cascades' displacement at world xz. `weights` optional per cascade (array of nodes).
+	// WGSL expression summing all cascades' displacement at `worldXZ` (a WGSL vec2f expression);
+	// `level` optional WGSL f32 expression, `weights` optional per-cascade WGSL f32 expressions.
+	// Needs `fft.module` in the shader.
 	sampleDisplacement( worldXZ, level = null, weights = null ) {
 
-		let sum = null;
+		const terms = [];
 		for ( let c = 0; c < this.cascades; c ++ ) {
 
-			const uv = worldXZ.div( this.uSizes.element( c ) );
-			let s = texture( this.displacementTexture, uv ).depth( c );
-			if ( level !== null ) s = s.level( level );
-			let v = s.xyz;
-			if ( weights ) v = v.mul( weights[ c ] );
-			sum = sum ? sum.add( v ) : v;
+			let s = `textureSampleLevel( oceanDisplacement, smpLinearRepeat, ( ${ worldXZ } ) / ocean.sizes[ ${ c } ].x, ${ c }, ${ level ?? '0.0' } ).xyz`;
+			if ( weights ) s += ` * ( ${ weights[ c ] } )`;
+			terms.push( s );
 
 		}
 
-		return sum;
+		return '( ' + terms.join( ' + ' ) + ' )';
 
 	}
 

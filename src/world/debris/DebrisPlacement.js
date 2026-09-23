@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Vector3 } from '../../engine/index.js';
 import { Noise2D, mulberry32, smoothstep as sstep } from '../../util/Noise.js';
 import { WORLD } from '../WorldLayout.js';
 import { PATHS, polylineDistance } from '../terrain/IslandShape.js';
@@ -334,7 +334,7 @@ export class DebrisPlacer {
 	addBox( x, y, z, hx, hy, hz, ry, tag ) {
 
 		if ( ! this.colliders ) return;
-		this.colliders.addBox( new THREE.Vector3( x, y, z ), new THREE.Vector3( hx, hy, hz ), ry, { tag } );
+		this.colliders.addBox( new Vector3( x, y, z ), new Vector3( hx, hy, hz ), ry, { tag } );
 		this.obs.box( x, z, hx, hz, ry, 0.05, tag );
 		this.newColliders ++;
 

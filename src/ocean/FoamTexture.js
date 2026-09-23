@@ -1,8 +1,4 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, float, vec2, vec3, vec4, uvec2, globalId, textureStore, fract, floor, sin, dot, min, max, length,
-	smoothstep, mix, pow, abs, clamp, saturate,
-} from 'three/tsl';
+import { Texture, ComputeKernel, generateMipmaps } from '../engine/webgpu.js';
 
 // Tileable procedural foam, generated once on the GPU.
 //
@@ -13,107 +9,103 @@ import {
 //   G: fine bubble detail (brightness / normal variation)
 //   B: soft large-scale mottling
 //   A: streaks
+// Sample it with smpAnisoRepeat / smpLinearRepeat (mipmapped rgba16float).
 export function createFoamTexture( renderer, size = 1024 ) {
 
-	const tex = new THREE.StorageTexture( size, size );
-	tex.type = THREE.HalfFloatType;
-	tex.format = THREE.RGBAFormat;
-	tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-	tex.magFilter = THREE.LinearFilter;
-	tex.minFilter = THREE.LinearMipmapLinearFilter;
-	tex.generateMipmaps = true;
-	tex.mipmapsAutoUpdate = true;
-	tex.anisotropy = 4;
-	tex.name = 'foamPattern';
+	const tex = new Texture( {
+		label: 'foamPattern', width: size, height: size, format: 'rgba16float', mips: true,
+		usage: [ 'sample', 'storage', 'copyDst' ], sampler: 'anisoRepeat',
+	} );
 
-	const hash2 = ( p ) => fract( sin( vec2( dot( p, vec2( 127.1, 311.7 ) ), dot( p, vec2( 269.5, 183.3 ) ) ) ).mul( 43758.5453 ) );
-
-	// periodic worley F1 with jittered cell sizes
-	const worley = ( uv, cells ) => {
-
-		const p = uv.mul( cells );
-		const ip = floor( p );
-		const fp = fract( p );
-		const f1 = float( 8 ).toVar();
-		for ( let j = - 1; j <= 1; j ++ ) {
-
-			for ( let i = - 1; i <= 1; i ++ ) {
-
-				const o = vec2( i, j );
-				const cell = ip.add( o ).mod( cells );
-				const h = hash2( cell );
-				const d = length( o.add( h ).sub( fp ) );
-				f1.assign( min( f1, d ) );
-
-			}
-
-		}
-
-		return f1;
-
-	};
-
-	const vnoise = ( uv, cells ) => {
-
-		const p = uv.mul( cells );
-		const i = floor( p );
-		const f = fract( p );
-		const u = f.mul( f ).mul( float( 3 ).sub( f.mul( 2 ) ) );
-		const a = hash2( i.mod( cells ) ).x;
-		const b = hash2( i.add( vec2( 1, 0 ) ).mod( cells ) ).x;
-		const c = hash2( i.add( vec2( 0, 1 ) ).mod( cells ) ).x;
-		const d = hash2( i.add( vec2( 1, 1 ) ).mod( cells ) ).x;
-		return mix( mix( a, b, u.x ), mix( c, d, u.x ), u.y );
-
-	};
-
+	// fbm( uv, base, oct ) unrolled like the TSL version (constant octave weights)
 	const fbm = ( uv, base, oct ) => {
 
-		let s = float( 0 ), a = 0.5, n = 0;
+		let s = '', a = 0.5, n = 0;
 		for ( let o = 0; o < oct; o ++ ) {
 
-			s = s.add( vnoise( uv, base * Math.pow( 2, o ) ).mul( a ) );
+			s += `${ s ? ' + ' : '' }vnoise( ${ uv }, ${ ( base * Math.pow( 2, o ) ).toFixed( 1 ) } ) * ${ a }`;
 			n += a;
 			a *= 0.5;
 
 		}
 
-		return s.div( n );
+		return `( ( ${ s } ) / ${ n } )`;
 
 	};
 
-	const kernel = Fn( () => {
+	const kernel = new ComputeKernel( {
+		label: 'Foam Pattern',
+		bindings: { foamOut: { storageTexture: tex, access: 'write', view: { dimension: '2d', baseMipLevel: 0, mipLevelCount: 1 } } },
+		workgroupSize: [ 8, 8, 1 ],
+		code: /* wgsl */`
+fn hash2( p: vec2f ) -> vec2f { return fract( sin( vec2f( dot( p, vec2f( 127.1, 311.7 ) ), dot( p, vec2f( 269.5, 183.3 ) ) ) ) * 43758.5453 ); }
+// GLSL-style mod (TSL .mod): x - y * floor( x / y )
+fn fmod2( x: vec2f, y: f32 ) -> vec2f { return x - y * floor( x / y ); }
 
-		const px = globalId.xy;
-		const uv = vec2( px ).add( 0.5 ).div( size );
+// periodic worley F1 with jittered cell sizes
+fn worley( uv: vec2f, cells: f32 ) -> f32 {
+	let p = uv * cells;
+	let ip = floor( p );
+	let fp = fract( p );
+	var f1 = 8.0;
+	for ( var j = -1; j <= 1; j++ ) {
+		for ( var i = -1; i <= 1; i++ ) {
+			let o = vec2f( f32( i ), f32( j ) );
+			let cell = fmod2( ip + o, cells );
+			let h = hash2( cell );
+			let d = length( o + h - fp );
+			f1 = min( f1, d );
+		}
+	}
+	return f1;
+}
 
-		// domain warp (organic, flowing shapes)
-		const w1 = vec2( fbm( uv, 3, 4 ), fbm( uv.add( 0.43 ), 3, 4 ) ).sub( 0.5 ).mul( 0.14 );
-		const wuv = uv.add( w1 );
+fn vnoise( uv: vec2f, cells: f32 ) -> f32 {
+	let p = uv * cells;
+	let i = floor( p );
+	let f = fract( p );
+	let u = f * f * ( 3.0 - f * 2.0 );
+	let a = hash2( fmod2( i, cells ) ).x;
+	let b = hash2( fmod2( i + vec2f( 1.0, 0.0 ), cells ) ).x;
+	let c = hash2( fmod2( i + vec2f( 0.0, 1.0 ), cells ) ).x;
+	let d = hash2( fmod2( i + vec2f( 1.0, 1.0 ), cells ) ).x;
+	return mix( mix( a, b, u.x ), mix( c, d, u.x ), u.y );
+}
 
-		// density: ragged rafts
-		const dens = fbm( wuv, 4, 6 ).toVar();
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let px = gid.xy;
+	let uv = ( vec2f( px ) + 0.5 ) / ${ size }.0;
 
-		// holes of many sizes punched through the mat (worley, radius varied by noise)
-		const holeA = smoothstep( 0.28, 0.12, worley( wuv, 7 ).add( fbm( uv, 16, 3 ).sub( 0.5 ).mul( 0.25 ) ) );
-		const holeB = smoothstep( 0.30, 0.16, worley( wuv.add( 0.17 ), 19 ).add( fbm( uv, 32, 2 ).sub( 0.5 ).mul( 0.3 ) ) );
-		const holeC = smoothstep( 0.32, 0.18, worley( wuv.add( 0.61 ), 47 ) );
-		const holes = saturate( holeA.mul( 0.9 ).add( holeB.mul( 0.7 ) ).add( holeC.mul( 0.45 ) ) );
+	// domain warp (organic, flowing shapes)
+	let w1 = ( vec2f( ${ fbm( 'uv', 3, 4 ) }, ${ fbm( '( uv + 0.43 )', 3, 4 ) } ) - 0.5 ) * 0.14;
+	let wuv = uv + w1;
 
-		// fine bubbles: small bright dots
-		const bub = smoothstep( 0.24, 0.08, worley( uv.add( 0.33 ), 140 ) ).mul( 0.8 ).add( smoothstep( 0.2, 0.05, worley( uv.add( 0.71 ), 260 ) ).mul( 0.5 ) );
+	// density: ragged rafts
+	let dens = ${ fbm( 'wuv', 4, 6 ) };
 
-		// streaks (drawn out by flow)
-		const streak = fbm( vec2( uv.x.mul( 1 ), uv.y.mul( 1 ) ).add( w1.mul( 2 ) ), 12, 4 );
+	// holes of many sizes punched through the mat (worley, radius varied by noise)
+	let holeA = smoothstep( 0.28, 0.12, worley( wuv, 7.0 ) + ( ${ fbm( 'uv', 16, 3 ) } - 0.5 ) * 0.25 );
+	let holeB = smoothstep( 0.30, 0.16, worley( wuv + 0.17, 19.0 ) + ( ${ fbm( 'uv', 32, 2 ) } - 0.5 ) * 0.3 );
+	let holeC = smoothstep( 0.32, 0.18, worley( wuv + 0.61, 47.0 ) );
+	let holes = clamp( holeA * 0.9 + holeB * 0.7 + holeC * 0.45, 0.0, 1.0 );
 
-		const foam = saturate( dens.mul( 1.35 ).sub( holes.mul( 0.55 ) ).add( bub.mul( 0.08 ) ) );
-		const mottle = fbm( uv, 2, 3 );
+	// fine bubbles: small bright dots
+	let bub = smoothstep( 0.24, 0.08, worley( uv + 0.33, 140.0 ) ) * 0.8 + smoothstep( 0.2, 0.05, worley( uv + 0.71, 260.0 ) ) * 0.5;
 
-		textureStore( tex, uvec2( px ), vec4( foam, saturate( bub ), mottle, streak ) );
+	// streaks (drawn out by flow)
+	let suv = vec2f( uv.x * 1.0, uv.y * 1.0 ) + w1 * 2.0;
+	let streak = ${ fbm( 'suv', 12, 4 ) };
 
-	} )().computeKernel( [ 8, 8, 1 ] ).setName( 'Foam Pattern' );
+	let foam = clamp( dens * 1.35 - holes * 0.55 + bub * 0.08, 0.0, 1.0 );
+	let mottle = ${ fbm( 'uv', 2, 3 ) };
 
-	renderer.compute( kernel, [ size / 8, size / 8, 1 ] );
+	textureStore( foamOut, px, vec4f( foam, clamp( bub, 0.0, 1.0 ), mottle, streak ) );
+}`,
+	} );
+
+	kernel.dispatch( [ size / 8, size / 8, 1 ] );
+	generateMipmaps( tex );
 	return tex;
 
 }

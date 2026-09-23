@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { BufferGeometry, Euler, Float32BufferAttribute, Matrix3, Matrix4, Quaternion, Uint16BufferAttribute, Uint32BufferAttribute, Vector3 } from '../../engine/index.js';
 
 // Procedural geometry toolkit for the village.
 //
@@ -11,18 +11,18 @@ import * as THREE from 'three/webgpu';
 //   tint  (vec3) : base color (paint color, wood tone, rope color ...)
 //   vdata (vec4) : material specific parameters (seed, wear, pattern, ...)
 
-const _m4 = new THREE.Matrix4();
-const _m3 = new THREE.Matrix3();
-const _q = new THREE.Quaternion();
-const _e = new THREE.Euler( 0, 0, 0, 'YXZ' );
-const _p = new THREE.Vector3();
-const _s = new THREE.Vector3( 1, 1, 1 );
-const _a = new THREE.Vector3();
-const _b = new THREE.Vector3();
-const _c = new THREE.Vector3();
-const _d = new THREE.Vector3();
-const _X = new THREE.Vector3( 1, 0, 0 );
-const _Y = new THREE.Vector3( 0, 1, 0 );
+const _m4 = new Matrix4();
+const _m3 = new Matrix3();
+const _q = new Quaternion();
+const _e = new Euler( 0, 0, 0, 'YXZ' );
+const _p = new Vector3();
+const _s = new Vector3( 1, 1, 1 );
+const _a = new Vector3();
+const _b = new Vector3();
+const _c = new Vector3();
+const _d = new Vector3();
+const _X = new Vector3( 1, 0, 0 );
+const _Y = new Vector3( 0, 1, 0 );
 
 // UV conventions shared with VillageMaterials:
 //   box faces perpendicular to the grain (end grain) get u += END_GRAIN_U
@@ -353,7 +353,7 @@ export function tubePart( points, radius, radial = 5 ) {
 	}
 
 	// initial normal
-	let n0 = Math.abs( T[ 0 ].y ) < 0.9 ? new THREE.Vector3( 0, 1, 0 ) : new THREE.Vector3( 1, 0, 0 );
+	let n0 = Math.abs( T[ 0 ].y ) < 0.9 ? new Vector3( 0, 1, 0 ) : new Vector3( 1, 0, 0 );
 	n0 = n0.sub( T[ 0 ].clone().multiplyScalar( n0.dot( T[ 0 ] ) ) ).normalize();
 	N.push( n0 );
 	Bn.push( T[ 0 ].clone().cross( n0 ) );
@@ -416,7 +416,7 @@ export function quad01Part( w, h ) {
 export function slabPart( pts, thickness, uDir = null, upHint = null ) {
 
 	const m = pts.length;
-	const nrm = new THREE.Vector3();
+	const nrm = new Vector3();
 	for ( let i = 0; i < m; i ++ ) {
 
 		const a = pts[ i ], b = pts[ ( i + 1 ) % m ];
@@ -535,8 +535,8 @@ export function gablePart( w, h, depth ) {
 	return cached( key, () => {
 
 		const d = depth / 2;
-		const pts = [ new THREE.Vector3( - w / 2, 0, d ), new THREE.Vector3( w / 2, 0, d ), new THREE.Vector3( 0, h, d ) ];
-		return slabPart( pts, depth, new THREE.Vector3( 1, 0, 0 ) );
+		const pts = [ new Vector3( - w / 2, 0, d ), new Vector3( w / 2, 0, d ), new Vector3( 0, h, d ) ];
+		return slabPart( pts, depth, new Vector3( 1, 0, 0 ) );
 
 	} );
 
@@ -677,13 +677,13 @@ export class Batch {
 
 	build() {
 
-		const g = new THREE.BufferGeometry();
-		g.setAttribute( 'position', new THREE.Float32BufferAttribute( this.pos, 3 ) );
-		g.setAttribute( 'normal', new THREE.Float32BufferAttribute( this.nrm, 3 ) );
-		g.setAttribute( 'uv', new THREE.Float32BufferAttribute( this.uv, 2 ) );
-		g.setAttribute( 'tint', new THREE.Float32BufferAttribute( this.tint, 3 ) );
-		g.setAttribute( 'vdata', new THREE.Float32BufferAttribute( this.data, 4 ) );
-		const Idx = this.vcount > 65535 ? THREE.Uint32BufferAttribute : THREE.Uint16BufferAttribute;
+		const g = new BufferGeometry();
+		g.setAttribute( 'position', new Float32BufferAttribute( this.pos, 3 ) );
+		g.setAttribute( 'normal', new Float32BufferAttribute( this.nrm, 3 ) );
+		g.setAttribute( 'uv', new Float32BufferAttribute( this.uv, 2 ) );
+		g.setAttribute( 'tint', new Float32BufferAttribute( this.tint, 3 ) );
+		g.setAttribute( 'vdata', new Float32BufferAttribute( this.data, 4 ) );
+		const Idx = this.vcount > 65535 ? Uint32BufferAttribute : Uint16BufferAttribute;
 		g.setIndex( new Idx( this.idx, 1 ) );
 		g.computeBoundingBox();
 		g.computeBoundingSphere();
@@ -706,7 +706,7 @@ const ropeData = ( d, r ) => {
 
 const toArr = ( c ) => ( c === undefined || c === null ) ? [ 1, 1, 1 ] : ( Array.isArray( c ) || typeof c === 'function' ? c : [ c.r, c.g, c.b ] );
 
-export function mat4( x = 0, y = 0, z = 0, ry = 0, rx = 0, rz = 0, out = new THREE.Matrix4() ) {
+export function mat4( x = 0, y = 0, z = 0, ry = 0, rx = 0, rz = 0, out = new Matrix4() ) {
 
 	_e.set( rx, ry, rz, 'YXZ' );
 	_q.setFromEuler( _e );
@@ -722,7 +722,7 @@ function optMat( x, y, z, o ) {
 	_q.setFromEuler( _e );
 	_p.set( x, y, z );
 	_d.set( o.sx ?? 1, o.sy ?? 1, o.sz ?? 1 );
-	return new THREE.Matrix4().compose( _p, _q, _d );
+	return new Matrix4().compose( _p, _q, _d );
 
 }
 
@@ -731,7 +731,7 @@ export class Builder {
 	constructor() {
 
 		this.batches = {};
-		this.frame = new THREE.Matrix4();
+		this.frame = new Matrix4();
 		this.stack = [];
 
 	}
@@ -764,7 +764,7 @@ export class Builder {
 	}
 
 	// local -> world point
-	toWorld( x, y, z, out = new THREE.Vector3() ) {
+	toWorld( x, y, z, out = new Vector3() ) {
 
 		return out.set( x, y, z ).applyMatrix4( this.frame );
 
@@ -836,7 +836,7 @@ export class Builder {
 
 		}
 
-		const m = new THREE.Matrix4().makeBasis( _a, _b, _c );
+		const m = new Matrix4().makeBasis( _a, _b, _c );
 		m.setPosition( ( p0[ 0 ] + p1[ 0 ] ) / 2, ( p0[ 1 ] + p1[ 1 ] ) / 2, ( p0[ 2 ] + p1[ 2 ] ) / 2 );
 		const part = boxPart( L + ( o.extend || 0 ), h, w, 0, o.skip ?? 0 );
 		this.add( key, part, m, o.tint, o.data );
@@ -851,7 +851,7 @@ export class Builder {
 		if ( L < 1e-5 ) return;
 		_a.divideScalar( L );
 		_q.setFromUnitVectors( _Y, _a );
-		const m = new THREE.Matrix4().compose( _p.set( p0[ 0 ], p0[ 1 ], p0[ 2 ] ), _q, _s );
+		const m = new Matrix4().compose( _p.set( p0[ 0 ], p0[ 1 ], p0[ 2 ] ), _q, _s );
 		const part = cylPart( r1, r0, L, o.segs ?? 6, o.capTop ?? true, o.capBot ?? false, false, WRAP_PERIOD[ key ] ?? 0 );
 		this.add( key, part, m, o.tint, o.data );
 
@@ -861,14 +861,14 @@ export class Builder {
 	tube( key, points, radius, o = {} ) {
 
 		const part = tubePart( points, radius, o.radial ?? 5 );
-		this.add( key, part, new THREE.Matrix4(), o.tint, key === 'rope' ? ropeData( o.data, radius ) : o.data );
+		this.add( key, part, new Matrix4(), o.tint, key === 'rope' ? ropeData( o.data, radius ) : o.data );
 
 	}
 
 	slab( key, pts, thickness, o = {} ) {
 
 		const part = slabPart( pts, thickness, o.uDir || null, o.up || null );
-		this.add( key, part, new THREE.Matrix4(), o.tint, o.data );
+		this.add( key, part, new Matrix4(), o.tint, o.data );
 
 	}
 
@@ -889,7 +889,7 @@ export function sagPoints( a, b, sag, n = 8 ) {
 	for ( let i = 0; i <= n; i ++ ) {
 
 		const t = i / n;
-		pts.push( new THREE.Vector3(
+		pts.push( new Vector3(
 			a[ 0 ] + ( b[ 0 ] - a[ 0 ] ) * t,
 			a[ 1 ] + ( b[ 1 ] - a[ 1 ] ) * t - sag * 4 * t * ( 1 - t ),
 			a[ 2 ] + ( b[ 2 ] - a[ 2 ] ) * t

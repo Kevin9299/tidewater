@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../engine/index.js';
 
 // Lightweight collision world for the character controller and boat.
 // Boxes are oriented around Y only. Walkable boxes (decks, floors, stairs) act as ground.

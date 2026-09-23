@@ -1,17 +1,25 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, uniform, float, int, vec2, vec3, vec4, uvec2, globalId, If, Loop, select,
-	sqrt, exp, max, min, abs, clamp, dot, normalize, length, cos, sin, acos, texture, textureStore,
-	mix, smoothstep, pow, instancedArray,
-} from 'three/tsl';
-import { G } from '../core/Globals.js';
+import { ShaderModule, UniformBlock } from '../engine/gpu/Shader.js';
+import { ComputeKernel } from '../engine/gpu/Compute.js';
+import { Texture, StorageBuffer } from '../engine/gpu/Texture.js';
+import { Readback } from '../engine/gpu/Readback.js';
+import { commonModule } from '../engine/render/wgsl/common.js';
+import { Color, Vector3 } from '../engine/math/index.js';
 
 // Physically based sky (Hillaire 2020, "A Scalable and Production Ready Sky and Atmosphere
 // Rendering Technique"). All distances in km inside the atmosphere code.
+//
+// WGSL module (`atmosphere.module`, prefix `atmosphere`):
+//   uniform var atmosphereParams: AtmosphereParams (rayleighScale, mieScale, mieG, ozoneScale, groundAlbedo,
+//     viewHeight (km), sunIlluminance, sunDir (the real sun, may be below the horizon))
+//   fn atmosphereSkyLuminance( dir: vec3f ) -> vec3f             sky luminance (no sun disk), sky view LUT
+//   fn atmosphereSampleTransmittance( rKm: f32, mu: f32 ) -> vec3f transmittance LUT
+//   fn atmosphereTransmittanceToSpace( dir: vec3f ) -> vec3f      from the viewer toward dir
+//   fn atmosphereRaySphereNearest( ro: vec3f, rd: vec3f, radius: f32 ) -> f32
+//   const ATMO_RG / ATMO_RT (km)
+// `atmosphere.multiScatModule`: fn atmosphereSampleMultiScat( rKm: f32, cosSun: f32 ) -> vec3f
 
 const RG = 6360.0;
 const RT = 6460.0;
-const PI = Math.PI;
 
 export const SUN_ILLUMINANCE = 11.0; // scene units (sun irradiance outside the atmosphere)
 export const SUN_ANGULAR_RADIUS = 0.004675 * 1.15;
@@ -20,111 +28,193 @@ const T_W = 256, T_H = 64;
 const MS_RES = 32;
 const SV_W = 192, SV_H = 108;
 
+const f = ( x ) => {
+
+	const s = String( x );
+	return s.includes( '.' ) || s.includes( 'e' ) ? s : s + '.0';
+
+};
+
 function makeLUT( w, h, name ) {
 
-	const t = new THREE.StorageTexture( w, h );
-	t.type = THREE.HalfFloatType;
-	t.format = THREE.RGBAFormat;
-	t.magFilter = t.minFilter = THREE.LinearFilter;
-	t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-	t.generateMipmaps = false;
-	t.name = name;
-	return t;
+	return new Texture( { label: name, width: w, height: h, format: 'rgba16float', usage: [ 'sample', 'storage' ] } );
+
+}
+
+// medium, parameterizations and ray / sphere helpers (no textures: usable by the kernels that write the LUTs)
+function coreCode() {
+
+	return /* wgsl */`
+const ATMO_RG: f32 = ${ f( RG ) };
+const ATMO_RT: f32 = ${ f( RT ) };
+
+struct AtmosphereMedium {
+	rayScat: vec3f,
+	mieScat: f32,
+	extinction: vec3f,
+	scattering: vec3f,
+};
+
+fn atmosphereMedium( hKm: f32 ) -> AtmosphereMedium {
+	let rayDensity = exp( - hKm / 8.0 );
+	let mieDensity = exp( - hKm / 1.2 );
+	let ozoneDensity = max( 0.0, 1.0 - abs( hKm - 25.0 ) / 15.0 );
+	var m: AtmosphereMedium;
+	m.rayScat = vec3f( 5.802e-3, 13.558e-3, 33.1e-3 ) * rayDensity * atmosphereParams.rayleighScale;
+	m.mieScat = 3.996e-3 * mieDensity * atmosphereParams.mieScale;
+	let mieExt = 4.440e-3 * mieDensity * atmosphereParams.mieScale;
+	let ozoneAbs = vec3f( 0.650e-3, 1.881e-3, 0.085e-3 ) * ozoneDensity * atmosphereParams.ozoneScale;
+	m.extinction = m.rayScat + mieExt + ozoneAbs;
+	m.scattering = m.rayScat + m.mieScat;
+	return m;
+}
+
+// (r, mu) -> transmittance LUT uv
+fn atmosphereTransmittanceUV( r: f32, mu: f32 ) -> vec2f {
+	let H = sqrt( ATMO_RT * ATMO_RT - ATMO_RG * ATMO_RG );
+	let rho = sqrt( max( r * r - ATMO_RG * ATMO_RG, 0.0 ) );
+	let disc = r * r * ( mu * mu - 1.0 ) + ATMO_RT * ATMO_RT;
+	let d = max( 0.0, - r * mu + sqrt( max( disc, 0.0 ) ) );
+	let dMin = ATMO_RT - r;
+	let dMax = rho + H;
+	let xMu = ( d - dMin ) / ( dMax - dMin );
+	let xR = rho / H;
+	// unit -> sub-uv
+	return vec2f( ( xMu + ${ f( 0.5 / T_W ) } ) * ${ f( T_W / ( T_W + 1 ) ) }, ( xR + ${ f( 0.5 / T_H ) } ) * ${ f( T_H / ( T_H + 1 ) ) } );
+}
+
+// nearest positive ray-sphere intersection from ro (km, planet centered), -1 if none
+fn atmosphereRaySphereNearest( ro: vec3f, rd: vec3f, radius: f32 ) -> f32 {
+	let b = dot( ro, rd );
+	let c = dot( ro, ro ) - radius * radius;
+	let disc = b * b - c;
+	let sq = sqrt( max( disc, 0.0 ) );
+	let t0 = - b - sq;
+	let t1 = - b + sq;
+	return select( select( select( -1.0, t1, t1 > 0.0 ), t0, t0 > 0.0 ), -1.0, disc < 0.0 );
+}
+`;
 
 }
 
 export class Atmosphere {
 
-	constructor( renderer ) {
+	constructor( renderer = null ) {
 
 		this.renderer = renderer;
 		this.transmittanceLUT = makeLUT( T_W, T_H, 'atmoTransmittance' );
 		this.multiScatLUT = makeLUT( MS_RES, MS_RES, 'atmoMultiScat' );
 		this.skyViewLUT = makeLUT( SV_W, SV_H, 'atmoSkyView' );
-		this.skyViewLUT.wrapS = THREE.ClampToEdgeWrapping;
 
-		this.rayleighScale = uniform( 1 ).setName( 'atmoRay' );
-		this.mieScale = uniform( 1 ).setName( 'atmoMie' );
-		this.mieG = uniform( 0.8 ).setName( 'atmoMieG' );
-		this.ozoneScale = uniform( 1 ).setName( 'atmoOzone' );
-		this.groundAlbedo = uniform( new THREE.Color( 0.06, 0.08, 0.1 ) ).setName( 'atmoAlbedo' );
-		this.viewHeight = uniform( RG + 0.002 ).setName( 'atmoViewH' ); // km
-		this.sunIlluminance = uniform( new THREE.Color( SUN_ILLUMINANCE, SUN_ILLUMINANCE, SUN_ILLUMINANCE ) ).setName( 'atmoSunE' );
-		// the real sun (may be below the horizon: twilight, night). G.sunDir is the key light, which
-		// becomes the moon at night; the sky itself is always scattered sunlight.
-		this.sunDir = uniform( new THREE.Vector3( 0.3, 0.6, - 0.7 ).normalize() ).setName( 'atmoSunDir' );
+		this.params = new UniformBlock( 'AtmosphereParams', {
+			rayleighScale: [ 'f32', 1 ],
+			mieScale: [ 'f32', 1 ],
+			mieG: [ 'f32', 0.8 ],
+			ozoneScale: [ 'f32', 1 ],
+			groundAlbedo: [ 'vec3f', new Color( 0.06, 0.08, 0.1 ) ],
+			viewHeight: [ 'f32', RG + 0.002 ], // km
+			sunIlluminance: [ 'vec3f', new Color( SUN_ILLUMINANCE, SUN_ILLUMINANCE, SUN_ILLUMINANCE ) ],
+			pad0: [ 'f32', 0 ],
+			// the real sun (may be below the horizon: twilight, night). G.sunDir is the key light, which
+			// becomes the moon at night; the sky itself is always scattered sunlight.
+			sunDir: [ 'vec3f', new Vector3( 0.3, 0.6, - 0.7 ).normalize() ],
+			pad1: [ 'f32', 0 ],
+		}, { label: 'atmosphere' } );
+		const U = this.params.fields;
+		// three-style { value } handles (same names as the TSL version)
+		this.rayleighScale = U.rayleighScale;
+		this.mieScale = U.mieScale;
+		this.mieG = U.mieG;
+		this.ozoneScale = U.ozoneScale;
+		this.groundAlbedo = U.groundAlbedo;
+		this.viewHeight = U.viewHeight;
+		this.sunIlluminance = U.sunIlluminance;
+		this.sunDir = U.sunDir;
 
 		// small buffer for sky irradiance readback
-		this.irrBuffer = instancedArray( 4, 'vec4' ).setName( 'atmoIrr' );
+		this.irrBuffer = new StorageBuffer( { label: 'atmoIrr', count: 4, type: 'vec4f' } );
+		this.readback = new Readback( { byteLength: 48, label: 'atmoIrrReadback' } );
+		this.readback.onData = ( buf ) => this._onIrradiance( buf );
 
+		this._buildModules();
 		this._build();
 		this.needsStatic = true;
 		this._irrPending = false;
 		this._irrTimer = 0;
+		this.skyIrradiance = null;
+		this.sunTransmittance = null;
+		this.horizon = null;
+		this.onIrradiance = null;
 
 	}
 
-	// ---------------------------------------------------------------- medium
+	_buildModules() {
 
-	_medium( hKm ) {
+		this.coreModule = new ShaderModule( {
+			name: 'atmosphereCore',
+			deps: [ commonModule ],
+			uniforms: this.params,
+			uniformName: 'atmosphereParams',
+			code: coreCode(),
+		} );
 
-		const rayDensity = exp( hKm.div( 8.0 ).negate() );
-		const mieDensity = exp( hKm.div( 1.2 ).negate() );
-		const ozoneDensity = max( 0, float( 1 ).sub( abs( hKm.sub( 25 ) ).div( 15 ) ) );
-		const rayScat = vec3( 5.802e-3, 13.558e-3, 33.1e-3 ).mul( rayDensity ).mul( this.rayleighScale );
-		const mieScat = float( 3.996e-3 ).mul( mieDensity ).mul( this.mieScale );
-		const mieExt = float( 4.440e-3 ).mul( mieDensity ).mul( this.mieScale );
-		const ozoneAbs = vec3( 0.650e-3, 1.881e-3, 0.085e-3 ).mul( ozoneDensity ).mul( this.ozoneScale );
-		const extinction = rayScat.add( mieExt ).add( ozoneAbs );
-		return { rayScat, mieScat, extinction, scattering: rayScat.add( mieScat ) };
+		this.transmittanceModule = new ShaderModule( {
+			name: 'atmosphereTransmittance',
+			deps: [ this.coreModule ],
+			bindings: { atmosphereTransmittanceLUT: { texture: this.transmittanceLUT } },
+			code: /* wgsl */`
+fn atmosphereSampleTransmittance( r: f32, mu: f32 ) -> vec3f {
+	return textureSampleLevel( atmosphereTransmittanceLUT, smpLinearClamp, atmosphereTransmittanceUV( r, mu ), 0.0 ).rgb;
+}
+// Transmittance from the viewer toward direction dir (for sun disk / sun light color).
+fn atmosphereTransmittanceToSpace( dir: vec3f ) -> vec3f {
+	return atmosphereSampleTransmittance( atmosphereParams.viewHeight, dir.y );
+}
+`,
+		} );
 
-	}
+		this.multiScatModule = new ShaderModule( {
+			name: 'atmosphereMultiScat',
+			deps: [ this.coreModule ],
+			bindings: { atmosphereMultiScatLUT: { texture: this.multiScatLUT } },
+			code: /* wgsl */`
+fn atmosphereSampleMultiScat( r: f32, cosSun: f32 ) -> vec3f {
+	let uv = vec2f( cosSun * 0.5 + 0.5, ( r - ATMO_RG ) / ( ATMO_RT - ATMO_RG ) );
+	let suv = uv * ${ f( ( MS_RES - 1 ) / MS_RES ) } + ${ f( 0.5 / MS_RES ) };
+	return textureSampleLevel( atmosphereMultiScatLUT, smpLinearClamp, suv, 0.0 ).rgb;
+}
+`,
+		} );
 
-	// ---------------------------------------------------------------- LUT parameterizations
+		// the public module: sky view LUT lookups + transmittance
+		this.module = new ShaderModule( {
+			name: 'atmosphere',
+			deps: [ this.transmittanceModule ],
+			bindings: { atmosphereSkyViewLUT: { texture: this.skyViewLUT } },
+			code: /* wgsl */`
+// Sky luminance (no sun disk) for world direction dir (normalized).
+fn atmosphereSkyLuminance( dir: vec3f ) -> vec3f {
+	let viewH = atmosphereParams.viewHeight;
+	let vHorizon = sqrt( max( viewH * viewH - ATMO_RG * ATMO_RG, 0.0 ) );
+	let beta = acos( vHorizon / viewH );
+	let zenithHorizonAngle = PI - beta;
+	let viewZenithAngle = acos( clamp( dir.y, -1.0, 1.0 ) );
 
-	// (r, mu) -> transmittance LUT uv
-	transmittanceUV( r, mu ) {
+	let vCoordA = ( 1.0 - sqrt( max( 1.0 - viewZenithAngle / zenithHorizonAngle, 0.0 ) ) ) * 0.5;
+	let vCoordB = sqrt( max( ( viewZenithAngle - zenithHorizonAngle ) / beta, 0.0 ) ) * 0.5 + 0.5;
+	let v = select( vCoordB, vCoordA, viewZenithAngle < zenithHorizonAngle );
 
-		const H = Math.sqrt( RT * RT - RG * RG );
-		const rho = sqrt( max( r.mul( r ).sub( RG * RG ), 0 ) );
-		const disc = r.mul( r ).mul( mu.mul( mu ).sub( 1 ) ).add( RT * RT );
-		const d = max( 0, r.mul( mu ).negate().add( sqrt( max( disc, 0 ) ) ) );
-		const dMin = float( RT ).sub( r );
-		const dMax = rho.add( H );
-		const xMu = d.sub( dMin ).div( dMax.sub( dMin ) );
-		const xR = rho.div( H );
-		// unit -> sub-uv
-		return vec2(
-			xMu.add( 0.5 / T_W ).mul( T_W / ( T_W + 1 ) ),
-			xR.add( 0.5 / T_H ).mul( T_H / ( T_H + 1 ) )
-		);
+	// azimuth relative to sun
+	let sunH = normalize( vec2f( atmosphereParams.sunDir.x, atmosphereParams.sunDir.z ) + vec2f( 1e-5, 0.0 ) );
+	let dirH = normalize( vec2f( dir.x, dir.z ) + vec2f( 1e-5, 0.0 ) );
+	let lightViewCos = dot( sunH, dirH );
+	let u = sqrt( clamp( lightViewCos * -0.5 + 0.5, 0.0, 1.0 ) );
 
-	}
-
-	sampleTransmittance( r, mu ) {
-
-		return texture( this.transmittanceLUT, this.transmittanceUV( r, mu ) ).level( 0 ).rgb;
-
-	}
-
-	sampleMultiScat( r, cosSun ) {
-
-		const uv = vec2( cosSun.mul( 0.5 ).add( 0.5 ), r.sub( RG ).div( RT - RG ) );
-		const suv = uv.mul( ( MS_RES - 1 ) / MS_RES ).add( 0.5 / MS_RES );
-		return texture( this.multiScatLUT, suv ).level( 0 ).rgb;
-
-	}
-
-	// nearest positive ray-sphere intersection from ro (km, planet centered), -1 if none
-	static raySphereNearest( ro, rd, radius ) {
-
-		const b = dot( ro, rd );
-		const c = dot( ro, ro ).sub( radius * radius );
-		const disc = b.mul( b ).sub( c );
-		const sq = sqrt( max( disc, 0 ) );
-		const t0 = b.negate().sub( sq );
-		const t1 = b.negate().add( sq );
-		return select( disc.lessThan( 0 ), float( - 1 ), select( t0.greaterThan( 0 ), t0, select( t1.greaterThan( 0 ), t1, float( - 1 ) ) ) );
+	let suv = vec2f( u * ${ f( ( SV_W - 1 ) / SV_W ) } + ${ f( 0.5 / SV_W ) }, v * ${ f( ( SV_H - 1 ) / SV_H ) } + ${ f( 0.5 / SV_H ) } );
+	return textureSampleLevel( atmosphereSkyViewLUT, smpLinearClamp, suv, 0.0 ).rgb;
+}
+`,
+		} );
 
 	}
 
@@ -132,284 +222,246 @@ export class Atmosphere {
 
 	_build() {
 
-		const self = this;
-
 		// ----- transmittance LUT
-		this.transmittanceKernel = Fn( () => {
+		this.transmittanceKernel = new ComputeKernel( {
+			label: 'Atmosphere Transmittance',
+			modules: [ this.coreModule ],
+			bindings: { outLUT: { storageTexture: this.transmittanceLUT } },
+			workgroupSize: [ 8, 8, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let px = gid.xy;
+	let uv = ( vec2f( px ) + 0.5 ) / vec2f( ${ f( T_W ) }, ${ f( T_H ) } );
+	let xMu = ( uv.x - ${ f( 0.5 / T_W ) } ) * ${ f( T_W / ( T_W - 1 ) ) };
+	let xR = ( uv.y - ${ f( 0.5 / T_H ) } ) * ${ f( T_H / ( T_H - 1 ) ) };
+	let H = sqrt( ATMO_RT * ATMO_RT - ATMO_RG * ATMO_RG );
+	let rho = xR * H;
+	let r = sqrt( rho * rho + ATMO_RG * ATMO_RG );
+	let dMin = ATMO_RT - r;
+	let dMax = rho + H;
+	let d = dMin + xMu * ( dMax - dMin );
+	let mu = clamp( select( ( H * H - rho * rho - d * d ) / ( 2.0 * r * d ), 1.0, d == 0.0 ), -1.0, 1.0 );
 
-			const px = globalId.xy;
-			const uv = vec2( px ).add( 0.5 ).div( vec2( T_W, T_H ) );
-			const xMu = uv.x.sub( 0.5 / T_W ).mul( T_W / ( T_W - 1 ) );
-			const xR = uv.y.sub( 0.5 / T_H ).mul( T_H / ( T_H - 1 ) );
-			const H = Math.sqrt( RT * RT - RG * RG );
-			const rho = xR.mul( H );
-			const r = sqrt( rho.mul( rho ).add( RG * RG ) ).toVar();
-			const dMin = float( RT ).sub( r );
-			const dMax = rho.add( H );
-			const d = dMin.add( xMu.mul( dMax.sub( dMin ) ) );
-			const mu = clamp( select( d.equal( 0 ), float( 1 ), float( H * H ).sub( rho.mul( rho ) ).sub( d.mul( d ) ).div( r.mul( d ).mul( 2 ) ) ), - 1, 1 ).toVar();
-
-			const ro = vec3( 0, r, 0 );
-			const rd = vec3( sqrt( max( float( 1 ).sub( mu.mul( mu ) ), 0 ) ), mu, 0 );
-			const tMax = Atmosphere.raySphereNearest( ro, rd, RT ).toVar();
-			const steps = 40;
-			const dt = tMax.div( steps );
-			const od = vec3( 0 ).toVar();
-
-			Loop( steps, ( { i } ) => {
-
-				const t = float( i ).add( 0.5 ).mul( dt );
-				const p = ro.add( rd.mul( t ) );
-				const h = length( p ).sub( RG );
-				od.addAssign( self._medium( h ).extinction.mul( dt ) );
-
-			} );
-
-			textureStore( this.transmittanceLUT, uvec2( px ), vec4( exp( od.negate() ), 1 ) );
-
-		} )().computeKernel( [ 8, 8, 1 ] ).setName( 'Atmosphere Transmittance' );
+	let ro = vec3f( 0.0, r, 0.0 );
+	let rd = vec3f( sqrt( max( 1.0 - mu * mu, 0.0 ) ), mu, 0.0 );
+	let tMax = atmosphereRaySphereNearest( ro, rd, ATMO_RT );
+	let steps = 40;
+	let dt = tMax / f32( steps );
+	var od = vec3f( 0.0 );
+	for ( var i = 0; i < steps; i++ ) {
+		let t = ( f32( i ) + 0.5 ) * dt;
+		let p = ro + rd * t;
+		let h = length( p ) - ATMO_RG;
+		od += atmosphereMedium( h ).extinction * dt;
+	}
+	textureStore( outLUT, px, vec4f( exp( - od ), 1.0 ) );
+}
+`,
+		} );
 
 		// ----- multiple scattering LUT
-		this.multiScatKernel = Fn( () => {
+		this.multiScatKernel = new ComputeKernel( {
+			label: 'Atmosphere MultiScat',
+			modules: [ this.transmittanceModule ],
+			bindings: { outLUT: { storageTexture: this.multiScatLUT } },
+			workgroupSize: [ 8, 8, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let px = gid.xy;
+	let uv = ( ( vec2f( px ) + 0.5 ) / ${ f( MS_RES ) } - ${ f( 0.5 / MS_RES ) } ) * ${ f( MS_RES / ( MS_RES - 1 ) ) };
+	let cosSun = uv.x * 2.0 - 1.0;
+	let r = ATMO_RG + clamp( uv.y, 0.001, 0.999 ) * ( ATMO_RT - ATMO_RG );
+	let sunDir = normalize( vec3f( 0.0, cosSun, - sqrt( max( 1.0 - cosSun * cosSun, 0.0 ) ) ) );
+	let ro = vec3f( 0.0, r, 0.0 );
 
-			const px = globalId.xy;
-			const uv = vec2( px ).add( 0.5 ).div( MS_RES ).sub( 0.5 / MS_RES ).mul( MS_RES / ( MS_RES - 1 ) );
-			const cosSun = uv.x.mul( 2 ).sub( 1 );
-			const r = float( RG ).add( clamp( uv.y, 0.001, 0.999 ).mul( RT - RG ) ).toVar();
-			const sunDir = normalize( vec3( 0, cosSun, sqrt( max( float( 1 ).sub( cosSun.mul( cosSun ) ), 0 ) ).negate() ) ).toVar();
-			const ro = vec3( 0, r, 0 ).toVar();
+	var Lsum = vec3f( 0.0 );
+	var fmsSum = vec3f( 0.0 );
+	const SQ = 8;
+	let isoPhase = 1.0 / ( 4.0 * PI );
 
-			const Lsum = vec3( 0 ).toVar();
-			const fmsSum = vec3( 0 ).toVar();
-			const SQ = 8;
-			const isoPhase = 1 / ( 4 * PI );
+	for ( var i = 0; i < SQ * SQ; i++ ) {
+		let ii = ( f32( i % SQ ) + 0.5 ) / f32( SQ );
+		let jj = ( f32( i / SQ ) + 0.5 ) / f32( SQ );
+		let theta = ii * 2.0 * PI;
+		let phi = acos( 1.0 - jj * 2.0 );
+		let rd = vec3f( cos( theta ) * sin( phi ), cos( phi ), sin( theta ) * sin( phi ) );
 
-			Loop( SQ * SQ, ( { i } ) => {
+		let tBottom = atmosphereRaySphereNearest( ro, rd, ATMO_RG );
+		let tTop = atmosphereRaySphereNearest( ro, rd, ATMO_RT );
+		let hitGround = tBottom > 0.0;
+		let tMax = select( tTop, tBottom, hitGround );
+		let steps = 20;
+		let dt = tMax / f32( steps );
+		var throughput = vec3f( 1.0 );
+		var L = vec3f( 0.0 );
+		var fms = vec3f( 0.0 );
 
-				const ii = float( i.mod( SQ ) ).add( 0.5 ).div( SQ );
-				const jj = float( i.div( SQ ) ).add( 0.5 ).div( SQ );
-				const theta = ii.mul( 2 * PI );
-				const phi = acos( float( 1 ).sub( jj.mul( 2 ) ) );
-				const rd = vec3( cos( theta ).mul( sin( phi ) ), cos( phi ), sin( theta ).mul( sin( phi ) ) ).toVar();
+		for ( var s = 0; s < steps; s++ ) {
+			let t = ( f32( s ) + 0.3 ) * dt;
+			let p = ro + rd * t;
+			let pr = length( p );
+			let m = atmosphereMedium( pr - ATMO_RG );
+			let up = p / pr;
+			let cosSunP = dot( up, sunDir );
+			let Tsun = atmosphereSampleTransmittance( pr, cosSunP );
+			let shadowT = atmosphereRaySphereNearest( p, sunDir, ATMO_RG );
+			let earthShadow = select( 1.0, 0.0, shadowT > 0.0 );
+			let S = Tsun * earthShadow * m.scattering * isoPhase;
+			let Tstep = exp( - m.extinction * dt );
+			let ext = max( m.extinction, vec3f( 1e-6 ) );
+			L += throughput * ( S - S * Tstep ) / ext;
+			fms += throughput * ( m.scattering - m.scattering * Tstep ) / ext;
+			throughput *= Tstep;
+		}
 
-				const tBottom = Atmosphere.raySphereNearest( ro, rd, RG ).toVar();
-				const tTop = Atmosphere.raySphereNearest( ro, rd, RT ).toVar();
-				const hitGround = tBottom.greaterThan( 0 );
-				const tMax = select( hitGround, tBottom, tTop ).toVar();
-				const steps = 20;
-				const dt = tMax.div( steps );
-				const throughput = vec3( 1 ).toVar();
-				const L = vec3( 0 ).toVar();
-				const fms = vec3( 0 ).toVar();
+		if ( hitGround ) {
+			let p = ro + rd * tMax;
+			let up = normalize( p );
+			let cosS = dot( up, sunDir );
+			let Tsun = atmosphereSampleTransmittance( ATMO_RG, cosS );
+			L += Tsun * throughput * max( cosS, 0.0 ) * atmosphereParams.groundAlbedo / PI;
+		}
 
-				Loop( { start: 0, end: steps, type: 'int', condition: '<', name: 's' }, ( { s } ) => {
+		Lsum += L * ( 4.0 * PI / f32( SQ * SQ ) );
+		fmsSum += fms * ( 4.0 * PI / f32( SQ * SQ ) );
+	}
 
-					const t = float( s ).add( 0.3 ).mul( dt );
-					const p = ro.add( rd.mul( t ) ).toVar();
-					const pr = length( p );
-					const m = self._medium( pr.sub( RG ) );
-					const up = p.div( pr );
-					const cosSunP = dot( up, sunDir );
-					const Tsun = self.sampleTransmittance( pr, cosSunP );
-					const shadowT = Atmosphere.raySphereNearest( p, sunDir, RG );
-					const earthShadow = select( shadowT.greaterThan( 0 ), float( 0 ), float( 1 ) );
-					const S = Tsun.mul( earthShadow ).mul( m.scattering ).mul( isoPhase );
-					const Tstep = exp( m.extinction.mul( dt ).negate() );
-					const ext = max( m.extinction, vec3( 1e-6 ) );
-					L.addAssign( throughput.mul( S.sub( S.mul( Tstep ) ).div( ext ) ) );
-					fms.addAssign( throughput.mul( m.scattering.sub( m.scattering.mul( Tstep ) ).div( ext ) ) );
-					throughput.mulAssign( Tstep );
-
-				} );
-
-				If( hitGround, () => {
-
-					const p = ro.add( rd.mul( tMax ) );
-					const up = normalize( p );
-					const cosS = dot( up, sunDir );
-					const Tsun = self.sampleTransmittance( float( RG ), cosS );
-					L.addAssign( Tsun.mul( throughput ).mul( max( cosS, 0 ) ).mul( self.groundAlbedo ).div( PI ) );
-
-				} );
-
-				Lsum.addAssign( L.mul( 4 * PI / ( SQ * SQ ) ) );
-				fmsSum.addAssign( fms.mul( 4 * PI / ( SQ * SQ ) ) );
-
-			} );
-
-			const Lin = Lsum.mul( isoPhase );
-			const fmsAvg = fmsSum.mul( isoPhase );
-			const Lms = Lin.div( vec3( 1 ).sub( fmsAvg ) );
-			textureStore( this.multiScatLUT, uvec2( px ), vec4( Lms, 1 ) );
-
-		} )().computeKernel( [ 8, 8, 1 ] ).setName( 'Atmosphere MultiScat' );
+	let Lin = Lsum * isoPhase;
+	let fmsAvg = fmsSum * isoPhase;
+	let Lms = Lin / ( vec3f( 1.0 ) - fmsAvg );
+	textureStore( outLUT, px, vec4f( Lms, 1.0 ) );
+}
+`,
+		} );
 
 		// ----- sky view LUT (per frame)
-		const sunE = this.sunIlluminance;
-		const mieG = this.mieG;
+		this.skyViewKernel = new ComputeKernel( {
+			label: 'Atmosphere SkyView',
+			modules: [ this.transmittanceModule, this.multiScatModule ],
+			bindings: { outLUT: { storageTexture: this.skyViewLUT } },
+			workgroupSize: [ 8, 8, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let px = gid.xy;
+	if ( px.x >= ${ SV_W }u || px.y >= ${ SV_H }u ) { return; }
+	let uv = ( vec2f( px ) + 0.5 ) / vec2f( ${ f( SV_W ) }, ${ f( SV_H ) } );
+	let u = ( uv.x - ${ f( 0.5 / SV_W ) } ) * ${ f( SV_W / ( SV_W - 1 ) ) };
+	let v = ( uv.y - ${ f( 0.5 / SV_H ) } ) * ${ f( SV_H / ( SV_H - 1 ) ) };
 
-		this.skyViewKernel = Fn( () => {
+	let viewH = atmosphereParams.viewHeight;
+	let vHorizon = sqrt( max( viewH * viewH - ATMO_RG * ATMO_RG, 0.0 ) );
+	let beta = acos( vHorizon / viewH );
+	let zenithHorizonAngle = PI - beta;
 
-			const px = globalId.xy;
-			const uv = vec2( px ).add( 0.5 ).div( vec2( SV_W, SV_H ) );
-			const u = uv.x.sub( 0.5 / SV_W ).mul( SV_W / ( SV_W - 1 ) );
-			const v = uv.y.sub( 0.5 / SV_H ).mul( SV_H / ( SV_H - 1 ) );
+	var vzA = 0.0;
+	if ( v < 0.5 ) {
+		var c = v * 2.0;
+		c = 1.0 - c;
+		c = c * c;
+		c = 1.0 - c;
+		vzA = zenithHorizonAngle * c;
+	} else {
+		var c = v * 2.0 - 1.0;
+		c = c * c;
+		vzA = zenithHorizonAngle + beta * c;
+	}
 
-			const viewH = this.viewHeight;
-			const vHorizon = sqrt( max( viewH.mul( viewH ).sub( RG * RG ), 0 ) );
-			const beta = acos( vHorizon.div( viewH ) );
-			const zenithHorizonAngle = float( PI ).sub( beta );
+	let cosViewZenith = cos( vzA );
+	let sinViewZenith = sin( vzA );
+	let cu = u * u;
+	let lightViewCos = - ( cu * 2.0 - 1.0 );
+	let lightViewSin = sqrt( max( 1.0 - lightViewCos * lightViewCos, 0.0 ) );
 
-			const vzA = float( 0 ).toVar();
-			If( v.lessThan( 0.5 ), () => {
+	// local frame: up = +y, sun azimuth along +x
+	let sunCosZ = atmosphereParams.sunDir.y;
+	let sunSinZ = sqrt( max( 1.0 - sunCosZ * sunCosZ, 0.0 ) );
+	let sunDir = vec3f( sunSinZ, sunCosZ, 0.0 );
+	let rd = vec3f( sinViewZenith * lightViewCos, cosViewZenith, sinViewZenith * lightViewSin );
+	let ro = vec3f( 0.0, viewH, 0.0 );
 
-				let c = v.mul( 2 );
-				c = float( 1 ).sub( c );
-				c = c.mul( c );
-				c = float( 1 ).sub( c );
-				vzA.assign( zenithHorizonAngle.mul( c ) );
+	let tBottom = atmosphereRaySphereNearest( ro, rd, ATMO_RG );
+	let tTop = atmosphereRaySphereNearest( ro, rd, ATMO_RT );
+	let tMax = select( tTop, tBottom, tBottom > 0.0 );
+	let steps = 32;
+	let cosTheta = dot( rd, sunDir );
+	let rayPhase = ${ f( 3 / ( 16 * Math.PI ) ) } * ( cosTheta * cosTheta + 1.0 );
+	let g = atmosphereParams.mieG;
+	let g2 = g * g;
+	// Cornette-Shanks
+	let miePhase = ${ f( 3 / ( 8 * Math.PI ) ) } * ( ( 1.0 - g2 ) * ( cosTheta * cosTheta + 1.0 ) )
+		/ ( ( g2 + 2.0 ) * pow( max( g2 + 1.0 - g * cosTheta * 2.0, 1e-4 ), 1.5 ) );
 
-			} ).Else( () => {
+	var throughput = vec3f( 1.0 );
+	var L = vec3f( 0.0 );
 
-				let c = v.mul( 2 ).sub( 1 );
-				c = c.mul( c );
-				vzA.assign( zenithHorizonAngle.add( beta.mul( c ) ) );
+	for ( var i = 0; i < steps; i++ ) {
+		// quadratic step distribution
+		let t0 = f32( i ) / f32( steps );
+		let t1 = ( f32( i ) + 1.0 ) / f32( steps );
+		let ta = t0 * t0 * tMax;
+		let tb = t1 * t1 * tMax;
+		let t = mix( ta, tb, 0.3 );
+		let dt = tb - ta;
+		let p = ro + rd * t;
+		let pr = length( p );
+		let m = atmosphereMedium( pr - ATMO_RG );
+		let up = p / pr;
+		let cosSunP = dot( up, sunDir );
+		let Tsun = atmosphereSampleTransmittance( pr, cosSunP );
+		let shadowT = atmosphereRaySphereNearest( p, sunDir, ATMO_RG );
+		let earthShadow = select( 1.0, 0.0, shadowT > 0.0 );
+		let ms = atmosphereSampleMultiScat( pr, cosSunP );
+		let phaseScat = m.rayScat * rayPhase + vec3f( m.mieScat * miePhase );
+		let S = Tsun * earthShadow * phaseScat + ms * m.scattering;
+		let Tstep = exp( - m.extinction * dt );
+		let ext = max( m.extinction, vec3f( 1e-6 ) );
+		L += throughput * ( S - S * Tstep ) / ext;
+		throughput *= Tstep;
+	}
 
-			} );
-
-			const cosViewZenith = cos( vzA );
-			const sinViewZenith = sin( vzA );
-			const cu = u.mul( u );
-			const lightViewCos = cu.mul( 2 ).sub( 1 ).negate();
-			const lightViewSin = sqrt( max( float( 1 ).sub( lightViewCos.mul( lightViewCos ) ), 0 ) );
-
-			// local frame: up = +y, sun azimuth along +x
-			const sunDirW = self.sunDir;
-			const sunCosZ = sunDirW.y;
-			const sunSinZ = sqrt( max( float( 1 ).sub( sunCosZ.mul( sunCosZ ) ), 0 ) );
-			const sunDir = vec3( sunSinZ, sunCosZ, 0 );
-			const rd = vec3( sinViewZenith.mul( lightViewCos ), cosViewZenith, sinViewZenith.mul( lightViewSin ) ).toVar();
-			const ro = vec3( 0, viewH, 0 ).toVar();
-
-			const tBottom = Atmosphere.raySphereNearest( ro, rd, RG ).toVar();
-			const tTop = Atmosphere.raySphereNearest( ro, rd, RT ).toVar();
-			const tMax = select( tBottom.greaterThan( 0 ), tBottom, tTop ).toVar();
-			const steps = 32;
-			const cosTheta = dot( rd, sunDir );
-			const rayPhase = float( 3 / ( 16 * PI ) ).mul( cosTheta.mul( cosTheta ).add( 1 ) );
-			const g = mieG;
-			const g2 = g.mul( g );
-			// Cornette-Shanks
-			const miePhase = float( 3 / ( 8 * PI ) ).mul( float( 1 ).sub( g2 ).mul( cosTheta.mul( cosTheta ).add( 1 ) ) )
-				.div( g2.add( 2 ).mul( pow( max( g2.add( 1 ).sub( g.mul( cosTheta ).mul( 2 ) ), 1e-4 ), 1.5 ) ) );
-
-			const throughput = vec3( 1 ).toVar();
-			const L = vec3( 0 ).toVar();
-			const tPrev = float( 0 ).toVar();
-
-			Loop( steps, ( { i } ) => {
-
-				// quadratic step distribution
-				const t0 = float( i ).div( steps );
-				const t1 = float( i ).add( 1 ).div( steps );
-				const ta = t0.mul( t0 ).mul( tMax );
-				const tb = t1.mul( t1 ).mul( tMax );
-				const t = mix( ta, tb, 0.3 );
-				const dt = tb.sub( ta );
-				const p = ro.add( rd.mul( t ) ).toVar();
-				const pr = length( p );
-				const m = self._medium( pr.sub( RG ) );
-				const up = p.div( pr );
-				const cosSunP = dot( up, sunDir );
-				const Tsun = self.sampleTransmittance( pr, cosSunP );
-				const shadowT = Atmosphere.raySphereNearest( p, sunDir, RG );
-				const earthShadow = select( shadowT.greaterThan( 0 ), float( 0 ), float( 1 ) );
-				const ms = self.sampleMultiScat( pr, cosSunP );
-				const phaseScat = m.rayScat.mul( rayPhase ).add( vec3( m.mieScat.mul( miePhase ) ) );
-				const S = Tsun.mul( earthShadow ).mul( phaseScat ).add( ms.mul( m.scattering ) );
-				const Tstep = exp( m.extinction.mul( dt ).negate() );
-				const ext = max( m.extinction, vec3( 1e-6 ) );
-				L.addAssign( throughput.mul( S.sub( S.mul( Tstep ) ).div( ext ) ) );
-				throughput.mulAssign( Tstep );
-				tPrev.assign( tb );
-
-			} );
-
-			textureStore( this.skyViewLUT, uvec2( px ), vec4( L.mul( sunE ), 1 ) );
-
-		} )().computeKernel( [ 8, 8, 1 ] ).setName( 'Atmosphere SkyView' );
+	textureStore( outLUT, px, vec4f( L * atmosphereParams.sunIlluminance, 1.0 ) );
+}
+`,
+		} );
 
 		// ----- sky irradiance (cosine weighted hemisphere integral of sky view LUT)
-		this.irradianceKernel = Fn( () => {
-
-			const sum = vec3( 0 ).toVar();
-			const N = 16;
-			Loop( N * N, ( { i } ) => {
-
-				const a = float( i.mod( N ) ).add( 0.5 ).div( N );
-				const b = float( i.div( N ) ).add( 0.5 ).div( N );
-				// cosine-weighted hemisphere
-				const r = sqrt( b );
-				const phi = a.mul( 2 * PI );
-				const dir = vec3( r.mul( cos( phi ) ), sqrt( max( float( 1 ).sub( b ), 0 ) ), r.mul( sin( phi ) ) );
-				sum.addAssign( self.skyLuminance( dir, true ) );
-
-			} );
-
-			// E = PI * mean(L) for cosine-weighted samples; store E/PI (radiance-equivalent irradiance)
-			self.irrBuffer.element( 0 ).assign( vec4( sum.div( N * N ), 1 ) );
-			// sun transmittance at sea level for the current sun direction
-			const Ts = self.sampleTransmittance( float( RG + 0.001 ), self.sunDir.y );
-			self.irrBuffer.element( 1 ).assign( vec4( Ts, 1 ) );
-			// horizon color (average around the horizon)
-			const hs = vec3( 0 ).toVar();
-			Loop( 16, ( { i } ) => {
-
-				const phi = float( i ).mul( 2 * PI / 16 );
-				hs.addAssign( self.skyLuminance( normalize( vec3( cos( phi ), 0.03, sin( phi ) ) ), true ) );
-
-			} );
-			self.irrBuffer.element( 2 ).assign( vec4( hs.div( 16 ), 1 ) );
-
-		} )().compute( 1 ).setName( 'Atmosphere Irradiance' );
-
+		this.irradianceKernel = new ComputeKernel( {
+			label: 'Atmosphere Irradiance',
+			modules: [ this.module ],
+			bindings: { irr: { storage: this.irrBuffer, access: 'read_write' } },
+			workgroupSize: [ 1, 1, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( 1 )
+fn main() {
+	var sum = vec3f( 0.0 );
+	const N = 16;
+	for ( var i = 0; i < N * N; i++ ) {
+		let a = ( f32( i % N ) + 0.5 ) / f32( N );
+		let b = ( f32( i / N ) + 0.5 ) / f32( N );
+		// cosine-weighted hemisphere
+		let r = sqrt( b );
+		let phi = a * 2.0 * PI;
+		let dir = vec3f( r * cos( phi ), sqrt( max( 1.0 - b, 0.0 ) ), r * sin( phi ) );
+		sum += atmosphereSkyLuminance( dir );
 	}
-
-	// ---------------------------------------------------------------- sampling (TSL)
-
-	// Sky luminance (no sun disk) for world direction `dir` (normalized).
-	skyLuminance( dir, inCompute = false ) {
-
-		const viewH = this.viewHeight;
-		const vHorizon = sqrt( max( viewH.mul( viewH ).sub( RG * RG ), 0 ) );
-		const beta = acos( vHorizon.div( viewH ) );
-		const zenithHorizonAngle = float( PI ).sub( beta );
-		const viewZenithAngle = acos( clamp( dir.y, - 1, 1 ) );
-
-		const vCoordA = float( 1 ).sub( sqrt( max( float( 1 ).sub( viewZenithAngle.div( zenithHorizonAngle ) ), 0 ) ) ).mul( 0.5 );
-		const vCoordB = sqrt( max( viewZenithAngle.sub( zenithHorizonAngle ).div( beta ), 0 ) ).mul( 0.5 ).add( 0.5 );
-		const v = select( viewZenithAngle.lessThan( zenithHorizonAngle ), vCoordA, vCoordB );
-
-		// azimuth relative to sun
-		const sunH = normalize( vec2( this.sunDir.x, this.sunDir.z ).add( vec2( 1e-5, 0 ) ) );
-		const dirH = normalize( vec2( dir.x, dir.z ).add( vec2( 1e-5, 0 ) ) );
-		const lightViewCos = dot( sunH, dirH );
-		const u = sqrt( clamp( lightViewCos.mul( - 0.5 ).add( 0.5 ), 0, 1 ) );
-
-		const suv = vec2(
-			u.mul( ( SV_W - 1 ) / SV_W ).add( 0.5 / SV_W ),
-			v.mul( ( SV_H - 1 ) / SV_H ).add( 0.5 / SV_H )
-		);
-
-		const s = texture( this.skyViewLUT, suv );
-		return ( inCompute ? s.level( 0 ) : s.level( 0 ) ).rgb;
-
+	// E = PI * mean(L) for cosine-weighted samples; store E/PI (radiance-equivalent irradiance)
+	irr[ 0 ] = vec4f( sum / f32( N * N ), 1.0 );
+	// sun transmittance at sea level for the current sun direction
+	let Ts = atmosphereSampleTransmittance( ATMO_RG + 0.001, atmosphereParams.sunDir.y );
+	irr[ 1 ] = vec4f( Ts, 1.0 );
+	// horizon color (average around the horizon)
+	var hs = vec3f( 0.0 );
+	for ( var i = 0; i < 16; i++ ) {
+		let phi = f32( i ) * ( 2.0 * PI / 16.0 );
+		hs += atmosphereSkyLuminance( normalize( vec3f( cos( phi ), 0.03, sin( phi ) ) ) );
 	}
-
-	// Transmittance from sea level toward direction dir (for sun disk / sun light color).
-	transmittanceToSpace( dir ) {
-
-		return this.sampleTransmittance( this.viewHeight, dir.y );
+	irr[ 2 ] = vec4f( hs / 16.0, 1.0 );
+}
+`,
+		} );
 
 	}
 
@@ -417,42 +469,38 @@ export class Atmosphere {
 
 	update( dt, cameraY ) {
 
-		const r = this.renderer;
 		this.viewHeight.value = RG + Math.max( 0.001, cameraY / 1000 + 0.0005 );
 
 		if ( this.needsStatic ) {
 
 			this.needsStatic = false;
-			r.compute( this.transmittanceKernel, [ T_W / 8, T_H / 8, 1 ] );
-			r.compute( this.multiScatKernel, [ MS_RES / 8, MS_RES / 8, 1 ] );
+			this.transmittanceKernel.dispatch( [ T_W / 8, T_H / 8, 1 ] );
+			this.multiScatKernel.dispatch( [ MS_RES / 8, MS_RES / 8, 1 ] );
 
 		}
 
-		r.compute( this.skyViewKernel, [ SV_W / 8, Math.ceil( SV_H / 8 ), 1 ] );
+		this.skyViewKernel.dispatch( [ SV_W / 8, Math.ceil( SV_H / 8 ), 1 ] );
 
 		// periodically integrate irradiance and read it back for CPU-side uniforms/lights
 		this._irrTimer -= dt;
 		if ( this._irrTimer <= 0 && ! this._irrPending ) {
 
 			this._irrTimer = 0.25;
-			r.compute( this.irradianceKernel );
-			this._irrPending = true;
-			r.getArrayBufferAsync( this.irrBuffer.value ).then( ( buf ) => {
-
-				const f = new Float32Array( buf );
-				this.skyIrradiance = [ f[ 0 ], f[ 1 ], f[ 2 ] ];
-				this.sunTransmittance = [ f[ 4 ], f[ 5 ], f[ 6 ] ];
-				this.horizon = [ f[ 8 ], f[ 9 ], f[ 10 ] ];
-				this._irrPending = false;
-				if ( this.onIrradiance ) this.onIrradiance( this );
-
-			} ).catch( () => {
-
-				this._irrPending = false;
-
-			} );
+			this.irradianceKernel.dispatch( 1 );
+			if ( this.readback.request( this.irrBuffer ) ) this._irrPending = true;
 
 		}
+
+	}
+
+	_onIrradiance( buf ) {
+
+		const f = new Float32Array( buf );
+		this.skyIrradiance = [ f[ 0 ], f[ 1 ], f[ 2 ] ];
+		this.sunTransmittance = [ f[ 4 ], f[ 5 ], f[ 6 ] ];
+		this.horizon = [ f[ 8 ], f[ 9 ], f[ 10 ] ];
+		this._irrPending = false;
+		if ( this.onIrradiance ) this.onIrradiance( this );
 
 	}
 

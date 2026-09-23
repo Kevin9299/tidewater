@@ -1,6 +1,5 @@
-import * as THREE from 'three/webgpu';
-import { Fn, float, vec2, vec3, vec4, instanceIndex, instancedArray, storage, If, texture, max, min, normalize, length, smoothstep } from 'three/tsl';
-import { G } from '../core/Globals.js';
+import { G, StorageBuffer, ShaderModule, ComputeKernel, Readback } from '../engine/webgpu.js';
+import { commonModule } from '../engine/render/wgsl/common.js';
 
 export const MAX_QUERIES = 64;
 
@@ -11,6 +10,16 @@ export const MAX_QUERIES = 64;
 //
 // Height is Eulerian: the FFT displacement is Lagrangian (x0 -> x0 + D(x0)), so we solve
 // x0 + D(x0) = xz with a few fixed-point iterations.
+//
+// WGSL (prefix `waterQuery`):
+//   query.resultsModule (the results buffer, read-only; cheap):
+//     fn waterQueryCameraState() -> vec4f           ( height, nx, nz, sea floor ) at the camera (slot 0)
+//     fn waterQueryHeightAt( slot: u32 ) -> f32
+//     fn waterQueryResult( slot: u32 ) -> vec4f
+//   query.heightModule (the full surface: FFT maps, shore, wake, terrain; built on first access):
+//   query.module = both (built on first access)
+//     fn waterQueryDispAt( x0: vec2f, depth: f32 ) -> vec3f   displacement at Lagrangian point x0
+//     fn waterQueryHeightAtXZ( xz: vec2f ) -> f32              Eulerian water height at xz
 export class WaterQuery {
 
 	constructor( renderer, surface ) {
@@ -18,9 +27,8 @@ export class WaterQuery {
 		this.renderer = renderer;
 		this.surface = surface;
 		this.inputs = new Float32Array( MAX_QUERIES * 4 );
-		this.inputAttr = new THREE.StorageInstancedBufferAttribute( this.inputs, 4 );
-		this.inputNode = storage( this.inputAttr, 'vec4', MAX_QUERIES ).toReadOnly();
-		this.results = instancedArray( MAX_QUERIES, 'vec4' ).setName( 'waterQueryResults' );
+		this.inputBuffer = new StorageBuffer( { label: 'waterQueryInputs', count: MAX_QUERIES, type: 'vec4f' } );
+		this.results = new StorageBuffer( { label: 'waterQueryResults', count: MAX_QUERIES, type: 'vec4f', data: new Float32Array( MAX_QUERIES * 4 ) } );
 		this.count = 1;
 		this.cpu = new Float32Array( MAX_QUERIES * 4 );
 		this.cpuValid = false;
@@ -34,82 +42,111 @@ export class WaterQuery {
 		this.latency = 0.05; // s, smoothed age of the results when they arrive
 		this.frameLatency = 0;
 		this.slots = new Map();
+		this.readback = new Readback( { byteLength: MAX_QUERIES * 16, ring: 3, label: 'waterQuery' } );
 
-		this._build();
+		this.resultsModule = new ShaderModule( {
+			name: 'waterQuery',
+			bindings: { waterQueryResults: { storage: this.results, access: 'read' } },
+			code: /* wgsl */`
+fn waterQueryResult( slot: u32 ) -> vec4f { return waterQueryResults[ slot ]; }
+fn waterQueryHeightAt( slot: u32 ) -> f32 { return waterQueryResults[ slot ].x; }
+fn waterQueryCameraState() -> vec4f { return waterQueryResults[ 0 ]; }
+`,
+		} );
+
+		this._heightModule = null;
+		this._module = null;
+		this.kernel = null;
+
+	}
+
+	// Everything (results + the Eulerian height solve). Built on first access: the wake / shore
+	// attached to the surface after this query was created are part of it.
+	get module() {
+
+		if ( ! this._module ) this._module = new ShaderModule( { name: 'waterQueryAll', deps: [ this.resultsModule, this.heightModule ] } );
+		return this._module;
 
 	}
 
 	// Returns the displacement (vec3) of the full water surface at Lagrangian point x0.
-	_disp( x0, depth ) {
+	get heightModule() {
 
+		if ( this._heightModule ) return this._heightModule;
 		const S = this.surface;
 		const fft = S.fft;
-		const d = vec3( 0 ).toVar();
-		for ( let c = 0; c < fft.cascades; c ++ ) {
+		const C = fft.cascades;
+		let casc = '';
+		for ( let c = 0; c < C; c ++ ) {
 
-			const s = texture( fft.displacementTexture, x0.div( fft.sizes[ c ] ) ).depth( c ).level( c === fft.cascades - 1 ? 2 : 0 ).xyz;
-			d.addAssign( s.mul( S.cascadeAttenuation( c, depth ) ) );
-
-		}
-
-		d.mulAssign( S.amplitude );
-		if ( S.shore ) {
-
-			const ground = S.terrain.heightAt( x0 );
-			d.addAssign( S.shore.evaluate( x0, depth, ground, { withNormal: false } ).disp );
+			casc += `\td += textureSampleLevel( oceanDisplacement, smpLinearRepeat, x0 / ocean.sizes[ ${ c } ].x, ${ c }, ${ c === C - 1 ? '2.0' : '0.0' } ).xyz * waterSurfaceCascadeAttenuation( ${ c }, depth );\n`;
 
 		}
 
-		if ( S.wake ) d.addAssign( S.wake.displacement( x0, depth ) );
-		return d;
+		const SH = !! ( S.shore && S.terrain );
+		this._heightModule = new ShaderModule( {
+			name: 'waterQueryHeight',
+			deps: [ commonModule, fft.module, S.attenuationModule, S.terrain && S.terrain.module, SH && S.shore.module, S.wake && S.wake.module ],
+			uniforms: S.params,
+			uniformName: 'waterSurface',
+			code: /* wgsl */`
+fn waterQueryDispAt( x0: vec2f, depth: f32 ) -> vec3f {
+	var d = vec3f( 0.0 );
+${ casc }
+	d *= waterSurface.amplitude;
+${ SH ? '	d += shoreEvaluateNoNormal( x0, depth, terrainHeightAt( x0 ) ).disp;' : '' }
+${ S.wake ? '	d += wakeDisplacement( x0 );' : '' }
+	return d;
+}
+
+fn waterQueryHeightAtXZ( p: vec2f ) -> f32 {
+	let depth = ${ S.terrain ? 'frame.seaLevel - terrainHeightAt( p )' : '500.0' };
+	var x0 = p;
+	for ( var i = 0; i < 2; i++ ) {
+		x0 = p - waterQueryDispAt( x0, depth ).xz;
+	}
+	return frame.seaLevel + waterQueryDispAt( x0, depth ).y;
+}
+`,
+		} );
+		return this._heightModule;
 
 	}
 
+	// WGSL call expression (three version: TSL node)
 	heightAtNode( xz ) {
 
-		if ( ! this._heightFn ) {
-
-			const S = this.surface;
-			const dispFn = Fn( ( [ x0, depth ] ) => this._disp( x0, depth ) ).setLayout( {
-				name: 'waterDispAt', type: 'vec3',
-				inputs: [ { name: 'x0', type: 'vec2' }, { name: 'depth', type: 'float' } ],
-			} );
-
-			this._heightFn = Fn( ( [ p ] ) => {
-
-				const depth = S.seaDepth( p ).toVar();
-				const x0 = vec2( p ).toVar();
-				for ( let i = 0; i < 2; i ++ ) {
-
-					x0.assign( p.sub( dispFn( x0, depth ).xz ) );
-
-				}
-
-				return G.seaLevel.add( dispFn( x0, depth ).y );
-
-			} ).setLayout( { name: 'waterHeightAt', type: 'float', inputs: [ { name: 'p', type: 'vec2' } ] } );
-
-		}
-
-		return this._heightFn( xz );
+		return `waterQueryHeightAtXZ( ${ xz } )`;
 
 	}
 
 	_build() {
 
-		this.kernel = Fn( () => {
-
-			const q = this.inputNode.element( instanceIndex );
-			const xz = q.xy;
-			const h = this.heightAtNode( xz ).toVar();
-			const e = 0.35;
-			const hx = this.heightAtNode( xz.add( vec2( e, 0 ) ) );
-			const hz = this.heightAtNode( xz.add( vec2( 0, e ) ) );
-			const n = normalize( vec3( h.sub( hx ).div( e ), 1, h.sub( hz ).div( e ) ) );
-			const seaFloor = this.surface.terrain ? this.surface.terrain.heightAt( xz ) : float( - 500 );
-			this.results.element( instanceIndex ).assign( vec4( h, n.x, n.z, seaFloor ) );
-
-		} )().compute( MAX_QUERIES ).setName( 'Water Queries' );
+		const S = this.surface;
+		this.kernel = new ComputeKernel( {
+			label: 'Water Queries',
+			modules: [ this.heightModule ],
+			bindings: {
+				queryInputs: { storage: this.inputBuffer, access: 'read' },
+				queryResults: { storage: this.results, access: 'read_write' },
+			},
+			workgroupSize: [ 64, 1, 1 ],
+			code: /* wgsl */`
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let i = gid.x;
+	if ( i >= ${ MAX_QUERIES }u ) { return; }
+	let q = queryInputs[ i ];
+	let xz = q.xy;
+	let h = waterQueryHeightAtXZ( xz );
+	let e = 0.35;
+	let hx = waterQueryHeightAtXZ( xz + vec2f( e, 0.0 ) );
+	let hz = waterQueryHeightAtXZ( xz + vec2f( 0.0, e ) );
+	let n = normalize( vec3f( ( h - hx ) / e, 1.0, ( h - hz ) / e ) );
+	let seaFloor = ${ S.terrain ? 'terrainHeightAt( xz )' : '-500.0' };
+	queryResults[ i ] = vec4f( h, n.x, n.z, seaFloor );
+}`,
+		} );
 
 	}
 
@@ -155,38 +192,52 @@ export class WaterQuery {
 
 	update() {
 
-		this.inputAttr.needsUpdate = true;
-		this.renderer.compute( this.kernel );
+		// built on first use: the wake / shore attached to the surface after construction are included
+		if ( ! this.kernel ) this._build();
+		this.inputBuffer.write( this.inputs );
+		this.kernel.dispatch( 1 );
 
 		if ( ! this._pending ) {
 
-			this._pending = true;
 			const issued = G.time.value;
 			this._issueInputs.set( this.inputs );
-			this.renderer.getArrayBufferAsync( this.results.value ).then( ( buf ) => {
+			this.readback.onData = ( buf ) => {
 
 				this.cpu.set( new Float32Array( buf ) );
 				this.cpuValid = true;
 				this._pending = false;
-				this.latency += ( Math.min( G.time.value - issued, 0.25 ) - this.latency ) * 0.2;
-				this.resultTime = issued;
+				this.latency += ( Math.min( G.time.value - this._issued, 0.25 ) - this.latency ) * 0.2;
+				this.resultTime = this._issued;
 				this.resultInputs.set( this._issueInputs );
 				this.version ++;
 
-			} ).catch( () => {
+			};
+			if ( this.readback.request( this.results ) ) {
 
-				this._pending = false;
+				this._pending = true;
+				this._issued = issued;
 
-			} );
+			}
 
 		}
 
 	}
 
-	// TSL: camera water state (same frame)
+	// WGSL: camera water state (same frame), vec4f( height, nx, nz, floor ) — see query.module.
+	// Returns a WGSL expression (String object) carrying `.module`, with .x/.y/.z/.w components
+	// (so `query.cameraState().x` still works where the TSL node was used).
 	cameraState() {
 
-		return this.results.element( 0 );
+		const mk = ( e ) => {
+
+			const o = new String( e ); // eslint-disable-line no-new-wrappers
+			o.module = this.resultsModule;
+			return o;
+
+		};
+		const r = mk( 'waterQueryCameraState()' );
+		for ( const c of 'xyzw' ) r[ c ] = mk( `waterQueryCameraState().${ c }` );
+		return r;
 
 	}
 

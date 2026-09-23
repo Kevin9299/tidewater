@@ -1,12 +1,6 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, float, int, vec2, vec3, vec4, attribute, positionLocal, normalLocal, positionWorld, varyingProperty,
-	uniformArray, uniform, mix, smoothstep, sin, abs, fract, floor, max, min, clamp, normalize, cross, dot,
-	select, cameraProjectionMatrix, cameraViewMatrix, mrt, mx_noise_float, mx_worley_noise_float, bumpMap,
-	saturate, pow, exp, sqrt, If, normalView, positionView, texture, uv,
-} from 'three/tsl';
-import { physical } from '../../materials/Materials.js';
-import { staticVelocity } from '../../post/CameraVelocity.js';
+import * as THREE from '../../engine/index.js';
+import { Material } from '../../engine/render/Material.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
 import { LAYERS } from '../../core/SceneRenderer.js';
 import { SPRAY } from '../../fx/Spray.js';
 import { WhaleBrain } from './WhaleBrain.js';
@@ -23,6 +17,11 @@ import { loadTexture } from './WhaleTextures.js';
 // Skin: procedural (dark slate back, mottled white throat and belly, ventral grooves,
 // tubercles, barnacles, scars, white flipper undersides and fluke pattern), SceneLighting with
 // full underwater lighting (caustics, depth attenuation).
+//
+// Port notes: the rig arrays are material uniforms (vec4f[2K] positions / rotations, vec4f[4]
+// flippers); `uPos.array` / `uRot.array` / `uFlip.array` are the same Vector4 lists the block packs
+// every frame. Motion vectors come from the engine's previous-position path (prevWorldPos =
+// last frame's pose), equivalent to the TSL version's static + own velocity.
 
 const K = 40; // spine frames
 const LOD_DIST = [ 48, 170 ]; // m: lod0 -> lod1 -> lod2
@@ -139,9 +138,9 @@ export class Whale {
 
 		this.rootIndex = Math.round( zHead / this.dz ); // frame nearest to z = 0
 		// uniform arrays: this frame [0, K), last frame [K, 2K)
-		this.uPos = uniformArray( new Array( 2 * K ).fill( 0 ).map( () => new THREE.Vector4() ), 'vec4' ).setName( 'whalePos' );
-		this.uRot = uniformArray( new Array( 2 * K ).fill( 0 ).map( () => new THREE.Vector4( 0, 0, 0, 1 ) ), 'vec4' ).setName( 'whaleRot' );
-		this.uFlip = uniformArray( [ new THREE.Vector4( 1, 0, 0, 0 ), new THREE.Vector4( 1, 0, 0, 0 ), new THREE.Vector4( 1, 0, 0, 0 ), new THREE.Vector4( 1, 0, 0, 0 ) ], 'vec4' ).setName( 'whaleFlip' );
+		this.uPos = { array: new Array( 2 * K ).fill( 0 ).map( () => new THREE.Vector4() ) };
+		this.uRot = { array: new Array( 2 * K ).fill( 0 ).map( () => new THREE.Vector4( 0, 0, 0, 1 ) ) };
+		this.uFlip = { array: [ new THREE.Vector4( 1, 0, 0, 0 ), new THREE.Vector4( 1, 0, 0, 0 ), new THREE.Vector4( 1, 0, 0, 0 ), new THREE.Vector4( 1, 0, 0, 0 ) ] };
 		this.pos = [];
 		this.rot = [];
 		for ( let k = 0; k < K; k ++ ) {
@@ -405,143 +404,138 @@ export class Whale {
 
 	_createMaterial( m ) {
 
-		const zHead = float( this.zHead ), dz = float( this.dz );
-		if ( this.heightTex ) this._hT = texture( this.heightTex );
-		const uPos = this.uPos, uRot = this.uRot, uFlip = this.uFlip;
-		const rig = attribute( 'rig', 'vec4' );
-		const vRest = varyingProperty( 'vec3', 'vWhaleRest' );
-		const vDelta = varyingProperty( 'vec3', 'vWhaleDelta' );
-		const vPart = varyingProperty( 'float', 'vWhalePart' );
-		const vUV = varyingProperty( 'vec2', 'vWhaleUV' );
+		const f = ( x ) => {
+
+			const t = String( + x.toFixed( 7 ) );
+			return t.includes( '.' ) || t.includes( 'e' ) ? t : t + '.0';
+
+		};
+
+		const hasTex = !! ( this.albedoTex && this.heightTex );
 		const pl = this.pecRoot[ 0 ], pr = this.pecRoot[ 1 ];
-		const rootL = vec3( pl.x, pl.y, pl.z ), rootR = vec3( pr.x, pr.y, pr.z );
+		const [ h0, h1 ] = m.textures ? m.textures.heightRange : [ 0, 0 ];
 
-		const rotateQ = ( q, v ) => v.add( cross( q.xyz, cross( q.xyz, v ).add( v.mul( q.w ) ) ).mul( 2 ) );
-		const rotAxis = ( ax, ang, v ) => {
-
-			// Rodrigues
-			const c = ang.cos(), s = ang.sin();
-			return v.mul( c ).add( cross( ax, v ).mul( s ) ).add( ax.mul( dot( ax, v ).mul( float( 1 ).sub( c ) ) ) );
-
-		};
-
-		// pose a rest point (and normal) with frame set `o` (0 = this frame, K = last frame)
-		const pose = ( p, n, o, withNormal ) => {
-
-			const part = rig.y;
-			const isL = part.greaterThan( 0.5 ).and( part.lessThan( 1.5 ) );
-			const isR = part.greaterThan( 1.5 ).and( part.lessThan( 2.5 ) );
-			const isPec = isL.or( isR );
-			const fl = select( isL, uFlip.element( int( o === 0 ? 0 : 2 ) ), uFlip.element( int( o === 0 ? 1 : 3 ) ) );
-			const root = select( isL, rootL, rootR );
-			// flippers flex: the tip turns a little further than the root
-			const ang = fl.w.mul( rig.z.mul( 0.35 ).add( 0.8 ) ).mul( select( isPec, 1, 0 ) );
-			const pp = root.add( rotAxis( fl.xyz, ang, p.sub( root ) ) ).toVar();
-			const fi = clamp( zHead.sub( rig.x ).div( dz ), 0, K - 1.001 );
-			const i0 = int( floor( fi ) ), t = fract( fi );
-			const P0 = uPos.element( i0.add( o ) ), P1 = uPos.element( i0.add( o + 1 ) );
-			const Q0 = uRot.element( i0.add( o ) ), Q1 = uRot.element( i0.add( o + 1 ) );
-			const q = normalize( mix( Q0, Q1, t ) );
-			const yc = mix( P0.w, P1.w, t );
-			const off = vec3( pp.x, pp.y.sub( yc ), pp.z.sub( rig.x ) );
-			const world = mix( P0.xyz, P1.xyz, t ).add( rotateQ( q, off ) );
-			if ( ! withNormal ) return { world };
-			const nn = rotateQ( q, rotAxis( fl.xyz, ang, n ) );
-			return { world, normal: nn };
-
-		};
-
-		const mat = physical( { roughness: 0.62, metalness: 0 } );
-		mat.name = 'Whale';
-		mat.underwaterLighting = 'full';
 		// real relief: tubercles, pleats and barnacles displace the finest mesh (rest space)
-		const relief = () => {
+		const relief = hasTex ? /* wgsl */`
+	let hRel = textureSampleLevel( whaleHeightTex, smpLinearClamp, v.uv, 0.0 );
+	let dRel = ( hRel.r * 0.99611 + hRel.g * 0.00389 ) * ${ f( h1 - h0 ) } + ${ f( h0 ) };
+	let p = v.position + v.normal * dRel;` : /* wgsl */`
+	let p = v.position;`;
 
-			if ( ! this.heightTex ) return positionLocal;
-			const [ h0, h1 ] = m.textures.heightRange;
-			const h = this._hT.sample( attribute( 'uv', 'vec2' ) ).level( 0 );
-			const d = h.r.mul( 0.99611 ).add( h.g.mul( 0.00389 ) ).mul( h1 - h0 ).add( h0 );
-			return positionLocal.add( normalLocal.mul( d ) );
-
-		};
-
-		mat.positionNode = Fn( () => {
-
-			const p = relief().toVar();
-			const cur = pose( p, normalLocal, 0, true );
-			const prev = pose( p, normalLocal, K, false );
-			vDelta.assign( cur.world.sub( prev.world ) );
-			normalLocal.assign( cur.normal );
-			return cur.world;
-
-		} )();
-		// the shadow pass needs only this frame's pose
-		mat.castShadowPositionNode = Fn( () => pose( relief(), normalLocal, 0, false ).world )();
-
-		// motion vectors: camera motion plus the whale's own motion (swimming, flexing)
-		const own = Fn( () => {
-
-			const vp = cameraProjectionMatrix.mul( cameraViewMatrix );
-			const c = vp.mul( vec4( positionWorld, 1 ) );
-			const q = vp.mul( vec4( positionWorld.sub( vDelta ), 1 ) );
-			return c.xy.div( c.w ).sub( q.xy.div( q.w ) );
-
-		} )();
-		mat.mrtNode = mrt( { velocity: staticVelocity.add( own ) } );
-
-		this._skinShading( mat, m );
+		const mat = new Material( {
+			name: 'Whale',
+			roughness: 0.62, metalness: 0,
+			underwaterLighting: 'full',
+			uniforms: {
+				whalePos: [ `vec4f[${ 2 * K }]`, this.uPos.array ],
+				whaleRot: [ `vec4f[${ 2 * K }]`, this.uRot.array ],
+				whaleFlip: [ 'vec4f[4]', this.uFlip.array ],
+				whaleWater: [ 'f32', 0 ],
+				whaleWet: [ 'f32', 0 ], // freshness of the wet film (1 = just surfaced)
+			},
+			textures: hasTex ? { whaleAlbedoTex: this.albedoTex, whaleHeightTex: this.heightTex } : {},
+			attributes: { rig: 'vec4f' },
+			defines: { WHALE_TEX: hasTex ? 1 : 0 },
+			modules: [ this._rigModule( f, pl, pr ) ],
+			vertex: /* wgsl */`
+${ relief }
+	let cur = whalePose( p, v.normal, v.rig, 0 );
+	v.useWorld = true;
+	v.worldPos = cur.world;
+	v.worldNormal = cur.normal;
+#if !PASS_DEPTH
+	// the shadow pass needs only this frame's pose
+	v.prevWorldPos = whalePose( p, v.normal, v.rig, ${ K } ).world;
+#endif
+`,
+			surface: this._skinShading( m, hasTex, f ),
+		} );
+		this.uWater = mat.uniforms.whaleWater;
+		this.uWet = mat.uniforms.whaleWet;
 		return mat;
 
 	}
 
+	// pose a rest point (and normal) with frame set `o` (0 = this frame, K = last frame)
+	_rigModule( f, pl, pr ) {
+
+		return new ShaderModule( {
+			name: 'whaleRig',
+			code: /* wgsl */`
+struct WhalePosed { world: vec3f, normal: vec3f };
+
+fn whaleRotateQ( q: vec4f, v: vec3f ) -> vec3f { return v + cross( q.xyz, cross( q.xyz, v ) + v * q.w ) * 2.0; }
+
+// Rodrigues
+fn whaleRotAxis( ax: vec3f, ang: f32, v: vec3f ) -> vec3f {
+	let c = cos( ang ); let s = sin( ang );
+	return v * c + cross( ax, v ) * s + ax * ( dot( ax, v ) * ( 1.0 - c ) );
+}
+
+fn whalePose( p: vec3f, n: vec3f, rig: vec4f, o: i32 ) -> WhalePosed {
+	let part = rig.y;
+	let isL = part > 0.5 && part < 1.5;
+	let isR = part > 1.5 && part < 2.5;
+	let isPec = isL || isR;
+	let fo = select( 0, 2, o != 0 );
+	let fl = select( mat.whaleFlip[ fo + 1 ], mat.whaleFlip[ fo ], isL );
+	let root = select( vec3f( ${ f( pr.x ) }, ${ f( pr.y ) }, ${ f( pr.z ) } ), vec3f( ${ f( pl.x ) }, ${ f( pl.y ) }, ${ f( pl.z ) } ), isL );
+	// flippers flex: the tip turns a little further than the root
+	let ang = fl.w * ( rig.z * 0.35 + 0.8 ) * select( 0.0, 1.0, isPec );
+	let pp = root + whaleRotAxis( fl.xyz, ang, p - root );
+	let fi = clamp( ( ${ f( this.zHead ) } - rig.x ) / ${ f( this.dz ) }, 0.0, ${ f( K - 1.001 ) } );
+	let i0 = i32( floor( fi ) ); let t = fract( fi );
+	let P0 = mat.whalePos[ i0 + o ]; let P1 = mat.whalePos[ i0 + o + 1 ];
+	let Q0 = mat.whaleRot[ i0 + o ]; let Q1 = mat.whaleRot[ i0 + o + 1 ];
+	let q = normalize( mix( Q0, Q1, t ) );
+	let yc = mix( P0.w, P1.w, t );
+	let off = vec3f( pp.x, pp.y - yc, pp.z - rig.x );
+	var r: WhalePosed;
+	r.world = mix( P0.xyz, P1.xyz, t ) + whaleRotateQ( q, off );
+	r.normal = whaleRotateQ( q, whaleRotAxis( fl.xyz, ang, n ) );
+	return r;
+}
+`,
+		} );
+
+	}
+
 	// Baked skin (authoring/whale/bake_textures.mjs): albedo + roughness, and relief height
-	// (16 bit in R/G) applied as a bump in view space from three height taps.
-	_skinShading( mat, m ) {
+	// (16 bit in R/G) applied as a bump from three height taps (the TSL version worked in view
+	// space; the same surface-gradient construction runs in world space here).
+	_skinShading( m, hasTex, f ) {
 
-		this.uWater = uniform( 0 ).setName( 'whaleWater' );
-		this.uWet = uniform( 0 ).setName( 'whaleWet' ); // freshness of the wet film (1 = just surfaced)
-		const above = smoothstep( - 0.1, 0.2, positionWorld.y.sub( this.uWater ) );
-		const film = above.mul( this.uWet );
-		// in water the skin's Fresnel reflectance is far weaker than in air (n 1.33 vs 1.0)
-		mat.specularIntensityNode = mix( 0.45, 1.0, above );
-		if ( ! this.albedoTex ) {
-
-			mat.colorNode = vec3( 0.03, 0.033, 0.038 );
-			mat.roughnessNode = mix( 0.62, 0.3, film );
-			return;
-
-		}
-
-		const aT = texture( this.albedoTex );
-		const hT = this._hT;
-		const uvA = uv();
-		const albedo = aT.sample( uvA );
-		mat.colorNode = albedo.rgb;
-		// matte skin (0.55-0.75) in the water; a thin glossy film only where it is out of the water
-		// and freshly wet
-		mat.roughnessNode = mix( albedo.a, albedo.a.mul( 0.48 ), film );
-		const range = m.textures.heightRange[ 1 ] - m.textures.heightRange[ 0 ];
-		const height = ( u ) => {
-
-			const h = hT.sample( u );
-			return h.r.mul( 0.99611 ).add( h.g.mul( 0.00389 ) ).mul( range );
-
-		};
-
-		mat.normalNode = Fn( () => {
-
-			const dux = uvA.dFdx(), duy = uvA.dFdy();
-			const h0 = height( uvA );
-			const dhx = height( uvA.add( dux ) ).sub( h0 ).mul( 1.6 );
-			const dhy = height( uvA.add( duy ) ).sub( h0 ).mul( 1.6 );
-			const N = normalView.toVar();
-			const dpx = positionView.dFdx(), dpy = positionView.dFdy();
-			const r1 = cross( dpy, N ), r2 = cross( N, dpx );
-			const det = dot( dpx, r1 );
-			const grad = r1.mul( dhx ).add( r2.mul( dhy ) ).mul( det.sign() );
-			return normalize( abs( det ).mul( N ).sub( grad ) );
-
-		} )();
+		const range = m.textures ? m.textures.heightRange[ 1 ] - m.textures.heightRange[ 0 ] : 0;
+		return /* wgsl */`
+	let above = smoothstep( -0.1, 0.2, in.P.y - mat.whaleWater );
+	let film = above * mat.whaleWet;
+	// in water the skin's Fresnel reflectance is far weaker than in air (n 1.33 vs 1.0)
+	s.specularIntensity = mix( 0.45, 1.0, above );
+#if !WHALE_TEX
+	s.albedo = vec3f( 0.03, 0.033, 0.038 );
+	s.roughness = mix( 0.62, 0.3, film );
+#else
+	let uvA = in.uv;
+	let dux = dpdx( uvA ); let duy = dpdy( uvA );
+	let dpx = dpdx( in.P ); let dpy = dpdy( in.P );
+	let albedo = textureSample( whaleAlbedoTex, smpAnisoClamp, uvA );
+	s.albedo = albedo.rgb;
+	// matte skin (0.55-0.75) in the water; a thin glossy film only where it is out of the water
+	// and freshly wet
+	s.roughness = mix( albedo.a, albedo.a * 0.48, film );
+	let t0 = textureSample( whaleHeightTex, smpAnisoClamp, uvA );
+	let t1 = textureSample( whaleHeightTex, smpAnisoClamp, uvA + dux );
+	let t2 = textureSample( whaleHeightTex, smpAnisoClamp, uvA + duy );
+	let hh0 = ( t0.r * 0.99611 + t0.g * 0.00389 ) * ${ f( range ) };
+	let dhx = ( ( t1.r * 0.99611 + t1.g * 0.00389 ) * ${ f( range ) } - hh0 ) * 1.6;
+	let dhy = ( ( t2.r * 0.99611 + t2.g * 0.00389 ) * ${ f( range ) } - hh0 ) * 1.6;
+	let N = in.N;
+	let r1 = cross( dpy, N ); let r2 = cross( N, dpx );
+	let det = dot( dpx, r1 );
+	let grad = ( r1 * dhx + r2 * dhy ) * sign( det );
+	s.normal = normalize( abs( det ) * N - grad );
+#endif
+`;
 
 	}
 

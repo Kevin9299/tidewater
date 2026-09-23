@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 
 // Instance storage + distance LOD for one vegetation type.
 //
@@ -11,8 +11,8 @@ import * as THREE from 'three/webgpu';
 // camera distance of the instance base), so the switch is frame-exact and independent of
 // how often the CPU refills. Instances outside their window collapse to a point.
 
-// > maxUniformBufferBindingSize / 64 forces three.js to use a vertex-attribute
-// instance matrix (uploaded only when changed) instead of a per-draw uniform buffer.
+// (three.js: > maxUniformBufferBindingSize / 64 forced a vertex-attribute instance matrix; the
+// engine always uses one. Kept so the buffers keep their size.)
 const MIN_CAPACITY = 1100;
 
 const _m = new THREE.Matrix4();
@@ -139,6 +139,8 @@ export class LodLevel {
 			mesh.receiveShadow = true;
 			mesh.frustumCulled = false; // instances are spread around the camera
 			mesh.userData.lodRange = this.lodRange;
+			// per-draw uniform (three's onObjectUpdate uLodRange): draw.params.yzw in WGSL
+			mesh.drawParams = [ this.lodRange.x, this.lodRange.y, this.lodRange.z ];
 			mesh.matrixAutoUpdate = false;
 			mesh.updateMatrix();
 			this.meshes.push( mesh );

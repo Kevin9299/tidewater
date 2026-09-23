@@ -1,8 +1,6 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, vec3, vec4, cross, mrt, storage, positionWorld, cameraProjectionMatrix, cameraViewMatrix, instanceIndex,
-} from 'three/tsl';
-import { staticVelocity } from '../../post/CameraVelocity.js';
+import * as THREE from '../../engine/index.js';
+import { StorageBuffer } from '../../engine/gpu/Texture.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
 
 // Shared pieces of the wildlife renderers and simulations.
 
@@ -30,24 +28,20 @@ export const angleDiff = ( a, b ) => {
 // exponential approach factor for a rate (1/s)
 export const approach = ( rate, dt ) => 1 - Math.exp( - rate * dt );
 
-// TSL: rotate v by the unit quaternion q
-export const rotateQ = ( q, v ) => v.add( cross( q.xyz, cross( q.xyz, v ).add( v.mul( q.w ) ) ).mul( 2 ) );
+// WGSL: rotate v by the unit quaternion q ( fn rotateQ( q: vec4f, v: vec3f ) -> vec3f )
+export const kitModule = new ShaderModule( {
+	name: 'wildlifeKit',
+	code: /* wgsl */`
+fn rotateQ( q: vec4f, v: vec3f ) -> vec3f { return v + cross( q.xyz, cross( q.xyz, v ) + v * q.w ) * 2.0; }
+`,
+} );
 
 // Motion vectors for animated instances: the camera motion (as for static geometry) plus the
-// object's own motion under the current camera. delta: world displacement since the last frame.
-export function motionVelocity( delta ) {
-
-	const own = Fn( () => {
-
-		const vp = cameraProjectionMatrix.mul( cameraViewMatrix );
-		const c = vp.mul( vec4( positionWorld, 1 ) );
-		const q = vp.mul( vec4( positionWorld.sub( delta ), 1 ) );
-		return c.xy.div( c.w ).sub( q.xy.div( q.w ) );
-
-	} )();
-	return mrt( { velocity: staticVelocity.add( own ) } );
-
-}
+// object's own motion. The three.js version added the object's own motion under the current
+// camera to the static (camera) velocity; the engine's mesh shader projects the previous world
+// position with the previous camera, which is the same to first order. Vertex snippets set the
+// world position directly and hand the previous one:
+//   v.useWorld = true; v.worldPos = world; v.worldNormal = n; v.prevWorldPos = world - delta;
 
 // ---------------------------------------------------------------- CPU quaternions (plain arrays)
 
@@ -123,18 +117,18 @@ export class InstanceRecords {
 
 		this.max = max;
 		this.stride = stride;
+		this.name = name;
 		this.data = new Float32Array( max * stride * 4 );
-		this.attr = new THREE.StorageBufferAttribute( this.data, 4 );
-		this.attr.setUsage( THREE.DynamicDrawUsage );
-		this.node = storage( this.attr, 'vec4', max * stride ).toReadOnly().setName( name );
+		this.buffer = new StorageBuffer( { label: name, count: max * stride, type: 'vec4f' } );
 		this.count = 0;
 
 	}
 
-	// TSL: the k-th vec4 of the current instance
+	// WGSL expression: the k-th vec4 of the current instance (in a vertex snippet; the material
+	// binds `storage: { [ name ]: records.buffer }`)
 	field( k ) {
 
-		return this.node.element( instanceIndex.mul( this.stride ).add( k ) );
+		return `${ this.name }[ v.instance * ${ this.stride }u + ${ k }u ]`;
 
 	}
 
@@ -154,19 +148,17 @@ export class InstanceRecords {
 
 	commit() {
 
-		this.attr.clearUpdateRanges();
-		this.attr.addUpdateRange( 0, Math.max( 1, this.count ) * this.stride * 4 );
-		this.attr.needsUpdate = true;
+		this.buffer.write( this.data.subarray( 0, Math.max( 1, this.count ) * this.stride * 4 ) );
 
 	}
 
 }
 
-// Instanced mesh drawing `records.count` instances; with a csm, shadows are cast into the near
-// cascade only (the far cascades never see these small things).
+// Instanced mesh drawing `records.count` instances; with a csm (SunShadows), shadows are cast into
+// the near cascade only (the far cascades never see these small things).
 export function instancedMesh( name, geometry, material, records, { csm = null, castShadow = false } = {} ) {
 
-	const g = new THREE.InstancedBufferGeometry();
+	const g = new THREE.BufferGeometry();
 	g.index = geometry.index;
 	for ( const k in geometry.attributes ) g.setAttribute( k, geometry.attributes[ k ] );
 	g.instanceCount = 0;
@@ -180,10 +172,10 @@ export function instancedMesh( name, geometry, material, records, { csm = null, 
 	mesh.onBeforeRender = ( renderer, scene, camera ) => {
 
 		let n = records.count;
-		if ( camera.isOrthographicCamera && csm ) {
+		if ( csm && csm.cascades && camera ) {
 
-			const near = csm.lights && csm.lights[ 0 ] ? csm.lights[ 0 ].shadow.camera : null;
-			if ( camera !== near ) n = 0;
+			const i = csm.cascades.findIndex( ( c ) => c.camera === camera );
+			if ( i > 0 ) n = 0;
 
 		}
 

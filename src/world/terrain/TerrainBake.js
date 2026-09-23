@@ -1,4 +1,4 @@
-import { DataUtils } from 'three/webgpu';
+import { DataUtils } from '../../engine/index.js';
 
 // CPU bakes of the terrain maps sampled by the terrain material (and the water):
 //   normal RGBA8: nx * 0.5 + 0.5, nz * 0.5 + 0.5, rock mask, ambient occlusion

@@ -92,8 +92,30 @@ fn vogelDiskSample( i: i32, n: i32, phi: f32 ) -> vec2f {
 	return vec2f( cos( theta ), sin( theta ) ) * r;
 }
 
-// ---- gradient noise (MaterialX mx_noise_float semantics: roughly -1..1, 0 at lattice points)
+// ---- gradient noise: MaterialX (three's MaterialXNoise.js) bit for bit — the same Jenkins
+// lookup3 hash, gradients, quintic fade and gradient scales (0.6616 in 2D, 0.982 in 3D), so the
+// procedural patterns land where they did in the three.js version.
 
+fn _mxRotl( x: u32, k: u32 ) -> u32 { return ( x << k ) | ( x >> ( 32u - k ) ); }
+fn _mxFinal( a0: u32, b0: u32, c0: u32 ) -> u32 {
+	var a = a0; var b = b0; var c = c0;
+	c ^= b; c -= _mxRotl( b, 14u );
+	a ^= c; a -= _mxRotl( c, 11u );
+	b ^= a; b -= _mxRotl( a, 25u );
+	c ^= b; c -= _mxRotl( b, 16u );
+	a ^= c; a -= _mxRotl( c, 4u );
+	b ^= a; b -= _mxRotl( a, 14u );
+	c ^= b; c -= _mxRotl( b, 24u );
+	return c;
+}
+fn mxHash2( x: i32, y: i32 ) -> u32 { let s = 0xdeadbeefu + ( 2u << 2u ) + 13u; return _mxFinal( s + u32( x ), s + u32( y ), s ); }
+fn mxHash3( x: i32, y: i32, z: i32 ) -> u32 { let s = 0xdeadbeefu + ( 3u << 2u ) + 13u; return _mxFinal( s + u32( x ), s + u32( y ), s + u32( z ) ); }
+fn _mxGrad2( hash: u32, x: f32, y: f32 ) -> f32 {
+	let h = hash & 7u;
+	let u = select( y, x, h < 4u );
+	let v = 2.0 * select( x, y, h < 4u );
+	return select( u, - u, ( h & 1u ) != 0u ) + select( v, - v, ( h & 2u ) != 0u );
+}
 fn _gradDot3( h: u32, p: vec3f ) -> f32 {
 	let hh = h & 15u;
 	let u = select( p.y, p.x, hh < 8u );
@@ -101,11 +123,12 @@ fn _gradDot3( h: u32, p: vec3f ) -> f32 {
 	return select( u, - u, ( hh & 1u ) != 0u ) + select( v, - v, ( hh & 2u ) != 0u );
 }
 fn _fade3( t: vec3f ) -> vec3f { return t * t * t * ( t * ( t * 6.0 - 15.0 ) + 10.0 ); }
-fn _h3( i: vec3i ) -> u32 { return ihash3( i ).x; }
+fn _h3( i: vec3i ) -> u32 { return mxHash3( i.x, i.y, i.z ); }
 
 fn perlin3( p: vec3f ) -> f32 {
-	let i = vec3i( floor( p ) );
-	let f = fract( p );
+	let fl = floor( p );
+	let i = vec3i( fl );
+	let f = p - fl;
 	let u = _fade3( f );
 	let n000 = _gradDot3( _h3( i ), f );
 	let n100 = _gradDot3( _h3( i + vec3i( 1, 0, 0 ) ), f - vec3f( 1.0, 0.0, 0.0 ) );
@@ -119,18 +142,46 @@ fn perlin3( p: vec3f ) -> f32 {
 	let x1 = mix( mix( n001, n101, u.x ), mix( n011, n111, u.x ), u.y );
 	return mix( x0, x1, u.z ) * 0.982;
 }
+fn perlin2( p: vec2f ) -> f32 {
+	let fl = floor( p );
+	let X = i32( fl.x ); let Y = i32( fl.y );
+	let fx = p.x - fl.x; let fy = p.y - fl.y;
+	let u = _fade3( vec3f( fx, fy, 0.0 ) );
+	let v0 = _mxGrad2( mxHash2( X, Y ), fx, fy );
+	let v1 = _mxGrad2( mxHash2( X + 1, Y ), fx - 1.0, fy );
+	let v2 = _mxGrad2( mxHash2( X, Y + 1 ), fx, fy - 1.0 );
+	let v3 = _mxGrad2( mxHash2( X + 1, Y + 1 ), fx - 1.0, fy - 1.0 );
+	let s1 = 1.0 - u.x;
+	return ( ( 1.0 - u.y ) * ( v0 * s1 + v1 * u.x ) + u.y * ( v2 * s1 + v3 * u.x ) ) * 0.6616;
+}
 fn mx_noise_float3( p: vec3f ) -> f32 { return perlin3( p ); }
-fn mx_noise_float2( p: vec2f ) -> f32 { return perlin3( vec3f( p, 0.0 ) ); }
+fn mx_noise_float2( p: vec2f ) -> f32 { return perlin2( p ); }
+// MaterialX vec3 noise: one hash per corner, its three low bytes pick the gradients
+fn _mxGrad3v( h: u32, p: vec3f ) -> vec3f { return vec3f( _gradDot3( h & 0xffu, p ), _gradDot3( ( h >> 8u ) & 0xffu, p ), _gradDot3( ( h >> 16u ) & 0xffu, p ) ); }
 fn mx_noise_vec3( p: vec3f ) -> vec3f {
-	return vec3f( perlin3( p ), perlin3( p + vec3f( 19.1, 33.4, 47.2 ) ), perlin3( p + vec3f( 74.2, - 124.5, 99.4 ) ) );
+	let fl = floor( p );
+	let i = vec3i( fl );
+	let f = p - fl;
+	let u = _fade3( f );
+	let n000 = _mxGrad3v( _h3( i ), f );
+	let n100 = _mxGrad3v( _h3( i + vec3i( 1, 0, 0 ) ), f - vec3f( 1.0, 0.0, 0.0 ) );
+	let n010 = _mxGrad3v( _h3( i + vec3i( 0, 1, 0 ) ), f - vec3f( 0.0, 1.0, 0.0 ) );
+	let n110 = _mxGrad3v( _h3( i + vec3i( 1, 1, 0 ) ), f - vec3f( 1.0, 1.0, 0.0 ) );
+	let n001 = _mxGrad3v( _h3( i + vec3i( 0, 0, 1 ) ), f - vec3f( 0.0, 0.0, 1.0 ) );
+	let n101 = _mxGrad3v( _h3( i + vec3i( 1, 0, 1 ) ), f - vec3f( 1.0, 0.0, 1.0 ) );
+	let n011 = _mxGrad3v( _h3( i + vec3i( 0, 1, 1 ) ), f - vec3f( 0.0, 1.0, 1.0 ) );
+	let n111 = _mxGrad3v( _h3( i + vec3i( 1, 1, 1 ) ), f - vec3f( 1.0, 1.0, 1.0 ) );
+	let x0 = mix( mix( n000, n100, u.x ), mix( n010, n110, u.x ), u.y );
+	let x1 = mix( mix( n001, n101, u.x ), mix( n011, n111, u.x ), u.y );
+	return mix( x0, x1, u.z ) * 0.982;
 }
 fn mx_fractal_noise_float3( p: vec3f, octaves: i32, lacunarity: f32, diminish: f32 ) -> f32 {
 	var r = 0.0; var amp = 1.0; var q = p;
 	for ( var i = 0; i < octaves; i++ ) { r += amp * perlin3( q ); amp *= diminish; q *= lacunarity; }
 	return r;
 }
-fn mx_cell_noise_float3( p: vec3f ) -> f32 { return u32ToUnit( ihash3( vec3i( floor( p ) ) ).x ); }
-fn mx_cell_noise_float2( p: vec2f ) -> f32 { return mx_cell_noise_float3( vec3f( p, 0.0 ) ); }
+fn mx_cell_noise_float3( p: vec3f ) -> f32 { let i = vec3i( floor( p ) ); return f32( mxHash3( i.x, i.y, i.z ) ) / f32( 0xffffffffu ); }
+fn mx_cell_noise_float2( p: vec2f ) -> f32 { let i = vec2i( floor( p ) ); return f32( mxHash2( i.x, i.y ) ) / f32( 0xffffffffu ); }
 // distances to the nearest two feature points (F1, F2), jitter 0..1
 fn mx_worley_noise_vec2_3( p: vec3f, jitter: f32 ) -> vec2f {
 	let i = vec3i( floor( p ) );

@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Color, Vector3 } from '../engine/index.js';
 import { WORLD } from './WorldLayout.js';
 import {
 	WOOD, HARD, C, lin, bollard, cleat, tireFender, ropeCoil, ropeLoop, lifeRing, lampPost,
@@ -31,8 +31,8 @@ export const PIER = {
 	capH: 0.26,
 };
 
-const _v = new THREE.Vector3();
-const _h = new THREE.Vector3();
+const _v = new Vector3();
+const _h = new Vector3();
 
 export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = null, hang = null } ) {
 
@@ -223,7 +223,7 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 		if ( bi >= lastBent ) continue;
 		const lx = X + side * ( halfW - 0.1 ), lz = bentZ[ bi ] + 0.32;
 		const w = hang ? hungLampPost( B, hang, info, lx, DK, lz, - side * Math.PI / 2, 3.1, rand.next() ) : lampPost( B, lx, DK, lz, - side * Math.PI / 2, 3.1, rand.next() );
-		lights.push( { position: w, color: new THREE.Color( 1.0, 0.72, 0.42 ), intensity: 5, kind: 'lantern' } );
+		lights.push( { position: w, color: new Color( 1.0, 0.72, 0.42 ), intensity: 5, kind: 'lantern' } );
 		info.lamps.push( w );
 		colliders.addCylinder( lx, lz, 0.1, DK, DK + 3.2, { tag: 'lampPost' } );
 
@@ -248,7 +248,7 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 		// the village swings it in the wind about the tops of the chains, info.signPivot)
 		const S = signB || B;
 		const sy = by - 0.52;
-		info.signPivot = new THREE.Vector3( X, by - 0.12, az + 0.02 );
+		info.signPivot = new Vector3( X, by - 0.12, az + 0.02 );
 		S.box( 'wood', X, sy, az + 0.02, 1.9, 0.52, 0.05, { grain: 0, tint: teal, data: WOOD( rand.next(), 0.6, 0.72, 6 ) } );
 		S.box( 'wood', X, sy, az + 0.02, 1.98, 0.6, 0.03, { grain: 0, tint: white, data: wd() } );
 		for ( const s of [ - 0.7, 0.7 ] ) S.rod( 'hard', [ X + s, sy + 0.26, az + 0.02 ], [ X + s, by - 0.12, az + 0.02 ], 0.008, 0.008, { segs: 4, tint: C.iron, data: HARD( rand.next(), 0.6, 0.6, 0.5 ) } );
@@ -260,13 +260,13 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 			for ( let i = 0; i < 14; i ++ ) {
 
 				const a = i / 14 * Math.PI * 2;
-				body.push( new THREE.Vector3( X - 0.1 + Math.cos( a ) * 0.5, sy + Math.sin( a ) * 0.17, zf ) );
+				body.push( new Vector3( X - 0.1 + Math.cos( a ) * 0.5, sy + Math.sin( a ) * 0.17, zf ) );
 
 			}
 
-			S.slab( 'wood', body, 0.01, { up: new THREE.Vector3( 0, 0, f ), uDir: new THREE.Vector3( 1, 0, 0 ), tint: coral, data: WOOD( rand.next(), 0.6, 0.75, 0 ) } );
-			S.slab( 'wood', [ new THREE.Vector3( X + 0.36, sy, zf ), new THREE.Vector3( X + 0.72, sy + 0.2, zf ), new THREE.Vector3( X + 0.66, sy, zf ), new THREE.Vector3( X + 0.72, sy - 0.2, zf ) ].slice( 0, 3 ), 0.01, { up: new THREE.Vector3( 0, 0, f ), tint: coral, data: WOOD( rand.next(), 0.6, 0.75, 0 ) } );
-			S.slab( 'wood', [ new THREE.Vector3( X + 0.36, sy, zf ), new THREE.Vector3( X + 0.66, sy, zf ), new THREE.Vector3( X + 0.72, sy - 0.2, zf ) ], 0.01, { up: new THREE.Vector3( 0, 0, f ), tint: coral, data: WOOD( rand.next(), 0.6, 0.75, 0 ) } );
+			S.slab( 'wood', body, 0.01, { up: new Vector3( 0, 0, f ), uDir: new Vector3( 1, 0, 0 ), tint: coral, data: WOOD( rand.next(), 0.6, 0.75, 0 ) } );
+			S.slab( 'wood', [ new Vector3( X + 0.36, sy, zf ), new Vector3( X + 0.72, sy + 0.2, zf ), new Vector3( X + 0.66, sy, zf ), new Vector3( X + 0.72, sy - 0.2, zf ) ].slice( 0, 3 ), 0.01, { up: new Vector3( 0, 0, f ), tint: coral, data: WOOD( rand.next(), 0.6, 0.75, 0 ) } );
+			S.slab( 'wood', [ new Vector3( X + 0.36, sy, zf ), new Vector3( X + 0.66, sy, zf ), new Vector3( X + 0.72, sy - 0.2, zf ) ], 0.01, { up: new Vector3( 0, 0, f ), tint: coral, data: WOOD( rand.next(), 0.6, 0.75, 0 ) } );
 			S.cyl( 'hard', X - 0.42, sy + 0.04, zf + f * 0.006, 0.035, 0.035, 0.008, { segs: 8, rx: f * Math.PI / 2, tint: C.black, data: HARD( rand.next(), 0, 0, 0.4 ) } );
 
 		}
@@ -280,16 +280,16 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 			if ( hang ) {
 
 				B.torus( 'hard', hx, by - 0.125, hz, 0.02, 0.005, { rx: Math.PI / 2, radial: 3, tubular: 6, tint: C.iron, data: HARD( 0.5, 0.35, 0.5, 0.45 ) } );
-				pos = hangLantern( hang, info, new THREE.Vector3( hx, by - 0.12, hz ), rand.next(), 0.9, 0.1 );
+				pos = hangLantern( hang, info, new Vector3( hx, by - 0.12, hz ), rand.next(), 0.9, 0.1 );
 
 			} else {
 
 				const c = lantern( B, hx, by - 0.12, hz, rand.next(), 0.9 );
-				pos = new THREE.Vector3( c[ 0 ], c[ 1 ], c[ 2 ] );
+				pos = new Vector3( c[ 0 ], c[ 1 ], c[ 2 ] );
 
 			}
 
-			lights.push( { position: pos, color: new THREE.Color( 1.0, 0.72, 0.42 ), intensity: 4, kind: 'lantern' } );
+			lights.push( { position: pos, color: new Color( 1.0, 0.72, 0.42 ), intensity: 4, kind: 'lantern' } );
 
 		}
 
@@ -329,7 +329,7 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 
 		}
 
-		info.stepFoot = new THREE.Vector3( X, ground( X, z0 - run - 0.3 ), z0 - run - 0.3 );
+		info.stepFoot = new Vector3( X, ground( X, z0 - run - 0.3 ), z0 - run - 0.3 );
 
 	}
 
@@ -432,12 +432,12 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 		ropeLoop( B, bx, DK + 0.36, bz, 0.155, null, rand.next() );
 		ropeCoil( B, bx - 0.75, DK, bz + ( bz < 36 ? 0.35 : - 0.35 ), 0.08, 0.3, 4, rand.next() );
 		colliders.addCylinder( bx, bz, 0.22, DK, DK + 0.5, { tag: 'bollard' } );
-		info.bollards.push( new THREE.Vector3( bx, DK + 0.45, bz ) );
+		info.bollards.push( new Vector3( bx, DK + 0.45, bz ) );
 
 	}
 
 	cleat( B, edgeX - 0.22, DK, 36.5, Math.PI / 2, rand.next() );
-	info.bollards.push( new THREE.Vector3( edgeX - 0.22, DK + 0.1, 36.5 ) );
+	info.bollards.push( new Vector3( edgeX - 0.22, DK + 0.1, 36.5 ) );
 
 	// tyre fenders on the berthing face
 	for ( const fz of [ 33.75, 36.0, 37.35, 39.25 ] ) tireFender( B, edgeX, DK - 0.04, fz, 0, rand.range( 0.65, 0.85 ), rand.next() );
@@ -456,7 +456,7 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 			for ( let i = 0; i <= 6; i ++ ) {
 
 				const a = i / 6 * Math.PI;
-				arc.push( new THREE.Vector3( lx - 0.25 + Math.cos( a ) * 0.25, yt - 0.15 + Math.sin( a ) * 0.15, rzs ) );
+				arc.push( new Vector3( lx - 0.25 + Math.cos( a ) * 0.25, yt - 0.15 + Math.sin( a ) * 0.15, rzs ) );
 
 			}
 
@@ -483,7 +483,7 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 
 		}
 
-		info.ladder = new THREE.Vector3( lx, DK, lz );
+		info.ladder = new Vector3( lx, DK, lz );
 
 	}
 
@@ -532,7 +532,7 @@ export function buildPier( { B, terrain, colliders, rand, lights, inst, signB = 
 	for ( const [ lx, lz, yaw ] of [ [ hx0 + 0.55, z1 - 0.55, 3 * Math.PI / 4 ], [ hx1 - 0.6, z1 - 0.55, - 3 * Math.PI / 4 ], [ hx0 + 0.55, zH + 0.6, Math.PI / 4 ] ] ) {
 
 		const w = hang ? hungLampPost( B, hang, info, lx, DK, lz, yaw, 3.1, rand.next() ) : lampPost( B, lx, DK, lz, yaw, 3.1, rand.next() );
-		lights.push( { position: w, color: new THREE.Color( 1.0, 0.72, 0.42 ), intensity: 5, kind: 'lantern' } );
+		lights.push( { position: w, color: new Color( 1.0, 0.72, 0.42 ), intensity: 5, kind: 'lantern' } );
 		info.lamps.push( w );
 		colliders.addCylinder( lx, lz, 0.1, DK, DK + 3.2, { tag: 'lampPost' } );
 
@@ -586,7 +586,7 @@ function hangLantern( hang, info, hook, seed, scale, chain ) {
 	}
 
 	const c = lantern( LB, hook.x, hook.y - n * pitch, hook.z, seed, scale );
-	const center = new THREE.Vector3( c[ 0 ], c[ 1 ], c[ 2 ] );
+	const center = new Vector3( c[ 0 ], c[ 1 ], c[ 2 ] );
 	info.hung.push( { B: LB, pivot: hook.clone(), rest: center.clone(), live: center } );
 	return center;
 

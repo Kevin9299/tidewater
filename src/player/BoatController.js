@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../engine/index.js';
 import { WORLD } from '../world/WorldLayout.js';
 
 const RHO = 1025; // sea water density

@@ -34,7 +34,7 @@ export class SunShadows {
 		this.cascades = splits.map( ( _, i ) => ( {
 			camera: {
 				matrixWorld: new Matrix4(), matrixWorldInverse: new Matrix4(), projectionMatrix: new Matrix4(),
-				near: 0, far: 1, reversedDepth: false, updateMatrixWorld() {}, isCamera: true,
+				near: 0, far: 1, reversedDepth: false, updateMatrixWorld() {}, isCamera: true, isShadowCamera: true,
 			},
 			block: createViewUniforms( 'shadowView' + i ),
 			viewProj: new Matrix4(),
@@ -54,12 +54,27 @@ export class SunShadows {
 
 	}
 
-	// Fit cascade i to the view-distance slice [ near, far ] of `camera`.
+	// seam blend band (m) at view distance d (SoftCSMShadowNode: max( 0.25 e^2, 0.25 e ) of the normalized
+	// break e, times the shadow distance): 2.5 m at the 10 m seam, 15 m at 60 m, 100 m fade-out at 400 m
+	_margin( d ) {
+
+		const far = this.splits[ this.count - 1 ];
+		const e = d / far;
+		return Math.max( 0.25 * e * e, 0.25 * e ) * far;
+
+	}
+
+	// Fit cascade i to the view-distance slice [ near, far ] of `camera`, widened by half the seam blend
+	// bands so the overlapping cascades both cover them.
 	_fit( i, camera, sunDir ) {
 
 		const c = this.cascades[ i ];
-		const near = i === 0 ? camera.near : this.splits[ i - 1 ];
-		const far = this.splits[ i ];
+		const x = i === 0 ? 0 : this.splits[ i - 1 ];
+		const y = this.splits[ i ];
+		const mN = this._margin( x ), mF = this._margin( y );
+		const near = Math.max( camera.near, x - mN * 0.5 );
+		const far = i === this.count - 1 ? y : y + mF * 0.5;
+		ShadowUniforms.fields.blend.value[ i ] = new Vector4( x, y, mN, mF );
 		// slice corners in world space (perspective: scale the unit frustum by distance)
 		const tanY = Math.tan( camera.fov * Math.PI / 360 );
 		const tanX = tanY * camera.aspect;

@@ -34,6 +34,7 @@ export const SAMPLERS = [
 	[ 'smpLinearMirror', 'linearMirror', 'filtering' ],
 	[ 'smpAnisoRepeat', 'anisoRepeat', 'filtering' ],
 	[ 'smpAnisoClamp', 'anisoClamp', 'filtering' ],
+	[ 'smpAniso4Repeat', 'aniso4Repeat', 'filtering' ],
 	[ 'smpNearestClamp', 'nearestClamp', 'non-filtering' ],
 	[ 'smpNearestRepeat', 'nearestRepeat', 'non-filtering' ],
 	[ 'smpShadow', 'shadow', 'comparison' ],
@@ -321,13 +322,33 @@ export function getBindGroupLayout( entries, label ) {
 // A composed set of group-1 bindings: layout + a bind group rebuilt when a resource changes.
 export class BindingSet {
 
-	constructor( specs, stage, label = 'bindings' ) {
+	// stageOf: { name: 'vertex' | 'fragment' } for render bindings only one stage reads (keeps the
+	// per-stage uniform buffer / texture counts down); demote: uniform blocks bound as read-only storage
+	constructor( specs, stage, label = 'bindings', stageOf = null, demote = null ) {
 
 		this.label = label;
 		this.stage = stage;
 		this.names = Object.keys( specs );
 		this.specs = specs;
 		this.described = this.names.map( ( n ) => describe( n, specs[ n ], stage ) );
+		if ( stageOf ) for ( let i = 0; i < this.names.length; i ++ ) {
+
+			const l = this.described[ i ].layout;
+			const st = stageOf[ this.names[ i ] ];
+			if ( st === 'fragment' && ( l.visibility & GPUShaderStage.FRAGMENT ) ) l.visibility = GPUShaderStage.FRAGMENT;
+			if ( st === 'vertex' && ( l.visibility & GPUShaderStage.VERTEX ) ) l.visibility = GPUShaderStage.VERTEX;
+
+		}
+
+		if ( demote ) for ( let i = 0; i < this.names.length; i ++ ) {
+
+			const d = this.described[ i ];
+			if ( ! demote.has( this.names[ i ] ) ) continue;
+			d.layout.buffer = { type: 'read-only-storage' };
+			d.decl = d.decl.replace( /^var<uniform>/, 'var<storage, read>' );
+
+		}
+
 		this.layout = getBindGroupLayout( this.described.map( ( d, i ) => ( { binding: i, ...d.layout } ) ), label );
 		this.group = null;
 		this.signature = '';
@@ -438,11 +459,61 @@ export function composeShader( { modules = [], bindings = {}, code = '', defines
 	}
 
 	for ( const k in bindings ) specs[ k ] = bindings[ k ];
-	const set = new BindingSet( specs, stage, label + '.g1' );
+	let stageOf = null;
+	let demote = null;
+	if ( stage === 'render' && /@vertex\s+fn\s+vs\b/.test( code ) ) {
+
+		// bindings only one entry point can reach are declared for that stage only (per-stage limits:
+		// 12 uniform buffers, 16 sampled textures on some adapters)
+		let all = '';
+		for ( const m of mods ) all += m.code + '\n';
+		const full = preprocess( all + code, defines );
+		const usedV = reachableIdentifiers( full, 'vs' );
+		const usedF = /@fragment\s+fn\s+fs\b/.test( full ) ? reachableIdentifiers( full, 'fs' ) : null;
+		stageOf = {};
+		for ( const k in specs ) {
+
+			if ( ! usedV.has( k ) && ( ! usedF || usedF.has( k ) ) ) stageOf[ k ] = 'fragment';
+			else if ( usedF && ! usedF.has( k ) && usedV.has( k ) ) stageOf[ k ] = 'vertex';
+
+		}
+
+		// still over the uniform buffer budget of a stage (frame + per-draw blocks take 2 of 12): the
+		// excess blocks are bound as read-only storage buffers instead (same struct layout)
+		demote = new Set();
+		const limits = GPU.limits || {};
+		const maxU = ( limits.maxUniformBuffersPerShaderStage || 12 ) - 2;
+		const maxS = { vertex: limits.maxStorageBuffersInVertexStage ?? 4, fragment: limits.maxStorageBuffersInFragmentStage ?? limits.maxStorageBuffersPerShaderStage ?? 8 };
+		const inStage = ( k, st ) => ! stageOf[ k ] || stageOf[ k ] === st;
+		for ( const st of [ 'fragment', 'vertex' ] ) {
+
+			const uniforms = Object.keys( specs ).filter( ( k ) => specs[ k ].uniform && inStage( k, st ) && ! demote.has( k ) );
+			let storage = Object.keys( specs ).filter( ( k ) => ( specs[ k ].storage || demote.has( k ) ) && inStage( k, st ) ).length;
+			// prefer blocks the other stage doesn't see, the smallest last-declared first
+			uniforms.sort( ( a, b ) => ( stageOf[ a ] === st ? 0 : 1 ) - ( stageOf[ b ] === st ? 0 : 1 ) );
+			let n = uniforms.length;
+			for ( const k of uniforms ) {
+
+				if ( n <= maxU ) break;
+				if ( storage >= maxS[ st ] ) break;
+				demote.add( k );
+				storage ++;
+				n --;
+
+			}
+
+		}
+
+	}
+
+	const set = new BindingSet( specs, stage, label + '.g1', stageOf, demote );
 	const g0 = group0( stage );
 	const structs = [ ...new Set( [ ...g0.structs(), ...set.structs() ] ) ];
 	let src = '';
 	if ( GPU.features.has( 'shader-f16' ) && defines.F16 ) src += 'enable f16;\n';
+	// as three.js' WGSL builder: derivatives inside data-dependent branches are allowed (the ported
+	// materials rely on it; results there are only used where the quad agrees)
+	if ( ! /diagnostic\s*\(\s*off\s*,\s*derivative_uniformity/.test( header ) ) src += 'diagnostic( off, derivative_uniformity );\n';
 	src += header;
 	src += structs.map( ( s ) => s.wgsl ).join( '\n' ) + '\n';
 	src += g0.declarations( 0 ) + '\n';
@@ -450,6 +521,53 @@ export function composeShader( { modules = [], bindings = {}, code = '', defines
 	for ( const m of mods ) src += `// ---- ${ m.name }\n${ m.code }\n`;
 	src += code;
 	return { code: preprocess( src, defines ), bindings: set, group0: g0, modules: mods };
+
+}
+
+// Identifiers reachable from function `entry` through the call graph of the top-level functions.
+export function reachableIdentifiers( code, entry ) {
+
+	const fns = new Map();
+	const re = /\bfn\s+([A-Za-z_]\w*)\s*\(/g;
+	let m;
+	while ( ( m = re.exec( code ) ) ) {
+
+		const open = code.indexOf( '{', m.index );
+		if ( open < 0 ) break;
+		let depth = 0, i = open;
+		for ( ; i < code.length; i ++ ) {
+
+			const c = code[ i ];
+			if ( c === '{' ) depth ++;
+			else if ( c === '}' && -- depth === 0 ) break;
+
+		}
+
+		// entry points are never called (a local variable named like one must not pull it in)
+		const isEntry = /@(vertex|fragment|compute)[^;{}]*$/.test( code.slice( Math.max( 0, m.index - 80 ), m.index ) );
+		if ( ! isEntry || m[ 1 ] === entry ) fns.set( m[ 1 ], code.slice( m.index, i + 1 ) );
+		re.lastIndex = i + 1;
+
+	}
+
+	const used = new Set();
+	const queue = [ entry ];
+	const seen = new Set();
+	while ( queue.length ) {
+
+		const f = queue.pop();
+		if ( seen.has( f ) || ! fns.has( f ) ) continue;
+		seen.add( f );
+		for ( const id of fns.get( f ).match( /[A-Za-z_]\w*/g ) || [] ) {
+
+			used.add( id );
+			if ( fns.has( id ) && ! seen.has( id ) ) queue.push( id );
+
+		}
+
+	}
+
+	return used;
 
 }
 

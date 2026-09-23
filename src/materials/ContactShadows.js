@@ -1,11 +1,5 @@
-import * as THREE from 'three/webgpu';
-import {
-	If, float, vec2, vec4, ivec2, max, min, abs, fract, select, smoothstep, textureLoad, uniform, dot, dFdx, dFdy,
-	positionWorld, positionView, normalWorld, screenCoordinate, interleavedGradientNoise, frameId, cameraNear,
-	renderGroup,
-} from 'three/tsl';
-import { G } from '../core/Globals.js';
-import { prevViewProj } from '../post/CameraVelocity.js';
+import { ShaderModule, UniformBlock } from '../engine/gpu/Shader.js';
+import { commonModule } from '../engine/render/wgsl/common.js';
 import { SceneLighting } from './SceneLighting.js';
 
 // Screen-space contact shadows for the sun: the fine shadows the cascaded maps miss (pebbles, shells,
@@ -17,92 +11,137 @@ import { SceneLighting } from './SceneLighting.js';
 // behind the depth buffer by more than a slope-scaled bias (no acne on flat ground) and less than a
 // thickness that grows along the ray (no long false shadows behind thin or distant objects).
 // Applied to the key light only, in the opaque pass only.
+//
+// Installed as the `contactShadow` lighting hook (fn hookContactShadow( P, N ) -> f32). Exclusions
+// are per material define (the hook only sees defines): IS_WATER, NO_CONTACT_SHADOWS (set for
+// `material.contactShadows = false` via ContactShadows.exclude( material ) and for every material
+// under ContactShadows.skipRoots), and the late (transparent) pass (PASS_LATE: last frame's depth is
+// this frame's there).
 const GROUP = 4;
 const GROUPS = 2;
 const STEPS = GROUP * GROUPS;
 const MAX_DIST = 32;
 const NEAR_DIST = 12; // the second group of steps only runs nearer than this
 
+const params = new UniformBlock( 'ContactShadowParams', { strength: [ 'f32', 1 ] }, { label: 'contactShadows' } );
+
+// receivers under these objects are skipped (foliage: overdraw, still casts); adding a root marks
+// the materials below it (call ContactShadows.refresh() after adding children to a root later)
+class SkipSet extends Set {
+
+	add( o ) {
+
+		super.add( o );
+		markTree( o );
+		return this;
+
+	}
+
+}
+
+function exclude( m ) {
+
+	if ( m && m.setDefine ) m.setDefine( 'NO_CONTACT_SHADOWS', 1 );
+
+}
+
+function markTree( root ) {
+
+	if ( root && root.traverse ) root.traverse( ( o ) => {
+
+		if ( o.material ) for ( const m of Array.isArray( o.material ) ? o.material : [ o.material ] ) exclude( m );
+
+	} );
+
+}
+
 export const ContactShadows = {
-	strength: uniform( 1 ).setName( 'csStrength' ),
+	strength: params.fields.strength,
 	depthTexture: null,
-	skipRoots: new Set(), // receivers under these objects are skipped (foliage: overdraw, still casts)
+	skipRoots: new SkipSet(),
+	exclude,
+	refresh() {
+
+		for ( const r of this.skipRoots ) markTree( r );
+
+	},
+	module: null,
 };
-
-const texSize = uniform( new THREE.Vector2( 1, 1 ) ).setName( 'csSize' ).setGroup( renderGroup ).onRenderUpdate( () => {
-
-	const img = ContactShadows.depthTexture && ContactShadows.depthTexture.image;
-	if ( img && img.width ) texSize.value.set( img.width, img.height );
-
-} );
 
 export function installContactShadows( { depthTexture, skip = [] } ) {
 
 	ContactShadows.depthTexture = depthTexture;
 	for ( const o of skip ) if ( o ) ContactShadows.skipRoots.add( o );
-	SceneLighting.contactShadow = contactShadow;
+	const loop = [];
+	for ( let g = 0; g < GROUPS; g ++ ) {
 
-}
+		let body = '';
+		for ( let k = 0; k < GROUP; k ++ ) body += /* wgsl */`
+			{
+				let s = ( jit + ${ g * GROUP + k }.0 ) / ${ STEPS }.0;
+				let u = s * s * 0.85 + s * 0.15; // denser near the contact
+				let q = q0 + qd * u;
+				let iw = 1.0 / q.w;
+				let uv = q.xy * iw * vec2f( 0.5, -0.5 ) + 0.5;
+				let d = textureLoad( contactDepth, vec2i( min( clamp( uv, vec2f( 0.0 ), vec2f( 1.0 ) ) * texSize, texSize - 1.0 ) ), 0 );
+				let k2 = frame.near * iw * iw;
+				let diff = d - q.z * iw; // > 0: the depth buffer is in front of the ray
+				let thick = bias + 0.06 + u * len * 0.3;
+				let occ = diff > bias * k2 && diff < thick * k2 && uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0;
+				hit = min( hit, select( 2.0, u, occ ) );
+			}`;
+		const go = g === 0 ? 'hit > 1.0' : `hit > 1.0 && w0 < ${ NEAR_DIST }.0`;
+		loop.push( `\t\tif ( ${ go } ) {${ body }\n\t\t}` );
 
-// 0 (occluded) .. 1 visibility node for the key light, or null where it does not apply
-export function contactShadow( builder, lightColor ) {
+	}
 
-	const mat = builder.material, obj = builder.object;
-	const depth = ContactShadows.depthTexture;
-	if ( ! depth || ! mat || mat.isWaterMaterial || mat.contactShadows === false ) return null;
-	// late (transparent) pass: last frame's depth is this frame's there
-	if ( obj && obj.layers && ( obj.layers.mask & 1 ) === 0 ) return null;
-	for ( let o = obj; o; o = o.parent ) if ( ContactShadows.skipRoots.has( o ) ) return null;
+	ContactShadows.module = new ShaderModule( {
+		name: 'hook-contactShadow',
+		deps: [ commonModule ],
+		uniforms: params,
+		uniformName: 'contactShadowParams',
+		bindings: { contactDepth: { texture: () => ContactShadows.depthTexture } },
+		code: /* wgsl */`
+// 0 (occluded) .. 1 visibility of the key light
+fn hookContactShadow( P: vec3f, N: vec3f ) -> f32 {
+#if IS_WATER || NO_CONTACT_SHADOWS || PASS_LATE || PASS_DEPTH || PASS_COLOR
+	return 1.0;
+#else
+	let L = frame.sunDir;
+	let fwd = -vec3f( frame.view[ 0 ][ 2 ], frame.view[ 1 ][ 2 ], frame.view[ 2 ][ 2 ] );
+	let w0 = dot( P - frame.cameraPos, fwd );
+	// depth change per pixel on this surface (before any branch)
+	let slope = max( abs( dpdx( w0 ) ), abs( dpdy( w0 ) ) );
+	var vis = 1.0;
+	let lit = dot( frame.sunColor, frame.sunColor ) > 1e-8 && dot( N, L ) > 0.02;
+	if ( contactShadowParams.strength > 0.0 && w0 < ${ MAX_DIST }.0 && lit && P.y > frame.seaLevel - 0.3 ) {
 
-	const P = positionWorld;
-	const L = G.sunDir;
-	const w0 = positionView.z.negate();
-	// depth change per pixel on this surface (uniform control flow: before any branch)
-	const slope = max( abs( dFdx( w0 ) ), abs( dFdy( w0 ) ) ).toVar();
-	const vis = float( 1 ).toVar();
-	const lit = dot( lightColor, lightColor ).greaterThan( 1e-8 ).and( dot( normalWorld, L ).greaterThan( 0.02 ) );
-	If( ContactShadows.strength.greaterThan( 0 ).and( w0.lessThan( MAX_DIST ) ).and( lit ).and( P.y.greaterThan( G.seaLevel.sub( 0.3 ) ) ), () => {
-
-		const len = smoothstep( 2, 30, w0 ).mul( 0.7 ).add( 0.3 );
-		const q0 = prevViewProj.mul( vec4( P, 1 ) ).toVar();
-		const qd = prevViewProj.mul( vec4( L.mul( len ), 0 ) ).toVar();
-		const bias = slope.mul( 2.0 ).add( w0.mul( 0.002 ) ).add( 0.01 ).toVar();
-		const jit = fract( interleavedGradientNoise( screenCoordinate.xy ).add( float( frameId ).mul( 0.618034 ) ) ).toVar();
-		const hit = float( 2 ).toVar(); // ray parameter of the first occluded sample (> 1: none)
+		let texSize = vec2f( textureDimensions( contactDepth ) );
+		let len = smoothstep( 2.0, 30.0, w0 ) * 0.7 + 0.3;
+		let q0 = frame.prevViewProjNoJitter * vec4f( P, 1.0 );
+		let qd = frame.prevViewProjNoJitter * vec4f( L * len, 0.0 );
+		let bias = slope * 2.0 + w0 * 0.002 + 0.01;
+		// screen coordinate of P (the hook has no fragment coordinate)
+		let cc = frame.viewProj * vec4f( P, 1.0 );
+		let pix = floor( ( cc.xy / cc.w * vec2f( 0.5, -0.5 ) + 0.5 ) * frame.resolution );
+		let jit = fract( interleavedGradientNoise( pix ) + f32( frame.frameIndex ) * 0.618034 );
+		var hit = 2.0; // ray parameter of the first occluded sample (> 1: none)
 		// groups of independent loads (latency hiding), early exit between groups; far away the ray
 		// covers few pixels and the first group is enough. Depths compare in reversed-Z device depth
 		// (d ~ near / w): the bias and thickness in metres scale by near / w^2.
-		for ( let g = 0; g < GROUPS; g ++ ) {
-
-			const go = g === 0 ? hit.greaterThan( 1 ) : hit.greaterThan( 1 ).and( w0.lessThan( NEAR_DIST ) );
-			If( go, () => {
-
-				for ( let k = 0; k < GROUP; k ++ ) {
-
-					const s = jit.add( g * GROUP + k ).div( STEPS );
-					const u = s.mul( s ).mul( 0.85 ).add( s.mul( 0.15 ) ); // denser near the contact
-					const q = q0.add( qd.mul( u ) );
-					const iw = float( 1 ).div( q.w );
-					const uv = q.xy.mul( iw ).mul( vec2( 0.5, - 0.5 ) ).add( 0.5 );
-					const d = textureLoad( depth, ivec2( uv.clamp( 0, 1 ).mul( texSize ).min( texSize.sub( 1 ) ) ) ).x;
-					const k2 = cameraNear.mul( iw ).mul( iw );
-					const diff = d.sub( q.z.mul( iw ) ); // > 0: the depth buffer is in front of the ray
-					const thick = bias.add( 0.06 ).add( u.mul( len ).mul( 0.3 ) );
-					const occ = diff.greaterThan( bias.mul( k2 ) ).and( diff.lessThan( thick.mul( k2 ) ) ).and( uv.x.greaterThan( 0 ) ).and( uv.x.lessThan( 1 ) ).and( uv.y.greaterThan( 0 ) ).and( uv.y.lessThan( 1 ) );
-					hit.assign( min( hit, select( occ, u, float( 2 ) ) ) );
-
-				}
-
-			} );
-
-		}
+${ loop.join( '\n' ) }
 
 		// the sun's penumbra is millimetres at this range: a hard shadow, faded out toward the end
 		// of the ray (no cut-off line at its length)
-		vis.assign( select( hit.lessThanEqual( 1 ), smoothstep( 0.55, 1.0, hit ), float( 1 ) ) );
-		vis.assign( vis.oneMinus().mul( ContactShadows.strength ).mul( smoothstep( MAX_DIST, MAX_DIST - 8, w0 ) ).oneMinus() );
+		vis = select( 1.0, smoothstep( 0.55, 1.0, hit ), hit <= 1.0 );
+		vis = 1.0 - ( 1.0 - vis ) * contactShadowParams.strength * smoothstep( ${ MAX_DIST }.0, ${ MAX_DIST - 8 }.0, w0 );
 
-	} );
+	}
 	return vis;
+#endif
+}
+`,
+	} );
+	SceneLighting.set( 'contactShadow', ContactShadows.module );
 
 }

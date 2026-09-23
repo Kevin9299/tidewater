@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 
 // Bird species and their shared-topology template.
 //

@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Vector3 } from '../engine/math/index.js';
 
 // Named review cameras used to check every change from the same set of angles.
 // window.__view( name ) jumps there; window.__views lists them.
@@ -36,7 +36,7 @@ export function installDebugViews( app ) {
 		if ( ! v ) return 'unknown view';
 		if ( v.time !== undefined ) app.settings.timeOfDay = v.time;
 		if ( app.setFreeCam ) app.setFreeCam( true );
-		app.fly.setPose( new THREE.Vector3( ...v.p ), v.yaw, v.pitch );
+		app.fly.setPose( new Vector3( ...v.p ), v.yaw, v.pitch );
 		app.fly.velocity.set( 0, 0, 0 );
 		return name;
 

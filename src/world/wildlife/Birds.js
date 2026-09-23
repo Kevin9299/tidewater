@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 import { G } from '../../core/Globals.js';
 import { WORLD } from '../WorldLayout.js';
 import { SPRAY } from '../../fx/Spray.js';

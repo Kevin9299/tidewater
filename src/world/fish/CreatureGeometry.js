@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 import { PART } from './FishGeometry.js';
 
 // Rays and the green sea turtle, in the fish frame (nose +z, back +y, total length 1 from the

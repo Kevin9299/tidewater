@@ -1,4 +1,5 @@
-import * as THREE from 'three/webgpu';
+import { Texture } from '../../engine/gpu/Texture.js';
+import { generateMipmaps } from '../../engine/gpu/Mipmaps.js';
 import { hash2 } from './TerrainNoise.js';
 
 // Tileable procedural detail heights shared by the terrain and rock materials (RGBA8, mipmapped,
@@ -216,15 +217,14 @@ export function getDetailTexture() {
 
 	}
 
-	const tex = new THREE.DataTexture( data, S, S, THREE.RGBAFormat, THREE.UnsignedByteType );
-	tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-	tex.magFilter = THREE.LinearFilter;
-	tex.minFilter = THREE.LinearMipmapLinearFilter;
-	tex.generateMipmaps = true;
-	tex.anisotropy = 4; // grazing views of the beach; 8 costs ~0.5 ms more at 1440p
-	tex.colorSpace = THREE.NoColorSpace;
-	tex.name = 'terrainDetail';
-	tex.needsUpdate = true;
+	// repeat wrapping + trilinear / anisotropic filtering come from the shared samplers
+	// (smpAniso4Repeat: grazing views of the beach, anisotropy 4 as before; smpLinearRepeat elsewhere)
+	const tex = new Texture( { label: 'terrainDetail', width: S, height: S, format: 'rgba8unorm', mips: true, usage: [ 'sample', 'copyDst' ], sampler: 'aniso4Repeat', data } );
+	tex.getGPU();
+	generateMipmaps( tex );
+	tex.userData = {};
+	// CPU copy for placement code sampling the same fbm (vegetation Scatter.js, three's DataTexture.image)
+	tex.image = { width: S, height: S, data };
 	tex.userData.ms = performance.now() - t0;
 	cached = tex;
 	return tex;

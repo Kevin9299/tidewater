@@ -1,9 +1,12 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../engine/index.js';
 import { G } from '../core/Globals.js';
 import { VegSite, scatterVegetation, buildGrassMask, RULES } from './vegetation/Scatter.js';
 import { VegType, LodLevel } from './vegetation/InstanceLOD.js';
 import { GrassField } from './vegetation/GrassField.js';
-import { uCamPos, uGustOffset, variantOf, UNDER_FERN_FADE } from './vegetation/VegNodes.js';
+import { uCamPos, uGustOffset, UNDER_FERN_FADE } from './vegetation/VegNodes.js';
+
+// WGSL variant index of an instance (VegNodes.vegVariantOf)
+const variantOf = ( seed, isShrub ) => `vegVariantOf( ${ seed }, ${ isShrub } )`;
 import {
 	buildPalmNear, buildPalmFar, buildUnderstory, buildCanopyNear, buildTreeNear, buildShrubNear,
 	lobeVariantGeometry, LOBE_TABLE, TREE_VARIANTS, SHRUB_VARIANTS, UNDERSTORY,
@@ -26,7 +29,7 @@ import { LeafAtlas } from './vegetation/LeafTextures.js';
 //
 // Options: { scene, terrain, village? } - with a village (Village.js) its building footprints
 // and boardwalks are kept clear; otherwise a default boardwalk polyline is used.
-// The impostor atlases are baked on the first update() after the first render (the renderer is
+// The impostor atlases are baked on the first update() (recorded into the frame encoder; three.js
 // picked up from the meshes' onBeforeRender); until then far trees are not drawn.
 
 // Building footprints + boardwalk polylines from a Village instance (duck-typed).
@@ -125,11 +128,12 @@ export class Vegetation {
 			{ variants: treeVariants, ...axisSphere( treeGeo ) },
 			{ variants: shrubVariants, ...axisSphere( shrubGeo ) },
 		], createCanopyBakeMaterials( this.leafAtlas ) );
+		// (WGSL expressions: see ImpostorAtlas.createMaterial)
 		const impostorMat = this.atlas.createMaterial( {
-			isGroup1: ( iDat ) => iDat.y.lessThan( 0 ),
+			isGroup1: ( iDat ) => `${ iDat }.y < 0.0`,
 			variantOf: ( seed, isShrub ) => variantOf( seed, isShrub ),
-			colorOf: impostorColor,
-			nearDist: ( isShrub ) => isShrub.select( uCanopyNear.y, uCanopyNear.x ),
+			colorOf: ( { seed, cr, leaf, bright, isGroup1 } ) => `${ impostorColor }( ${ seed }, ${ cr }, ${ leaf }, ${ bright }, ${ isGroup1 } )`,
+			nearDist: ( isShrub ) => `select( vegParams.canopyNear.x, vegParams.canopyNear.y, ${ isShrub } )`,
 		} );
 		this.materials = [ leafMat, canopyMat, impostorMat ];
 
@@ -176,13 +180,9 @@ export class Vegetation {
 		for ( const t of [ this.palms, this.understory, this.canopy ] ) for ( const m of t.meshes ) m.renderOrder = 1;
 		for ( const m of this.canopy.far.meshes ) m.renderOrder = 2;
 
-		// the renderer is needed for the impostor bake: pick it up from the first render
-		this.renderer = null;
-		for ( const m of this.canopy.meshes ) m.onBeforeRender = ( r ) => {
-
-			if ( ! this.renderer ) this.renderer = r;
-
-		};
+		// the impostor bake records into the frame encoder on the first update (the engine needs no
+		// renderer handle; the atlas bakes with its own MeshRenderer)
+		this.renderer = true;
 
 		this.grass = new GrassField( { terrain, mask: grassMask } );
 		for ( const m of this.grass.meshes ) this.group.add( m );
@@ -293,6 +293,7 @@ export class Vegetation {
 		this.atlas.rtA.dispose();
 		this.leafAtlas.rt.dispose();
 		this.atlas.rtB.dispose();
+		this.atlas.depth.destroy();
 		this.grass.dispose();
 
 	}

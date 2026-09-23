@@ -1,5 +1,6 @@
-import * as THREE from 'three/webgpu';
-import { attribute, storage, uniformArray, instanceIndex, uint, float } from 'three/tsl';
+import { BufferGeometry, BufferAttribute, Mesh } from '../../engine/index.js';
+import { StorageBuffer } from '../../engine/gpu/Texture.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
 
 // Many different instanced models in a single render object.
 //
@@ -23,6 +24,25 @@ import { attribute, storage, uniformArray, instanceIndex, uint, float } from 'th
 // the outgoing one keeping the complementary pixels, and the last level fading out at the far
 // culling distance. The main channel's material stays free of discard (hidden surface removal).
 // The fade channel casts no shadows (the main channel's shadow proxies do).
+//
+// WGSL port: the batch exposes `batch.module` (a ShaderModule; add it to the material's modules)
+// with prefix P = batch.prefix (from the name: 'Reef.hard' -> 'reefHard', 'Fish' -> 'fish'):
+//   bindings  P + 'Instances' (array<vec4f>, 4 per instance), P + 'List' / P + 'Base' (array<u32>),
+//             P + 'FadeList' / P + 'FadeBase' (with `fade`)
+//   fn P + 'RecordIndex'( kind: u32, instance: u32 ) -> u32
+//   fn P + 'Record'( index: u32, k: u32 ) -> vec4f             (k = 0..3)
+//   fn P + 'FadeEntry'( kind: u32, instance: u32 ) -> P + 'FadeInfo'   { index: u32, fade: f32, outgoing: f32 }
+// The JS helpers recordIndex() / record( index ) / fadeEntry() return those calls as WGSL
+// expression strings for a material `vertex` snippet (they read `v.aKind` and `v.instance`;
+// declare `attributes: { aKind: 'f32', aData: 'vec4f' }` on the material).
+
+function prefixOf( name ) {
+
+	const parts = name.split( /[^A-Za-z0-9]+/ ).filter( Boolean );
+	return parts.map( ( p, i ) => i === 0 ? p[ 0 ].toLowerCase() + p.slice( 1 ) : p[ 0 ].toUpperCase() + p.slice( 1 ) ).join( '' );
+
+}
+
 export class ReefBatch {
 
 	constructor( name, kinds, { maxInstances, dynamic = false, fade = false } ) {
@@ -31,6 +51,8 @@ export class ReefBatch {
 		this.kinds = kinds;
 		const K = kinds.length;
 		this.maxInstances = maxInstances;
+		this.dynamic = dynamic;
+		const P = this.prefix = prefixOf( name );
 
 		// ---- merged geometry
 		let nv = 0, ni = 0;
@@ -66,33 +88,34 @@ export class ReefBatch {
 
 		} );
 
-		const geometry = new THREE.BufferGeometry();
-		geometry.setAttribute( 'position', new THREE.BufferAttribute( pos, 3 ) );
-		geometry.setAttribute( 'normal', new THREE.BufferAttribute( nrm, 3 ) );
-		geometry.setAttribute( 'aData', new THREE.BufferAttribute( dat, 4 ) );
-		geometry.setAttribute( 'aKind', new THREE.BufferAttribute( kid, 1 ) );
-		geometry.setIndex( new THREE.BufferAttribute( idx, 1 ) );
+		const geometry = new BufferGeometry();
+		geometry.setAttribute( 'position', new BufferAttribute( pos, 3 ) );
+		geometry.setAttribute( 'normal', new BufferAttribute( nrm, 3 ) );
+		geometry.setAttribute( 'aData', new BufferAttribute( dat, 4 ) );
+		geometry.setAttribute( 'aKind', new BufferAttribute( kid, 1 ) );
+		geometry.setIndex( new BufferAttribute( idx, 1 ) );
 		this.vertexCount = nv;
 
 		// ---- per-instance data (owner writes this.data, then calls upload())
 		this.data = new Float32Array( maxInstances * 16 );
-		this.dataAttr = new THREE.StorageBufferAttribute( this.data, 4 );
-		if ( dynamic ) this.dataAttr.setUsage( THREE.DynamicDrawUsage );
-		this.instances = storage( this.dataAttr, 'vec4', maxInstances * 4 ).toReadOnly();
+		this.instanceBuffer = new StorageBuffer( { label: name + '.instances', count: maxInstances * 4, type: 'vec4f' } );
+		// three-style handle: `batch.dataAttr.needsUpdate = true` uploads the data
+		const self = this;
+		this.dataAttr = { set needsUpdate( v ) { if ( v ) self.upload(); } };
 
 		// ---- visible instance ids, per-kind bases and the indirect commands (an instance can be
 		// listed twice: drawn, and as a shadow proxy)
 		const cap = maxInstances * 2;
 		this.list = new Uint32Array( cap );
-		this.listAttr = new THREE.StorageBufferAttribute( this.list, 1 );
-		this.listNode = storage( this.listAttr, 'uint', cap ).toReadOnly();
-		this.base = uniformArray( new Array( K ).fill( 0 ), 'uint' );
+		this.listBuffer = new StorageBuffer( { label: name + '.list', count: cap, type: 'u32' } );
+		this.baseArray = new Uint32Array( Math.max( K, 4 ) );
+		this.baseBuffer = new StorageBuffer( { label: name + '.base', count: this.baseArray.length, type: 'u32' } );
 		this.commands = new Uint32Array( K * 5 );
-		this.indirect = new THREE.IndirectStorageBufferAttribute( this.commands, 5 );
+		this.indirectBuffer = new StorageBuffer( { label: name + '.indirect', count: K * 5, type: 'u32', usage: [ 'indirect' ] } );
 		this.offsetPool = [ [], [] ]; // arrays of indirect offsets by length (no per-frame allocation)
 		this.mainOffsets = [];
 		this.shadowOffsets = [];
-		geometry.setIndirect( this.indirect, this.mainOffsets );
+		geometry.indirect = { buffer: this.indirectBuffer, offsets: this.mainOffsets };
 		this.geometry = geometry;
 
 		// per-frame ( kind, id ) pairs, sorted by kind in commit()
@@ -109,18 +132,27 @@ export class ReefBatch {
 		this.fadeMesh = null;
 		this.fadeOffsets = [];
 		this.fadeInstances = 0;
+		const bindings = {
+			[ P + 'Instances' ]: { storage: this.instanceBuffer, access: 'read' },
+			[ P + 'List' ]: { storage: this.listBuffer, access: 'read' },
+			[ P + 'Base' ]: { storage: this.baseBuffer, access: 'read' },
+		};
+		let code = /* wgsl */`
+fn ${ P }RecordIndex( kind: u32, instance: u32 ) -> u32 { return ${ P }List[ ${ P }Base[ kind ] + instance ]; }
+fn ${ P }Record( index: u32, k: u32 ) -> vec4f { return ${ P }Instances[ index * 4u + k ]; }
+`;
 		if ( fade ) {
 
 			this.fadeList = new Uint32Array( cap );
-			this.fadeListAttr = new THREE.StorageBufferAttribute( this.fadeList, 1 );
-			this.fadeListNode = storage( this.fadeListAttr, 'uint', cap ).toReadOnly();
-			this.fadeBase = uniformArray( new Array( K ).fill( 0 ), 'uint' );
+			this.fadeListBuffer = new StorageBuffer( { label: name + '.fadeList', count: cap, type: 'u32' } );
+			this.fadeBaseArray = new Uint32Array( Math.max( K, 4 ) );
+			this.fadeBaseBuffer = new StorageBuffer( { label: name + '.fadeBase', count: this.fadeBaseArray.length, type: 'u32' } );
 			this.fadeCommands = new Uint32Array( K * 5 );
-			this.fadeIndirect = new THREE.IndirectStorageBufferAttribute( this.fadeCommands, 5 );
-			const fg = new THREE.BufferGeometry();
+			this.fadeIndirectBuffer = new StorageBuffer( { label: name + '.fadeIndirect', count: K * 5, type: 'u32', usage: [ 'indirect' ] } );
+			const fg = new BufferGeometry();
 			for ( const k in geometry.attributes ) fg.setAttribute( k, geometry.attributes[ k ] );
 			fg.setIndex( geometry.index );
-			fg.setIndirect( this.fadeIndirect, this.fadeOffsets );
+			fg.indirect = { buffer: this.fadeIndirectBuffer, offsets: this.fadeOffsets };
 			this.fadeGeometry = fg;
 			this.fadeKind = new Uint16Array( cap );
 			this.fadeVal = new Uint32Array( cap );
@@ -128,18 +160,28 @@ export class ReefBatch {
 			this.fadeCounts = new Uint32Array( K );
 			this.fadeCursor = new Uint32Array( K );
 			this.fadePool = [];
+			bindings[ P + 'FadeList' ] = { storage: this.fadeListBuffer, access: 'read' };
+			bindings[ P + 'FadeBase' ] = { storage: this.fadeBaseBuffer, access: 'read' };
+			code += /* wgsl */`
+struct ${ P }FadeInfo { index: u32, fade: f32, outgoing: f32 };
+// fade channel: the instance record index, its fade (0..1) and whether this draw is the
+// outgoing level (1) or the incoming one (0)
+fn ${ P }FadeEntry( kind: u32, instance: u32 ) -> ${ P }FadeInfo {
+	let e = ${ P }FadeList[ ${ P }FadeBase[ kind ] + instance ];
+	return ${ P }FadeInfo( e & 0xffffffu, f32( ( e >> 24u ) & 127u ) / 127.0, f32( e >> 31u ) );
+}
+`;
 
 		}
 
+		this.module = new ShaderModule( { name: 'batch-' + P, bindings, code } );
+
 	}
 
-	// TSL, fade channel: the instance record index, its fade (0..1) and whether this draw is the
-	// outgoing level (1) or the incoming one (0)
+	// WGSL (vertex snippet), fade channel: expression of type P + 'FadeInfo' (index, fade, outgoing)
 	fadeEntry() {
 
-		const kind = uint( attribute( 'aKind', 'float' ) );
-		const e = this.fadeListNode.element( this.fadeBase.element( kind ).add( instanceIndex ) );
-		return { index: e.bitAnd( 0xffffff ), fade: float( e.shiftRight( 24 ).bitAnd( 127 ) ).div( 127 ), outgoing: float( e.shiftRight( 31 ) ) };
+		return `${ this.prefix }FadeEntry( u32( v.aKind ), v.instance )`;
 
 	}
 
@@ -156,7 +198,7 @@ export class ReefBatch {
 
 	createFadeMesh( material ) {
 
-		const mesh = new THREE.Mesh( this.fadeGeometry, material );
+		const mesh = new Mesh( this.fadeGeometry, material );
 		mesh.name = this.name + '.fade';
 		mesh.frustumCulled = false;
 		mesh.castShadow = false;
@@ -165,7 +207,7 @@ export class ReefBatch {
 		const g = this.fadeGeometry;
 		mesh.onBeforeRender = () => {
 
-			g.indirectOffset = this.fadeOffsets;
+			g.indirect.offsets = this.fadeOffsets;
 
 		};
 
@@ -174,25 +216,22 @@ export class ReefBatch {
 
 	}
 
-	// TSL: instance record index for the current vertex, and its 4 data vec4s
+	// WGSL (vertex snippet): instance record index for the current vertex, and its 4 data vec4s
 	recordIndex() {
 
-		const kind = uint( attribute( 'aKind', 'float' ) );
-		return this.listNode.element( this.base.element( kind ).add( instanceIndex ) );
+		return `${ this.prefix }RecordIndex( u32( v.aKind ), v.instance )`;
 
 	}
 
 	record( index ) {
 
-		const i = index.mul( 4 );
-		const d = this.instances;
-		return [ d.element( i ), d.element( i.add( 1 ) ), d.element( i.add( 2 ) ), d.element( i.add( 3 ) ) ];
+		return [ 0, 1, 2, 3 ].map( ( k ) => `${ this.prefix }Record( ${ index }, ${ k }u )` );
 
 	}
 
 	createMesh( material, { castShadow = false, receiveShadow = true } = {} ) {
 
-		const mesh = new THREE.Mesh( this.geometry, material );
+		const mesh = new Mesh( this.geometry, material );
 		mesh.name = this.name;
 		mesh.frustumCulled = false;
 		mesh.castShadow = castShadow;
@@ -201,7 +240,9 @@ export class ReefBatch {
 		const geometry = this.geometry;
 		mesh.onBeforeRender = ( renderer, scene, camera ) => {
 
-			geometry.indirectOffset = camera.isOrthographicCamera ? this.shadowOffsets : this.mainOffsets;
+			// the engine's shadow cascade cameras are standard-Z (reversedDepth false)
+			const shadowCam = camera && ( camera.isOrthographicCamera || camera.reversedDepth === false );
+			geometry.indirect.offsets = shadowCam ? this.shadowOffsets : this.mainOffsets;
 
 		};
 
@@ -212,7 +253,7 @@ export class ReefBatch {
 
 	upload() {
 
-		this.dataAttr.needsUpdate = true;
+		this.instanceBuffer.write( this.data );
 
 	}
 
@@ -250,7 +291,7 @@ export class ReefBatch {
 	commit() {
 
 		const K = this.kinds.length;
-		const cmd = this.commands, base = this.base.array, counts = this.counts, cursor = this.cursor;
+		const cmd = this.commands, base = this.baseArray, counts = this.counts, cursor = this.cursor;
 		let n = 0, nMain = 0, nShadow = 0, tris = 0, shadowTris = 0;
 		for ( let k = 0; k < K; k ++ ) {
 
@@ -302,21 +343,21 @@ export class ReefBatch {
 
 		this.mainOffsets = main;
 		this.shadowOffsets = shadow;
+		this.geometry.indirect.offsets = main;
 		if ( this.fadeList ) this.commitFade();
 		this.visibleInstances = n;
 		this.visibleTriangles = tris;
 		this.shadowTriangles = shadowTris;
-		this.listAttr.clearUpdateRanges();
-		this.listAttr.addUpdateRange( 0, Math.max( n, 1 ) );
-		this.listAttr.needsUpdate = true;
-		this.indirect.needsUpdate = true;
+		if ( n > 0 ) this.listBuffer.write( list.subarray( 0, n ) );
+		this.baseBuffer.write( base );
+		this.indirectBuffer.write( cmd );
 
 	}
 
 	commitFade() {
 
 		const K = this.kinds.length;
-		const cmd = this.fadeCommands, base = this.fadeBase.array, counts = this.fadeCounts, cursor = this.fadeCursor;
+		const cmd = this.fadeCommands, base = this.fadeBaseArray, counts = this.fadeCounts, cursor = this.fadeCursor;
 		let n = 0, used = 0;
 		for ( let k = 0; k < K; k ++ ) {
 
@@ -347,12 +388,12 @@ export class ReefBatch {
 		}
 
 		this.fadeOffsets = offs;
+		this.fadeGeometry.indirect.offsets = offs;
 		this.fadeInstances = n;
 		this.visibleTriangles += tris;
-		this.fadeListAttr.clearUpdateRanges();
-		this.fadeListAttr.addUpdateRange( 0, Math.max( n, 1 ) );
-		this.fadeListAttr.needsUpdate = true;
-		this.fadeIndirect.needsUpdate = true;
+		if ( n > 0 ) this.fadeListBuffer.write( list.subarray( 0, n ) );
+		this.fadeBaseBuffer.write( base );
+		this.fadeIndirectBuffer.write( cmd );
 		if ( this.fadeMesh ) this.fadeMesh.visible = used > 0;
 
 	}
@@ -360,6 +401,8 @@ export class ReefBatch {
 	dispose() {
 
 		this.geometry.dispose();
+		if ( this.fadeGeometry ) this.fadeGeometry.dispose();
+		for ( const b of [ this.instanceBuffer, this.listBuffer, this.baseBuffer, this.indirectBuffer, this.fadeListBuffer, this.fadeBaseBuffer, this.fadeIndirectBuffer ] ) if ( b ) b.destroy();
 		if ( this.mesh ) this.mesh.removeFromParent();
 
 	}

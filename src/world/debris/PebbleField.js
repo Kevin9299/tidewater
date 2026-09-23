@@ -1,14 +1,10 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, float, vec2, vec3, vec4, attribute, texture, varyingProperty, normalLocal, normalWorldGeometry, positionWorld,
-	cameraPosition, mix, smoothstep, clamp, max, sin, cos, fract, step, select, length, normalize, dot,
-	transformNormalToView, saturate,
-} from 'three/tsl';
+import { BufferGeometry, Float32BufferAttribute, Uint16BufferAttribute, InstancedBufferAttribute, Mesh, Frustum, Matrix4, Box3, DynamicDrawUsage } from '../../engine/index.js';
+import { Texture } from '../../engine/gpu/Texture.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
+import { commonModule } from '../../engine/render/wgsl/common.js';
 import { standard } from '../../materials/Materials.js';
-import { TerrainLightingModel } from '../Terrain.js';
-import { srgb, perturbNormal, triWeights } from '../terrain/TerrainShading.js';
-import { staticVelocityMRT } from '../../post/CameraVelocity.js';
-import { stoneSurface } from './NatureMaterial.js';
+import { srgb, terrainShadingModule } from '../terrain/TerrainShading.js';
+import { stoneSurfaceModule } from './NatureMaterial.js';
 import { stonePart } from './DebrisShapes.js';
 
 // Camera-following ground clutter: pebbles, cobbles and shell / coral grit on the beaches,
@@ -151,16 +147,19 @@ function buildPatch() {
 
 	}
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-	g.setAttribute( 'normal', new THREE.Float32BufferAttribute( nor, 3 ) );
-	g.setAttribute( 'aSlot', new THREE.Float32BufferAttribute( slot, 4 ) );
-	g.setIndex( new THREE.Uint16BufferAttribute( idx, 1 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+	g.setAttribute( 'normal', new Float32BufferAttribute( nor, 3 ) );
+	g.setAttribute( 'aSlot', new Float32BufferAttribute( slot, 4 ) );
+	g.setIndex( new Uint16BufferAttribute( idx, 1 ) );
 	return g;
 
 }
 
-const hash12 = ( p ) => fract( sin( dot( p, vec2( 127.1, 311.7 ) ) ).mul( 43758.5453 ) );
+const pebbleModule = new ShaderModule( {
+	name: 'debrisPebble',
+	code: 'fn pebHash12( p: vec2f ) -> f32 { return fract( sin( dot( p, vec2f( 127.1, 311.7 ) ) ) * 43758.5453 ); }',
+} );
 
 export class PebbleField {
 
@@ -170,12 +169,8 @@ export class PebbleField {
 		this.terrain = terrain;
 		this.gpu = gpu;
 		const T = terrain;
-		this.maskTex = new THREE.DataTexture( mask.data, mask.res, mask.res, THREE.RGBAFormat, THREE.UnsignedByteType );
-		this.maskTex.magFilter = this.maskTex.minFilter = THREE.LinearFilter;
-		this.maskTex.generateMipmaps = false;
-		this.maskTex.colorSpace = THREE.NoColorSpace;
-		this.maskTex.name = 'debrisPebbleMask';
-		this.maskTex.needsUpdate = true;
+		// RGBA8, bilinear, clamp to edge (smpLinearClamp), linear data, no mips
+		this.maskTex = new Texture( { label: 'debrisPebbleMask', width: mask.res, height: mask.res, format: 'rgba8unorm', usage: [ 'sample', 'copyDst' ], data: mask.data } );
 
 		// occupied cells + height range
 		const n = Math.ceil( T.size / PCELL );
@@ -227,133 +222,130 @@ export class PebbleField {
 		const geometry = buildPatch();
 		this.patchTris = geometry.index.count / 3;
 		this.arr = new Float32Array( MAX_CELLS * 4 );
-		this.attr = new THREE.InstancedBufferAttribute( this.arr, 4 );
-		this.attr.setUsage( THREE.DynamicDrawUsage );
+		this.attr = new InstancedBufferAttribute( this.arr, 4 );
+		this.attr.setUsage( DynamicDrawUsage );
 		geometry.setAttribute( 'iCell', this.attr );
 		geometry.instanceCount = 0;
 		this.geometry = geometry;
 		this.material = this._createMaterial();
-		this.mesh = new THREE.Mesh( geometry, this.material );
+		this.mesh = new Mesh( geometry, this.material );
 		this.mesh.name = 'debris-pebbles';
 		this.mesh.frustumCulled = false;
 		this.mesh.castShadow = false;
 		this.mesh.receiveShadow = true;
 		this.mesh.matrixAutoUpdate = false;
+		this.mesh.staticVelocity = true;
 		this.count = 0;
 
-		this._frustum = new THREE.Frustum();
-		this._mat = new THREE.Matrix4();
-		this._box = new THREE.Box3();
+		this._frustum = new Frustum();
+		this._mat = new Matrix4();
+		this._box = new Box3();
 		this._last = new Float64Array( 8 ).fill( NaN );
 
 	}
 
 	_createMaterial() {
 
-		const T = this.terrain, gpu = this.gpu;
-		const mTex = texture( this.maskTex );
-		const det = gpu.detailTexture;
-		const vPeb = varyingProperty( 'vec4', 'vPebble' ); // type, palette, seed, radius
+		const gpu = this.gpu;
+		const f = ( x ) => Number( x ).toFixed( 1 );
+		// (the mask covers the terrain domain: terrainUvOf)
 
-		const mat = standard( { roughness: 0.8, metalness: 0 } );
-		mat.name = 'DebrisPebbles';
-		mat.mrtNode = staticVelocityMRT;
-		mat.underwaterLighting = 'lite';
-		mat.setupLightingModel = () => new TerrainLightingModel( mat, gpu.sunShadowAt( positionWorld ) );
-
-		mat.positionNode = Fn( () => {
-
-			const cell = attribute( 'iCell', 'vec4' ).xy;
-			const slot = attribute( 'aSlot', 'vec4' );
-			const P = attribute( 'position', 'vec3' );
-			const N = attribute( 'normal', 'vec3' );
-			const xz = cell.add( slot.xy );
-			const m = mTex.sample( xz.sub( T.origin ).div( T.size ) ).level( 0 );
-			const type = slot.w;
-			const isSmall = type.lessThan( 0.5 );
-			const isCob = type.greaterThan( 0.5 ).and( type.lessThan( 1.5 ) );
-			const isChip = type.greaterThan( 1.5 );
-			const dens = select( isSmall, m.x, select( isCob, m.y, m.z ) );
-			const h1 = hash12( xz.mul( 1.37 ).add( 0.51 ) );
-			const h2 = hash12( xz.mul( 2.11 ).add( 7.3 ) );
-			const h3 = hash12( xz.mul( 3.7 ).add( 1.1 ) );
-			const h4 = hash12( xz.mul( 5.3 ).add( 2.9 ) );
-			const h5 = hash12( xz.mul( 8.9 ).add( 4.7 ) );
-			const present = step( h1, dens );
-			const d = length( xz.sub( cameraPosition.xz ) );
-			const fade = float( 1 ).sub( smoothstep( select( isCob, float( FADE_COBBLE[ 0 ] ), float( FADE_SMALL[ 0 ] ) ), select( isCob, float( FADE_COBBLE[ 1 ] ), float( FADE_SMALL[ 1 ] ) ), d.add( h4.mul( 2.5 ) ) ) );
-			// size: denser patches have more but slightly smaller stones
-			const r = select( isSmall, mix( 0.007, 0.024, h2.mul( h2 ) ), select( isCob, mix( 0.03, 0.09, h2.mul( h2 ) ), mix( 0.008, 0.022, h2 ) ) )
-				.mul( float( 1.15 ).sub( dens.mul( 0.3 ) ) );
-			const sc = vec3( r.mul( mix( 1.0, 1.55, h3 ) ), r.mul( select( isChip, float( 0.28 ), mix( 0.42, 0.8, h4 ) ) ), r );
-			const k = present.mul( fade );
-			// tilt about the local x axis (the stones don't all lie flat), then yaw
-			const tilt = h5.sub( 0.5 ).mul( select( isChip, float( 0.5 ), float( 0.9 ) ) );
-			const ct = cos( tilt ), st = sin( tilt );
-			const q0 = P.mul( sc ).mul( k );
-			const q = vec3( q0.x, q0.y.mul( ct ).sub( q0.z.mul( st ) ), q0.y.mul( st ).add( q0.z.mul( ct ) ) );
-			const yaw = h3.mul( 6.2832 );
-			const c = cos( yaw ), s = sin( yaw );
-			const gy = gpu.heightAt( xz );
-			const lift = sc.y.mul( select( isChip, float( 0.35 ), float( 0.15 ) ) ).mul( k );
-			const n0 = N.div( sc );
-			const nl = vec3( n0.x, n0.y.mul( ct ).sub( n0.z.mul( st ) ), n0.y.mul( st ).add( n0.z.mul( ct ) ) );
-			normalLocal.assign( normalize( vec3( nl.x.mul( c ).add( nl.z.mul( s ) ), nl.y, nl.z.mul( c ).sub( nl.x.mul( s ) ) ) ) );
-			// palette: dark basalt / grey / pale coral limestone in proportions set by the region
-			// (mask alpha: 0 rocky shore .. 1 white coral beach)
-			const dark = mix( 0.72, 0.24, m.w ), grey = mix( 0.26, 0.3, m.w );
-			const pal = select( h4.lessThan( dark ), mix( 0.02, 0.3, h2 ), select( h4.lessThan( dark.add( grey ) ), mix( 0.32, 0.56, h2 ), mix( 0.6, 0.97, h2 ) ) );
-			vPeb.assign( vec4( type, pal, h2.add( h3 ), r ) );
-			return vec3( xz.x.add( q.x.mul( c ) ).add( q.z.mul( s ) ), gy.add( lift ).add( q.y ), xz.y.add( q.z.mul( c ) ).sub( q.x.mul( s ) ) );
-
-		} )();
-
-		const outRough = float( 0.8 ).toVar( 'pebRough' );
-		const outN = vec3( 0, 1, 0 ).toVar( 'pebN' );
-		const outAO = float( 1 ).toVar( 'pebAO' );
-		mat.colorNode = Fn( () => {
-
-			const p = positionWorld;
-			const N = normalWorldGeometry.toVar();
-			const type = vPeb.x, pal = vPeb.y, seed = vPeb.z, r = vPeb.w;
-			const isChip = step( 1.5, type );
-			const tile = clamp( r.mul( 4 ), 0.03, 0.3 );
-			const w = triWeights( N );
-			const A = texture( det, p.zy.div( tile ) ), B = texture( det, p.xz.div( tile ).add( 0.37 ) ), Cc = texture( det, p.xy.div( tile ).add( 0.71 ) );
-			const T3 = A.mul( w.x ).add( B.mul( w.y ) ).add( Cc.mul( w.z ) );
-			const S = stoneSurface( { T: T3, N, pal, style: float( 0 ), seed, tile } );
-			// shell and coral grit: white / cream / pink chips with growth bands
-			const hue = fract( seed.mul( 7.13 ) );
-			let chip = mix( srgb( 0.94, 0.92, 0.88 ), srgb( 0.86, 0.74, 0.56 ), smoothstep( 0.3, 0.45, hue ) );
-			chip = mix( chip, srgb( 0.9, 0.6, 0.56 ), smoothstep( 0.58, 0.66, hue ) );
-			chip = mix( chip, srgb( 0.58, 0.4, 0.28 ), smoothstep( 0.76, 0.82, hue ) );
-			chip = mix( chip, srgb( 0.36, 0.33, 0.4 ), smoothstep( 0.9, 0.95, hue ) );
-			chip = chip.mul( T3.a.sub( 0.5 ).mul( 0.5 ).add( 1 ) ).mul( sin( p.x.add( p.z ).mul( 900 ) ).mul( 0.06 ).add( 0.97 ) );
-			// sea glass among the grit (frosted green / brown / white, glinting) and pumice among the
-			// pebbles (pale, porous)
-			const glass = step( 0.955, fract( seed.mul( 3.71 ) ) ).mul( isChip );
-			const glassC = select( fract( seed.mul( 13.3 ) ).lessThan( 0.45 ), srgb( 0.42, 0.62, 0.45 ), select( fract( seed.mul( 13.3 ) ).lessThan( 0.75 ), srgb( 0.52, 0.34, 0.18 ), srgb( 0.8, 0.84, 0.82 ) ) );
-			chip = mix( chip, glassC, glass );
-			const pumice = step( 0.93, fract( seed.mul( 5.17 ) ) ).mul( float( 1 ).sub( isChip ) );
-			const pumiceC = srgb( 0.66, 0.64, 0.6 ).mul( float( 1 ).sub( smoothstep( 0.55, 0.8, T3.b ).mul( 0.45 ) ) );
-			let col = mix( mix( S.albedo, pumiceC, pumice ), chip, isChip );
-			let rough = mix( mix( S.rough, float( 0.95 ), pumice ), mix( float( 0.5 ), float( 0.12 ), glass ), isChip );
-			// wet near the sea, dusted with sand where they touch the ground
-			const ground = gpu.heightAt( p.xz );
-			const contact = float( 1 ).sub( smoothstep( 0.0, max( r.mul( 0.7 ), 0.006 ), p.y.sub( ground ) ) );
-			const wet = float( 1 ).sub( smoothstep( 0.4, 1.0, p.y ) );
-			col = mix( col, srgb( 0.78, 0.7, 0.56 ), contact.mul( smoothstep( 0.8, 1.6, ground ) ).mul( 0.35 ) );
-			col = col.mul( float( 1 ).sub( wet.mul( 0.45 ) ) );
-			rough = mix( rough, float( 0.22 ), wet.mul( 0.85 ) );
-			outRough.assign( clamp( rough, 0.05, 1 ) );
-			outAO.assign( float( 1 ).sub( contact.mul( 0.5 ) ) );
-			outN.assign( perturbNormal( N, S.hd.mul( float( 1 ).sub( isChip ) ), 1.0 ) );
-			return vec4( col, 1 );
-
-		} )();
-		mat.roughnessNode = outRough;
-		mat.normalNode = transformNormalToView( outN );
-		mat.aoNode = saturate( outAO );
+		const mat = standard( {
+			name: 'DebrisPebbles',
+			roughness: 0.8, metalness: 0,
+			underwaterLighting: 'lite',
+			// the former TerrainLightingModel (heightfield sun shadow on the key light)
+			modules: [ commonModule, terrainShadingModule(), gpu.module, gpu.sunModulationModule, stoneSurfaceModule, pebbleModule ],
+			defines: { MATERIAL_SUN_MODULATION: 1 },
+			textures: { debrisPebbleMask: this.maskTex },
+			attributes: { iCell: 'vec4f', aSlot: 'vec4f' },
+			varyings: { vPebble: 'vec4f' }, // type, palette, seed, radius
+			vertex: /* wgsl */`
+	let cell = v.iCell.xy;
+	let slot = v.aSlot;
+	let P = v.position;
+	let N = v.normal;
+	let xz = cell + slot.xy;
+	let m = textureSampleLevel( debrisPebbleMask, smpLinearClamp, terrainUvOf( xz ), 0.0 );
+	let ptype = slot.w;
+	let isSmall = ptype < 0.5;
+	let isCob = ptype > 0.5 && ptype < 1.5;
+	let isChip = ptype > 1.5;
+	let dens = select( select( m.z, m.y, isCob ), m.x, isSmall );
+	let h1 = pebHash12( xz * 1.37 + 0.51 );
+	let h2 = pebHash12( xz * 2.11 + 7.3 );
+	let h3 = pebHash12( xz * 3.7 + 1.1 );
+	let h4 = pebHash12( xz * 5.3 + 2.9 );
+	let h5 = pebHash12( xz * 8.9 + 4.7 );
+	let present = step( h1, dens );
+	let d = length( xz - frame.cameraPos.xz );
+	let fade = 1.0 - smoothstep( select( ${ f( FADE_SMALL[ 0 ] ) }, ${ f( FADE_COBBLE[ 0 ] ) }, isCob ), select( ${ f( FADE_SMALL[ 1 ] ) }, ${ f( FADE_COBBLE[ 1 ] ) }, isCob ), d + h4 * 2.5 );
+	// size: denser patches have more but slightly smaller stones
+	let r = select( select( mix( 0.008, 0.022, h2 ), mix( 0.03, 0.09, h2 * h2 ), isCob ), mix( 0.007, 0.024, h2 * h2 ), isSmall ) * ( 1.15 - dens * 0.3 );
+	let sc = vec3f( r * mix( 1.0, 1.55, h3 ), r * select( mix( 0.42, 0.8, h4 ), 0.28, isChip ), r );
+	let k = present * fade;
+	// tilt about the local x axis (the stones don't all lie flat), then yaw
+	let tilt = ( h5 - 0.5 ) * select( 0.9, 0.5, isChip );
+	let ct = cos( tilt ); let st = sin( tilt );
+	let q0 = P * sc * k;
+	let q = vec3f( q0.x, q0.y * ct - q0.z * st, q0.y * st + q0.z * ct );
+	let yaw = h3 * 6.2832;
+	let c = cos( yaw ); let s = sin( yaw );
+	let gy = terrainHeightAt( xz );
+	let lift = sc.y * select( 0.15, 0.35, isChip ) * k;
+	let n0 = N / sc;
+	let nl = vec3f( n0.x, n0.y * ct - n0.z * st, n0.y * st + n0.z * ct );
+	v.normal = normalize( vec3f( nl.x * c + nl.z * s, nl.y, nl.z * c - nl.x * s ) );
+	// palette: dark basalt / grey / pale coral limestone in proportions set by the region
+	// (mask alpha: 0 rocky shore .. 1 white coral beach)
+	let dark = mix( 0.72, 0.24, m.w ); let grey = mix( 0.26, 0.3, m.w );
+	let pal = select( select( mix( 0.6, 0.97, h2 ), mix( 0.32, 0.56, h2 ), h4 < dark + grey ), mix( 0.02, 0.3, h2 ), h4 < dark );
+	o.vPebble = vec4f( ptype, pal, h2 + h3, r );
+	v.position = vec3f( xz.x + q.x * c + q.z * s, gy + lift + q.y, xz.y + q.z * c - q.x * s );
+`,
+			surface: /* wgsl */`
+	let p = in.P;
+	let N = in.N;
+	let ptype = in.vs.vPebble.x; let pal = in.vs.vPebble.y; let seed = in.vs.vPebble.z; let r = in.vs.vPebble.w;
+	let isChip = step( 1.5, ptype );
+	let tile = clamp( r * 4.0, 0.03, 0.3 );
+	let w = terrainTriWeights( N );
+	let A = textureSample( terrainDetailTex, smpAniso4Repeat, p.zy / tile );
+	let B = textureSample( terrainDetailTex, smpAniso4Repeat, p.xz / tile + 0.37 );
+	let Cc = textureSample( terrainDetailTex, smpAniso4Repeat, p.xy / tile + 0.71 );
+	let T3 = A * w.x + B * w.y + Cc * w.z;
+	let S = debrisStoneSurface( T3, N, pal, 0.0, seed, tile );
+	// shell and coral grit: white / cream / pink chips with growth bands
+	let hue = fract( seed * 7.13 );
+	var chip = mix( ${ srgb( 0.94, 0.92, 0.88 ) }, ${ srgb( 0.86, 0.74, 0.56 ) }, smoothstep( 0.3, 0.45, hue ) );
+	chip = mix( chip, ${ srgb( 0.9, 0.6, 0.56 ) }, smoothstep( 0.58, 0.66, hue ) );
+	chip = mix( chip, ${ srgb( 0.58, 0.4, 0.28 ) }, smoothstep( 0.76, 0.82, hue ) );
+	chip = mix( chip, ${ srgb( 0.36, 0.33, 0.4 ) }, smoothstep( 0.9, 0.95, hue ) );
+	chip = chip * ( ( T3.a - 0.5 ) * 0.5 + 1.0 ) * ( sin( ( p.x + p.z ) * 900.0 ) * 0.06 + 0.97 );
+	// sea glass among the grit (frosted green / brown / white, glinting) and pumice among the
+	// pebbles (pale, porous)
+	let glass = step( 0.955, fract( seed * 3.71 ) ) * isChip;
+	let gh = fract( seed * 13.3 );
+	let glassC = select( select( ${ srgb( 0.8, 0.84, 0.82 ) }, ${ srgb( 0.52, 0.34, 0.18 ) }, gh < 0.75 ), ${ srgb( 0.42, 0.62, 0.45 ) }, gh < 0.45 );
+	chip = mix( chip, glassC, glass );
+	let pumice = step( 0.93, fract( seed * 5.17 ) ) * ( 1.0 - isChip );
+	let pumiceC = ${ srgb( 0.66, 0.64, 0.6 ) } * ( 1.0 - smoothstep( 0.55, 0.8, T3.b ) * 0.45 );
+	var col = mix( mix( S.albedo, pumiceC, pumice ), chip, isChip );
+	var rough = mix( mix( S.rough, 0.95, pumice ), mix( 0.5, 0.12, glass ), isChip );
+	// wet near the sea, dusted with sand where they touch the ground
+	let ground = terrainHeightAt( p.xz );
+	let contact = 1.0 - smoothstep( 0.0, max( r * 0.7, 0.006 ), p.y - ground );
+	let wet = 1.0 - smoothstep( 0.4, 1.0, p.y );
+	col = mix( col, ${ srgb( 0.78, 0.7, 0.56 ) }, contact * smoothstep( 0.8, 1.6, ground ) * 0.35 );
+	col = col * ( 1.0 - wet * 0.45 );
+	rough = mix( rough, 0.22, wet * 0.85 );
+	s.albedo = col;
+	s.roughness = clamp( rough, 0.05, 1.0 );
+	s.ao = sat( 1.0 - contact * 0.5 );
+	s.normal = terrainPerturbNormal( p, N, S.hd * ( 1.0 - isChip ), 1.0 );
+`,
+		} );
+		// (the TSL version set mat.mrtNode = staticVelocityMRT: the mesh sets `staticVelocity = true`)
 		return mat;
 
 	}
@@ -419,7 +411,7 @@ export class PebbleField {
 
 	dispose() {
 
-		this.maskTex.dispose();
+		this.maskTex.destroy();
 		this.material.dispose();
 		this.geometry.dispose();
 

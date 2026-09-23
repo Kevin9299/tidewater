@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 import { hash2 } from './TerrainNoise.js';
 
 // Procedural rock meshes: an icosphere carved by a handful of random planes (fracture facets),

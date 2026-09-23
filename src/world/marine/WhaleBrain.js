@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 
 // Behaviour of the humpback: a loop through the deep water of the bay mouth and past the reef
 // drop-off (~4.5 min), a surfacing sequence of 3-6 breaths (rise, blow, roll back under) in

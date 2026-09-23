@@ -1,11 +1,12 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, uniform, float, vec2, vec3, vec4, texture, screenUV, rtt, mix, smoothstep, length, dot, max,
-	luminance, pow, select, fract, sin, instancedArray, workgroupArray, workgroupBarrier, localId, textureLoad,
-	textureSize, ivec2, uvec2, int, uint, Loop, If, exp, exp2, log2, clamp, floor, min, abs,
-} from 'three/tsl';
-import { G } from '../core/Globals.js';
-import { ao } from 'three/addons/tsl/display/GTAONode.js';
+import { GPU } from '../engine/gpu/GPU.js';
+import { UniformBlock } from '../engine/gpu/Shader.js';
+import { ComputeKernel } from '../engine/gpu/Compute.js';
+import { RenderTarget, StorageBuffer, Texture } from '../engine/gpu/Texture.js';
+import { FullscreenPass } from '../engine/render/FullscreenPass.js';
+import { FrameUniforms, setFrameCamera } from '../engine/render/Frame.js';
+import { commonModule } from '../engine/render/wgsl/common.js';
+import { MathUtils, Matrix4, Vector2, Vector3 } from '../engine/math/index.js';
+import { GTAO } from './GTAO.js';
 import { TemporalUpscale } from './TemporalUpscale.js';
 import { LensDroplets } from './LensDroplets.js';
 import { LensFlare } from './LensFlare.js';
@@ -17,6 +18,38 @@ import { MotionBlur } from './MotionBlur.js';
 //   -> TAAU (anti-aliasing + upscale to the output resolution)
 //   -> bloom (13-tap downsample / tent upsample chain from half res)
 //   -> grading (saturation, contrast, warmth) + vignette + grain -> ACES (renderOutput)
+//
+// Per frame (App): beginFrame() (internal size, TAAU jitter, the frame camera: setFrameCamera), the
+// scene, flare.kernel.dispatch( 1 ), render() (records the chain, the last pass draws into the canvas
+// texture, or `outputTexture` when set: headless tests), endFrame().
+// Tone mapping: three's ACESFilmicToneMapping with frame.exposure (G.exposure, the app's exposure
+// setting) times the auto exposure, then the sRGB transfer (renderOutput) for the canvas format.
+
+// three's ACES fitted curve (sRGB => XYZ => D65_2_D60 => AP1 => RRT_SAT, RRT + ODT fit,
+// ODT_SAT => XYZ => D60_2_D65 => sRGB), clamped
+const ACES = /* wgsl */`
+fn RRTAndODTFit( v: vec3f ) -> vec3f {
+	let a = v * ( v + 0.0245786 ) - 0.000090537;
+	let b = v * ( 0.983729 * v + 0.4329510 ) + 0.238081;
+	return a / b;
+}
+fn acesFilmicToneMapping( colorIn: vec3f, exposure: f32 ) -> vec3f {
+	let ACESInputMat = transpose( mat3x3f(
+		0.59719, 0.35458, 0.04823,
+		0.07600, 0.90834, 0.01566,
+		0.02840, 0.13383, 0.83777 ) );
+	let ACESOutputMat = transpose( mat3x3f(
+		1.60475, -0.53108, -0.07367,
+		-0.10208, 1.10813, -0.00605,
+		-0.00327, -0.07276, 1.07602 ) );
+	var color = colorIn * exposure / 0.6;
+	color = ACESInputMat * color;
+	color = RRTAndODTFit( color );
+	color = ACESOutputMat * color;
+	return clamp( color, vec3f( 0.0 ), vec3f( 1.0 ) );
+}
+`;
+
 export class PostFX {
 
 	constructor( renderer, { sceneRenderer, camera, underwater, clouds = null, sunDir = null, haze = null } ) {
@@ -24,28 +57,46 @@ export class PostFX {
 		this.renderer = renderer;
 		this.camera = camera;
 		this.sceneRenderer = sceneRenderer;
+		this.underwater = underwater;
 		this.scale = 1;
+		// headless / tests: a Texture to draw into instead of the canvas, and its size
+		this.outputTexture = null;
+		this.outputSize = null;
+		this.outputFormat = GPU.context ? GPU.format : 'rgba8unorm';
 
-		this.params = {
-			aoStrength: uniform( 1.0 ).setName( 'ppAO' ),
-			bloom: uniform( 0.05 ).setName( 'ppBloom' ),
-			vignette: uniform( 0.28 ).setName( 'ppVignette' ),
-			saturation: uniform( 1.06 ).setName( 'ppSat' ),
-			contrast: uniform( 1.04 ).setName( 'ppContrast' ),
-			warmth: uniform( 0.02 ).setName( 'ppWarm' ),
-			grain: uniform( 0.012 ).setName( 'ppGrain' ),
-			sharpen: uniform( 0.45 ).setName( 'ppSharpen' ), // RCAS strength (0 = off, 1 = strong)
-		};
+		this.uniforms = new UniformBlock( 'PostParams', {
+			aoStrength: [ 'f32', 1.0 ],
+			bloom: [ 'f32', 0.05 ],
+			vignette: [ 'f32', 0.28 ],
+			saturation: [ 'f32', 1.06 ],
+			contrast: [ 'f32', 1.04 ],
+			warmth: [ 'f32', 0.02 ],
+			grain: [ 'f32', 0.012 ],
+			sharpen: [ 'f32', 0.45 ], // RCAS strength (0 = off, 1 = strong)
+		}, { label: 'post' } );
+		this.params = this.uniforms.fields;
 
-		const P = this.params;
+		// ---- auto exposure (eye adaptation), metered on the GPU from the 1/16 bloom level
+		this.aeUniforms = new UniformBlock( 'AutoExposureParams', {
+			enabled: [ 'f32', 1 ],
+			refLum: [ 'f32', 0.25 ], // scene average luminance that needs no correction
+			min: [ 'f32', 0.6 ],
+			max: [ 'f32', 6.0 ],
+			up: [ 'f32', 1.6 ], // adaptation rates (1/s): brightening, darkening
+			down: [ 'f32', 1.1 ],
+		}, { label: 'autoExposure' } );
+		// (`ref` is a WGSL keyword: the field is refLum, aliased as autoExposure.ref)
+		this.autoExposure = { ...this.aeUniforms.fields, ref: this.aeUniforms.fields.refLum };
+		this.exposure = new StorageBuffer( { label: 'autoExposure', count: 1, type: 'f32', data: new Float32Array( [ 1 ] ) } );
+
 		const sceneRT = sceneRenderer.sceneRT;
 		const opaque = sceneRenderer.opaqueCopy;
-		const sceneColor = texture( sceneRT.texture );
-		const opaqueDepth = texture( opaque.depthTexture );
-		const finalDepth = texture( sceneRT.depthTexture );
+		this.sceneColor = sceneRT.texture;
+		this.opaqueDepth = opaque.depthTexture;
+		this.finalDepth = sceneRT.depthTexture;
 
 		// ---- ambient occlusion on the opaque depth (normals reconstructed from depth)
-		this.aoPass = ao( opaqueDepth, null, camera );
+		this.aoPass = new GTAO( this.opaqueDepth, camera, { samples: 12 } );
 		this.aoPass.resolutionScale = 0.5;
 		this.aoPass.radius.value = 2.2;
 		this.aoPass.thickness.value = 2.0;
@@ -57,288 +108,422 @@ export class PostFX {
 		// directions over a 5x5 pattern and jitters its steps per pixel and per frame, which only the
 		// temporal resolve averaged out; where it can't accumulate (the rocking helm, fast turns) that
 		// noise flickered
-		const aoBlur = ( src, dx, dy ) => rtt( Fn( () => {
+		this.aoBlurX = new RenderTarget( 1, 1, { colors: [ 'r16float' ], label: 'aoBlurX' } );
+		this.aoBlurY = new RenderTarget( 1, 1, { colors: [ 'r16float' ], label: 'aoBlurY' } );
+		const aoBlur = ( src, dx, dy ) => {
 
-			const size = vec2( src.size() );
-			const dC = opaqueDepth.sample( screenUV ).x;
-			const sum = float( 0 ).toVar(), wSum = float( 0 ).toVar();
-			for ( let k = - 2; k <= 2; k ++ ) {
-
-				const uvK = screenUV.add( vec2( dx * k, dy * k ).div( size ) );
-				const rel = abs( opaqueDepth.sample( uvK ).x.sub( dC ) ).div( max( dC, 1e-7 ) );
-				const w = float( 1 ).div( rel.mul( 40 ).add( 1 ).pow2() );
-				sum.addAssign( src.sample( uvK ).r.mul( w ) );
-				wSum.addAssign( w );
-
-			}
-
-			return vec4( sum.div( wSum ), 0, 0, 1 );
-
-		} )(), null, null, { type: THREE.HalfFloatType, resolutionScale: 0.5 } );
-		this.aoBlurX = aoBlur( this.aoPass.getTextureNode(), 1, 0 );
-		this.aoBlurY = aoBlur( this.aoBlurX, 0, 1 );
-		const aoTex = this.aoBlurY;
-
-		// scene color with AO applied to opaque pixels that aren't behind water
-		const colorAO = ( uv ) => {
-
-			const c = sceneColor.sample( uv ).rgb;
-			const dO = opaqueDepth.sample( uv ).x;
-			const dF = finalDepth.sample( uv ).x;
-			// reversed depth: sky = 0; water in front of the opaque surface has a larger depth value
-			const isSky = dO.lessThan( 1e-7 );
-			const covered = dF.greaterThan( dO.add( 1e-7 ) );
-			// depth-aware upsample of the half-res AO: the 4 nearest AO texels, weighted by how close
-			// their depth is to this pixel's (no dark halos bleeding across depth edges)
-			const aoSize = vec2( aoTex.size() );
-			const pa = uv.mul( aoSize ).sub( 0.5 );
-			const i0 = floor( pa );
-			const fr = pa.sub( i0 );
-			const aSum = float( 0 ).toVar(), wSum = float( 1e-4 ).toVar();
-			for ( const [ ox, oy ] of [ [ 0, 0 ], [ 1, 0 ], [ 0, 1 ], [ 1, 1 ] ] ) {
-
-				const uvT = i0.add( vec2( ox, oy ) ).add( 0.5 ).div( aoSize );
-				const dT = opaqueDepth.sample( uvT ).x;
-				const wBil = ( ox ? fr.x : fr.x.oneMinus() ).mul( oy ? fr.y : fr.y.oneMinus() );
-				// reversed-Z depth ~ near / z, so the relative depth difference ~ |dT - dO| / dO
-				const rel = abs( dT.sub( dO ) ).div( max( dO, 1e-7 ) );
-				const wDepth = float( 1 ).div( rel.mul( 40 ).add( 1 ).pow2() );
-				const wt = wBil.mul( wDepth ).add( 1e-5 );
-				aSum.addAssign( aoTex.sample( uvT ).r.mul( wt ) );
-				wSum.addAssign( wt );
-
-			}
-
-			const a = aSum.div( wSum );
-			// multi-bounce approximation (Jimenez 2016) for a typical outdoor albedo of ~0.35
-			const aMB = max( a, a.mul( 0.382 ).sub( 1.036 ).mul( a ).add( 1.654 ).mul( a ) );
-			// AO only removes ambient light: full effect where the pixel is lit by the sky alone,
-			// a third of it on sunlit surfaces (still grounds objects without dirty halos)
-			const ambientOnly = float( 1 ).sub( smoothstep( 0.12, 0.9, luminance( c ) ) );
-			const k = select( isSky.or( covered ), float( 0 ), P.aoStrength.mul( mix( 0.35, 1.0, ambientOnly ) ) );
-			return vec4( c.mul( mix( float( 1 ), aMB, k ) ), 1 );
+			let taps = '';
+			for ( let k = - 2; k <= 2; k ++ ) taps += /* wgsl */`
+	{
+		let uvK = in.uv + vec2f( ${ dx * k }.0, ${ dy * k }.0 ) / size;
+		let rel = abs( postDepthOpaque( uvK ) - dC ) / max( dC, 1e-7 );
+		let w = 1.0 / pow2( rel * 40.0 + 1.0 );
+		sum += textureSampleLevel( aoSrc, smpLinearClamp, uvK, 0.0 ).r * w;
+		wSum += w;
+	}`;
+			return new FullscreenPass( {
+				label: 'AO blur ' + ( dx ? 'x' : 'y' ),
+				colorFormats: [ 'r16float' ],
+				bindings: { aoSrc: { texture: src }, postOpaqueDepth: { texture: () => this.opaqueDepth } },
+				code: /* wgsl */`
+fn postDepthOpaque( uv: vec2f ) -> f32 {
+	let s = vec2i( textureDimensions( postOpaqueDepth ) );
+	return textureLoad( postOpaqueDepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 );
+}
+fn fragment( in: FSIn ) -> vec4f {
+	let size = vec2f( textureDimensions( aoSrc ) );
+	let dC = postDepthOpaque( in.uv );
+	var sum = 0.0; var wSum = 0.0;
+${ taps }
+	return vec4f( sum / wSum, 0.0, 0.0, 1.0 );
+}
+`,
+			} );
 
 		};
 
+		this._aoBlurXPass = aoBlur( () => this.aoPass.texture, 1, 0 );
+		this._aoBlurYPass = aoBlur( () => this.aoBlurX.texture, 0, 1 );
+
 		// medium at the near clip plane per pixel (the waterline on the lens), then the composite
-		this.medium = rtt( underwater.mediumNode(), null, null, { type: THREE.UnsignedByteType, format: THREE.RedFormat } );
-		underwater.mediumTexture = this.medium;
+		this.medium = new RenderTarget( 1, 1, { colors: [ 'r8unorm' ], label: 'medium' } );
+		underwater.mediumTexture = this.medium.texture;
 		// air: aerial perspective, marine haze and volumetric sun shafts (AirHaze) on the lit scene
 		this.haze = haze;
-		if ( haze ) haze.mediumTexture = this.medium;
-		const sceneSample = haze ? ( uv ) => haze.apply( uv, colorAO( uv ) ) : colorAO;
-		this.beauty = rtt( underwater.node( { sample: sceneSample } ), null, null, { type: THREE.HalfFloatType } );
+		if ( haze ) haze.mediumTexture = this.medium.texture;
+		this.beauty = new RenderTarget( 1, 1, { colors: [ 'rgba16float' ], label: 'beauty' } );
 
 		// ---- temporal anti-aliasing + upscale
-		this.taau = new TemporalUpscale( this.beauty, finalDepth, texture( sceneRenderer.velocityTexture ), camera, sceneRenderer.waterMaskTexture );
-		const resolved = this.taau.getTextureNode();
+		this.taau = new TemporalUpscale( () => this.beauty.texture, this.finalDepth, sceneRenderer.velocityTexture, camera, sceneRenderer.waterMaskTexture );
 
 		// ---- camera + object motion blur on the resolved image (gathered in the final pass, before
 		// bloom and the screen-fixed lens effects)
-		this.motionBlur = new MotionBlur( { velocityTexture: sceneRenderer.velocityTexture, depthTexture: sceneRenderer.sceneRT.depthTexture, color: resolved } );
-
-		// RCAS (AMD FSR1 robust contrast-adaptive sharpening) on the resolved image: TAA converges to a
-		// slightly soft image, RCAS restores the detail without halos (the lobe is limited by local
-		// contrast). Done on a tonemapped proxy of the HDR values and inverted afterwards.
-		const rcas = ( uvIn ) => {
-
-			const size = ivec2( resolved.size() );
-			const pc = ivec2( uvIn.mul( vec2( size ) ) ).clamp( ivec2( 1 ), size.sub( 2 ) ).toVar();
-			const tm = ( c ) => c.div( max( c.r, max( c.g, c.b ) ).add( 1 ) );
-			const e = tm( resolved.load( pc ).rgb ).toVar();
-			const b = tm( resolved.load( pc.add( ivec2( 0, - 1 ) ) ).rgb ), d = tm( resolved.load( pc.add( ivec2( - 1, 0 ) ) ).rgb );
-			const f = tm( resolved.load( pc.add( ivec2( 1, 0 ) ) ).rgb ), h = tm( resolved.load( pc.add( ivec2( 0, 1 ) ) ).rgb );
-			const mn4 = min( min( b, d ), min( f, h ) );
-			const mx4 = max( max( b, d ), max( f, h ) );
-			const hitMin = min( mn4, e ).div( mx4.mul( 4.0 ).add( 1e-5 ) );
-			const hitMax = vec3( 1.0 ).sub( max( mx4, e ) ).div( mn4.mul( 4.0 ).sub( 4.0 ) );
-			const lobeRGB = max( hitMin.negate(), hitMax );
-			const lobe = max( float( - ( 0.25 - 1.0 / 16.0 ) ), min( max( lobeRGB.r, max( lobeRGB.g, lobeRGB.b ) ), float( 0 ) ) ).mul( P.sharpen );
-			const r = b.add( d ).add( f ).add( h ).mul( lobe ).add( e ).div( lobe.mul( 4.0 ).add( 1.0 ) ).max( 0 );
-			// back to HDR (inverse of the max-channel Reinhard)
-			return r.div( max( float( 1 ).sub( max( r.r, max( r.g, r.b ) ) ), 1e-3 ) );
-
-		};
-
-		// ---- bloom
-		const { bloom: bloomTex, half, meter } = this._buildBloom( resolved );
-
-		// ---- auto exposure (eye adaptation), metered on the GPU from the 1/16 bloom level
-		this.autoExposure = {
-			enabled: uniform( 1 ).setName( 'aeOn' ),
-			ref: uniform( 0.25 ).setName( 'aeRef' ), // scene average luminance that needs no correction
-			min: uniform( 0.6 ).setName( 'aeMin' ),
-			max: uniform( 6.0 ).setName( 'aeMax' ),
-			up: uniform( 1.6 ).setName( 'aeUp' ), // adaptation rates (1/s): brightening, darkening
-			down: uniform( 1.1 ).setName( 'aeDown' ),
-		};
-		this.exposure = instancedArray( new Float32Array( [ 1 ] ), 'float' ).setName( 'autoExposure' );
-		this._buildMeter( meter );
-		const exposureMul = this.exposure.element( uint( 0 ) );
+		this.motionBlur = new MotionBlur( { velocityTexture: sceneRenderer.velocityTexture, depthTexture: sceneRT.depthTexture, color: () => this.taau.texture } );
 
 		// ---- sun flare in the lens (screen-fixed, after the temporal resolve; its visibility is measured
 		// from the scene depth by a compute pass the app runs after the scene)
-		this.flare = sunDir ? new LensFlare( { depthTexture: sceneRenderer.sceneRT.depthTexture, clouds, sunDir } ) : null;
-		const flareAt = ( uv ) => this.flare ? this.flare.node( uv ) : vec3( 0 );
+		this.flare = sunDir ? new LensFlare( { depthTexture: sceneRT.depthTexture, clouds, sunDir } ) : null;
 
 		// ---- water on the lens after surfacing (screen-fixed, so after the temporal resolve)
 		this.lens = new LensDroplets();
-		const lensFn = this.lens.build();
 
-		const graded = Fn( () => {
+		this._outW = 0;
+		this._outH = 0;
+		this._inW = 0;
+		this._inH = 0;
+		this._prevVP = new Matrix4();
+		this._prevCamPos = new Vector3();
+		this._hasPrev = false;
+		this._size = new Vector2();
+		this._built = false;
+		this.profiler = null; // core/Profiler: every pass is tracked when the chain is built
 
-			const sharp = ( uv ) => this.motionBlur.apply( rcas( uv ), uv ).add( bloomTex.sample( uv ).rgb.mul( P.bloom ) ).add( flareAt( uv ) );
-			const blurred = ( uv ) => half.sample( uv ).rgb.add( bloomTex.sample( uv ).rgb.mul( P.bloom ) );
-			let c = lensFn( sharp, blurred, screenUV ).mul( exposureMul );
-			// white balance nudge + saturation + contrast around mid grey (in linear HDR)
-			c = c.mul( vec3( float( 1 ).add( P.warmth ), 1, float( 1 ).sub( P.warmth ) ) );
-			const l = luminance( c );
-			c = mix( vec3( l ), c, P.saturation );
-			c = pow( max( c, vec3( 0 ) ).div( 0.18 ), vec3( P.contrast ) ).mul( 0.18 );
-			// vignette (elliptical, soft)
-			const d = screenUV.sub( 0.5 ).mul( vec2( 1.0, 0.8 ) );
-			const v = float( 1 ).sub( smoothstep( 0.25, 0.75, length( d ) ).mul( P.vignette ) );
-			c = c.mul( v );
-			// fine film grain (luminance-weighted, hides banding in dark gradients)
-			const n = fract( sin( dot( screenUV.mul( vec2( 1920, 1080 ) ), vec2( 12.9898, 78.233 ) ) ).mul( 43758.5453 ) ).sub( 0.5 );
-			c = c.add( c.mul( n.mul( P.grain ) ) );
-			return vec4( c, 1 );
+	}
 
-		} )();
+	// ---------------------------------------------------------------- build (lazy: other systems' modules)
 
-		this.pipeline = new THREE.RenderPipeline( renderer );
-		this.pipeline.outputNode = graded;
-		this._size = new THREE.Vector2();
+	_build() {
+
+		this._built = true;
+		const uw = this.underwater;
+		const haze = this.haze;
+
+		// the medium of each pixel's lens
+		this._mediumPass = new FullscreenPass( {
+			label: 'medium', colorFormats: [ 'r8unorm' ], modules: [ uw.module ],
+			code: 'fn fragment( in: FSIn ) -> vec4f { return vec4f( underwaterMedium( in.uv ), 0.0, 0.0, 1.0 ); }',
+		} );
+
+		// scene color with AO applied to opaque pixels that aren't behind water, then the haze, then
+		// the underwater / waterline composite
+		this._beautyPass = new FullscreenPass( {
+			label: 'beauty (AO + haze + underwater)',
+			colorFormats: [ 'rgba16float' ],
+			modules: [ uw.compositeModule, haze ? haze.compositeModule : null ].filter( Boolean ),
+			defines: haze ? haze._defines() : {},
+			bindings: {
+				post: { uniform: this.uniforms },
+				postScene: { texture: () => this.sceneColor },
+				postOpaqueDepth: { texture: () => this.opaqueDepth },
+				postFinalDepth: { texture: () => this.finalDepth },
+				postAO: { texture: () => this.aoBlurY.texture },
+			},
+			code: /* wgsl */`
+fn postDepthLoad( uv: vec2f, which: i32 ) -> f32 {
+	if ( which == 0 ) {
+		let s = vec2i( textureDimensions( postOpaqueDepth ) );
+		return textureLoad( postOpaqueDepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 );
+	}
+	let s = vec2i( textureDimensions( postFinalDepth ) );
+	return textureLoad( postFinalDepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 );
+}
+
+fn postColorAO( uv: vec2f ) -> vec3f {
+	let c = textureSampleLevel( postScene, smpLinearClamp, uv, 0.0 ).rgb;
+	let dO = postDepthLoad( uv, 0 );
+	let dF = postDepthLoad( uv, 1 );
+	// reversed depth: sky = 0; water in front of the opaque surface has a larger depth value
+	let isSky = dO < 1e-7;
+	let covered = dF > dO + 1e-7;
+	// depth-aware upsample of the half-res AO: the 4 nearest AO texels, weighted by how close
+	// their depth is to this pixel's (no dark halos bleeding across depth edges)
+	let aoSize = vec2f( textureDimensions( postAO ) );
+	let pa = uv * aoSize - 0.5;
+	let i0 = floor( pa );
+	let fr = pa - i0;
+	var aSum = 0.0; var wSum = 1e-4;
+	for ( var k = 0; k < 4; k++ ) {
+		let o = vec2f( f32( k & 1 ), f32( k >> 1u ) );
+		let uvT = ( i0 + o + 0.5 ) / aoSize;
+		let dT = postDepthLoad( uvT, 0 );
+		let wBil = select( 1.0 - fr.x, fr.x, o.x > 0.5 ) * select( 1.0 - fr.y, fr.y, o.y > 0.5 );
+		// reversed-Z depth ~ near / z, so the relative depth difference ~ |dT - dO| / dO
+		let rel = abs( dT - dO ) / max( dO, 1e-7 );
+		let wDepth = 1.0 / pow2( rel * 40.0 + 1.0 );
+		let wt = wBil * wDepth + 1e-5;
+		aSum += textureSampleLevel( postAO, smpLinearClamp, uvT, 0.0 ).r * wt;
+		wSum += wt;
+	}
+	let a = aSum / wSum;
+	// multi-bounce approximation (Jimenez 2016) for a typical outdoor albedo of ~0.35
+	let aMB = max( a, ( ( a * 0.382 - 1.036 ) * a + 1.654 ) * a );
+	// AO only removes ambient light: full effect where the pixel is lit by the sky alone,
+	// a third of it on sunlit surfaces (still grounds objects without dirty halos)
+	let ambientOnly = 1.0 - smoothstep( 0.12, 0.9, luminance( c ) );
+	let k = select( post.aoStrength * mix( 0.35, 1.0, ambientOnly ), 0.0, isSky || covered );
+	return c * mix( 1.0, aMB, k );
+}
+
+fn postSceneSample( uv: vec2f ) -> vec3f {
+	${ haze ? 'return hazeApply( uv, vec4f( postColorAO( uv ), 1.0 ) ).rgb;' : 'return postColorAO( uv );' }
+}
+
+fn fragment( in: FSIn ) -> vec4f {
+	return underwaterComposite( in.uv, in.pos.xy );
+}
+`,
+		} );
+
+		// build the lazily built passes now (the profiler tracks them after beginFrame)
+		if ( ! this.aoPass._pass ) this.aoPass._build();
+		if ( haze && ! haze._passes ) haze._build();
+
+		// ---- bloom
+		this._buildBloom();
+		this._buildMeter();
+		this._buildFinal();
+		// GPU timestamps per pass (core/Profiler): set `post.profiler = profiler` before the first frame
+		if ( this.profiler ) for ( const [ n, p ] of this.passes() ) this.profiler.track( 'post ' + n, p );
 
 	}
 
 	// Physically-motivated bloom (Jimenez 2014): 13-tap downsamples (Karis average on the first
 	// one so single bright glints can't flicker), then 3x3 tent upsamples accumulating each level.
-	_buildBloom( src ) {
+	_buildBloom() {
 
-		const opts = ( s ) => ( { type: THREE.HalfFloatType, resolutionScale: s } );
-		const tap = ( t, uv, texel, x, y ) => t.sample( uv.add( texel.mul( vec2( x, y ) ) ) ).rgb;
-		const karis = ( c ) => c.div( luminance( c ).add( 1 ) );
+		const mk = ( name ) => new RenderTarget( 1, 1, { colors: [ 'rgba16float' ], label: name } );
+		this.bloomScales = [ 0.5, 0.25, 0.125, 0.0625, 0.03125 ];
+		this.bloomDown = this.bloomScales.map( ( s, i ) => mk( 'bloomDown' + ( i + 1 ) ) );
+		this.bloomUp = this.bloomScales.slice( 0, 4 ).map( ( s, i ) => mk( 'bloomUp' + ( i + 1 ) ) );
 
-		const down = ( t, scale, first ) => rtt( Fn( () => {
+		const TAPS = /* wgsl */`
+fn bTap( uv: vec2f, texel: vec2f, x: f32, y: f32 ) -> vec3f { return textureSampleLevel( bSrc, smpLinearClamp, uv + texel * vec2f( x, y ), 0.0 ).rgb; }
+fn karis( c: vec3f ) -> vec3f { return c / ( luminance( c ) + 1.0 ); }
+`;
+		const down = ( src, first ) => new FullscreenPass( {
+			label: 'bloom down', colorFormats: [ 'rgba16float' ], bindings: { bSrc: { texture: src } },
+			code: TAPS + /* wgsl */`
+fn fragment( in: FSIn ) -> vec4f {
+	let uv = in.uv;
+	let texel = 1.0 / vec2f( textureDimensions( bSrc ) );
+	let a = bTap( uv, texel, -2.0, -2.0 ); let b = bTap( uv, texel, 0.0, -2.0 ); let c = bTap( uv, texel, 2.0, -2.0 );
+	let d = bTap( uv, texel, -2.0, 0.0 ); let e = bTap( uv, texel, 0.0, 0.0 ); let f = bTap( uv, texel, 2.0, 0.0 );
+	let g = bTap( uv, texel, -2.0, 2.0 ); let h = bTap( uv, texel, 0.0, 2.0 ); let i = bTap( uv, texel, 2.0, 2.0 );
+	let j = bTap( uv, texel, -1.0, -1.0 ); let k = bTap( uv, texel, 1.0, -1.0 ); let l = bTap( uv, texel, -1.0, 1.0 ); let m = bTap( uv, texel, 1.0, 1.0 );
+${ first ? /* wgsl */`
+	// weighted groups of four (Karis average) suppress fireflies
+	let g0 = karis( ( j + k + l + m ) * 0.25 ) * 0.5;
+	let g1 = karis( ( a + b + d + e ) * 0.25 ) * 0.125;
+	let g2 = karis( ( b + c + e + f ) * 0.25 ) * 0.125;
+	let g3 = karis( ( d + e + g + h ) * 0.25 ) * 0.125;
+	let g4 = karis( ( e + f + h + i ) * 0.25 ) * 0.125;
+	let s = g0 + g1 + g2 + g3 + g4;
+	// undo the Karis tonemap on the result
+	return vec4f( s / max( 1.0 - luminance( s ), 0.02 ), 1.0 );` : /* wgsl */`
+	let s = e * 0.125 + ( a + c + g + i ) * 0.03125 + ( b + d + f + h ) * 0.0625 + ( j + k + l + m ) * 0.125;
+	return vec4f( s, 1.0 );` }
+}
+`,
+		} );
 
-			const uv = screenUV;
-			const texel = vec2( 1 ).div( vec2( t.size() ) );
-			const a = tap( t, uv, texel, - 2, - 2 ), b = tap( t, uv, texel, 0, - 2 ), c = tap( t, uv, texel, 2, - 2 );
-			const d = tap( t, uv, texel, - 2, 0 ), e = tap( t, uv, texel, 0, 0 ), f = tap( t, uv, texel, 2, 0 );
-			const g = tap( t, uv, texel, - 2, 2 ), h = tap( t, uv, texel, 0, 2 ), i = tap( t, uv, texel, 2, 2 );
-			const j = tap( t, uv, texel, - 1, - 1 ), k = tap( t, uv, texel, 1, - 1 ), l = tap( t, uv, texel, - 1, 1 ), m = tap( t, uv, texel, 1, 1 );
-			if ( first ) {
+		const up = ( small, base ) => new FullscreenPass( {
+			label: 'bloom up', colorFormats: [ 'rgba16float' ], bindings: { bSrc: { texture: small }, bBase: { texture: base } },
+			code: TAPS + /* wgsl */`
+fn fragment( in: FSIn ) -> vec4f {
+	let uv = in.uv;
+	let texel = 1.0 / vec2f( textureDimensions( bSrc ) );
+	let s = ( bTap( uv, texel, 0.0, 0.0 ) * 4.0
+		+ ( bTap( uv, texel, -1.0, 0.0 ) + bTap( uv, texel, 1.0, 0.0 ) + bTap( uv, texel, 0.0, -1.0 ) + bTap( uv, texel, 0.0, 1.0 ) ) * 2.0
+		+ ( bTap( uv, texel, -1.0, -1.0 ) + bTap( uv, texel, 1.0, -1.0 ) + bTap( uv, texel, -1.0, 1.0 ) + bTap( uv, texel, 1.0, 1.0 ) ) ) / 16.0;
+	return vec4f( textureSampleLevel( bBase, smpLinearClamp, uv, 0.0 ).rgb + s, 1.0 );
+}
+`,
+		} );
 
-				// weighted groups of four (Karis average) suppress fireflies
-				const g0 = karis( j.add( k ).add( l ).add( m ).mul( 0.25 ) ).mul( 0.5 );
-				const g1 = karis( a.add( b ).add( d ).add( e ).mul( 0.25 ) ).mul( 0.125 );
-				const g2 = karis( b.add( c ).add( e ).add( f ).mul( 0.25 ) ).mul( 0.125 );
-				const g3 = karis( d.add( e ).add( g ).add( h ).mul( 0.25 ) ).mul( 0.125 );
-				const g4 = karis( e.add( f ).add( h ).add( i ).mul( 0.25 ) ).mul( 0.125 );
-				const s = g0.add( g1 ).add( g2 ).add( g3 ).add( g4 );
-				// undo the Karis tonemap on the result
-				return vec4( s.div( max( float( 1 ).sub( luminance( s ) ), 0.02 ) ), 1 );
-
-			}
-
-			const s = e.mul( 0.125 ).add( a.add( c ).add( g ).add( i ).mul( 0.03125 ) )
-				.add( b.add( d ).add( f ).add( h ).mul( 0.0625 ) ).add( j.add( k ).add( l ).add( m ).mul( 0.125 ) );
-			return vec4( s, 1 );
-
-		} )(), null, null, opts( scale ) );
-
-		const up = ( small, base, scale ) => rtt( Fn( () => {
-
-			const uv = screenUV;
-			const texel = vec2( 1 ).div( vec2( small.size() ) );
-			const s = tap( small, uv, texel, 0, 0 ).mul( 4 )
-				.add( tap( small, uv, texel, - 1, 0 ).add( tap( small, uv, texel, 1, 0 ) ).add( tap( small, uv, texel, 0, - 1 ) ).add( tap( small, uv, texel, 0, 1 ) ).mul( 2 ) )
-				.add( tap( small, uv, texel, - 1, - 1 ).add( tap( small, uv, texel, 1, - 1 ) ).add( tap( small, uv, texel, - 1, 1 ) ).add( tap( small, uv, texel, 1, 1 ) ) )
-				.div( 16 );
-			return vec4( base.sample( uv ).rgb.add( s ), 1 );
-
-		} )(), null, null, opts( scale ) );
-
-		const d1 = down( src, 0.5, true );
-		const d2 = down( d1, 0.25, false );
-		const d3 = down( d2, 0.125, false );
-		const d4 = down( d3, 0.0625, false );
-		const d5 = down( d4, 0.03125, false );
-		const u4 = up( d5, d4, 0.0625 );
-		const u3 = up( u4, d3, 0.125 );
-		const u2 = up( u3, d2, 0.25 );
-		const u1 = up( u2, d1, 0.5 );
-		return { bloom: u1, half: d1, meter: d4 };
+		const D = this.bloomDown, U = this.bloomUp;
+		this._bloomPasses = [
+			[ down( () => this.taau.texture, true ), D[ 0 ] ],
+			[ down( () => D[ 0 ].texture, false ), D[ 1 ] ],
+			[ down( () => D[ 1 ].texture, false ), D[ 2 ] ],
+			[ down( () => D[ 2 ].texture, false ), D[ 3 ] ],
+			[ down( () => D[ 3 ].texture, false ), D[ 4 ] ],
+			[ up( () => D[ 4 ].texture, () => D[ 3 ].texture ), U[ 3 ] ],
+			[ up( () => U[ 3 ].texture, () => D[ 2 ].texture ), U[ 2 ] ],
+			[ up( () => U[ 2 ].texture, () => D[ 1 ].texture ), U[ 1 ] ],
+			[ up( () => U[ 1 ].texture, () => D[ 0 ].texture ), U[ 0 ] ],
+		];
+		this.bloomTex = U[ 0 ];
+		this.half = D[ 0 ];
+		this.meterRT = D[ 3 ];
 
 	}
 
 	// Average log luminance (centre weighted) of a small copy of the frame, one workgroup; the
 	// adapted exposure multiplier lives in a storage buffer read by the grading pass next frame.
-	_buildMeter( meterRTT ) {
+	_buildMeter() {
 
 		const W = 256;
-		const A = this.autoExposure;
-		const exposure = this.exposure;
-		const tex = texture( meterRTT.value );
+		let reduce = '';
+		for ( let s = W / 2; s > 0; s >>= 1 ) reduce += /* wgsl */`
+	if ( t < ${ s }u ) {
+		sumL[ t ] += sumL[ t + ${ s }u ];
+		sumW[ t ] += sumW[ t + ${ s }u ];
+	}
+	workgroupBarrier();`;
 
-		this.meterKernel = Fn( () => {
+		this.meterKernel = new ComputeKernel( {
+			label: 'Auto Exposure',
+			modules: [ commonModule ],
+			bindings: {
+				ae: { uniform: this.aeUniforms },
+				aeTex: { texture: () => this.meterRT.texture },
+				aeExposure: { storage: this.exposure, access: 'read_write' },
+			},
+			workgroupSize: [ W, 1, 1 ],
+			code: /* wgsl */`
+var<workgroup> sumL: array<f32, ${ W }>;
+var<workgroup> sumW: array<f32, ${ W }>;
+@compute @workgroup_size( WG_X, 1, 1 )
+fn main( @builtin( local_invocation_id ) lid: vec3u ) {
+	let t = lid.x;
+	let size = textureDimensions( aeTex );
+	let n = size.x * size.y;
+	var accL = 0.0; var accW = 0.0;
+	for ( var i = 0u; i < 160u; i++ ) {
+		let idx = t + i * ${ W }u;
+		if ( idx < n ) {
+			let x = idx % size.x; let y = idx / size.x;
+			let c = textureLoad( aeTex, vec2i( i32( x ), i32( y ) ), 0 ).rgb;
+			let l = log2( max( luminance( c ), 1e-4 ) );
+			let uvc = vec2f( ( f32( x ) + 0.5 ) / f32( size.x ), ( f32( y ) + 0.5 ) / f32( size.y ) ) - 0.5;
+			let w = max( 1.0 - length( uvc * vec2f( 1.0, 1.4 ) ) * 1.2, 0.15 );
+			accL += l * w;
+			accW += w;
+		}
+	}
+	sumL[ t ] = accL;
+	sumW[ t ] = accW;
+	workgroupBarrier();
+${ reduce }
+	if ( t == 0u ) {
+		let avg = exp2( sumL[ 0 ] / max( sumW[ 0 ], 1e-4 ) );
+		// the eye only partly compensates: dark scenes stay darker (dusk and night must not
+		// look like day), and at night at most one extra stop
+		let ratio = ae.refLum / avg;
+		let partial = select( ratio, pow( ratio, 0.8 ), ratio > 1.0 );
+		let tgt = clamp( partial, ae.min, mix( ae.max, 2.0, frame.night ) );
+		let cur = aeExposure[ 0 ];
+		let rate = select( ae.down, ae.up, tgt > cur );
+		let k = 1.0 - exp( - frame.dt * rate );
+		let next = exp2( mix( log2( max( cur, 1e-3 ) ), log2( tgt ), k ) );
+		aeExposure[ 0 ] = select( 1.0, next, ae.enabled > 0.5 );
+	}
+}
+`,
+		} );
 
-			const t = localId.x;
-			const sumL = workgroupArray( 'float', W );
-			const sumW = workgroupArray( 'float', W );
-			const size = uvec2( textureSize( tex, 0 ) ).toVar();
-			const n = size.x.mul( size.y ).toVar();
-			const accL = float( 0 ).toVar(), accW = float( 0 ).toVar();
-			Loop( 160, ( { i } ) => {
+	}
 
-				const idx = t.add( uint( i ).mul( uint( W ) ) );
-				If( idx.lessThan( n ), () => {
+	_buildFinal() {
 
-					const x = idx.mod( size.x ), y = idx.div( size.x );
-					const c = textureLoad( tex, ivec2( x, y ) ).rgb;
-					const l = log2( max( luminance( c ), 1e-4 ) );
-					const uvc = vec2( float( x ).add( 0.5 ).div( float( size.x ) ), float( y ).add( 0.5 ).div( float( size.y ) ) ).sub( 0.5 );
-					const w = max( float( 1 ).sub( length( uvc.mul( vec2( 1, 1.4 ) ) ).mul( 1.2 ) ), 0.15 );
-					accL.addAssign( l.mul( w ) );
-					accW.addAssign( w );
+		const modules = [ commonModule, this.motionBlur.module, this.lens.module ];
+		if ( this.flare ) modules.push( this.flare.module );
+		this._finalPass = new FullscreenPass( {
+			label: 'final (grade + tonemap)',
+			colorFormats: [ this.outputFormat ],
+			modules,
+			bindings: {
+				post: { uniform: this.uniforms },
+				postResolved: { texture: () => this.taau.texture },
+				postBloom: { texture: () => this.bloomTex.texture },
+				postHalf: { texture: () => this.half.texture },
+				postExposure: { storage: this.exposure, access: 'read' },
+			},
+			code: ACES + /* wgsl */`
+fn tm( c: vec3f ) -> vec3f { return c / ( max( c.r, max( c.g, c.b ) ) + 1.0 ); }
+fn loadResolved( p: vec2i ) -> vec3f { return textureLoad( postResolved, p, 0 ).rgb; }
 
-				} );
+// RCAS (AMD FSR1 robust contrast-adaptive sharpening) on the resolved image: TAA converges to a
+// slightly soft image, RCAS restores the detail without halos (the lobe is limited by local
+// contrast). Done on a tonemapped proxy of the HDR values and inverted afterwards.
+fn rcas( uvIn: vec2f ) -> vec3f {
+	let size = vec2i( textureDimensions( postResolved ) );
+	let pc = clamp( vec2i( uvIn * vec2f( size ) ), vec2i( 1 ), size - 2 );
+	let e = tm( loadResolved( pc ) );
+	let b = tm( loadResolved( pc + vec2i( 0, -1 ) ) ); let d = tm( loadResolved( pc + vec2i( -1, 0 ) ) );
+	let f = tm( loadResolved( pc + vec2i( 1, 0 ) ) ); let h = tm( loadResolved( pc + vec2i( 0, 1 ) ) );
+	let mn4 = min( min( b, d ), min( f, h ) );
+	let mx4 = max( max( b, d ), max( f, h ) );
+	let hitMin = min( mn4, e ) / ( mx4 * 4.0 + 1e-5 );
+	let hitMax = ( vec3f( 1.0 ) - max( mx4, e ) ) / ( mn4 * 4.0 - 4.0 );
+	let lobeRGB = max( - hitMin, hitMax );
+	let lobe = max( ${ - ( 0.25 - 1.0 / 16.0 ) }, min( max( lobeRGB.r, max( lobeRGB.g, lobeRGB.b ) ), 0.0 ) ) * post.sharpen;
+	let r = max( ( ( b + d + f + h ) * lobe + e ) / ( lobe * 4.0 + 1.0 ), vec3f( 0.0 ) );
+	// back to HDR (inverse of the max-channel Reinhard)
+	return r / max( 1.0 - max( r.r, max( r.g, r.b ) ), 1e-3 );
+}
 
-			} );
+fn bloomAt( uv: vec2f ) -> vec3f { return textureSampleLevel( postBloom, smpLinearClamp, uv, 0.0 ).rgb * post.bloom; }
 
-			sumL.element( t ).assign( accL );
-			sumW.element( t ).assign( accW );
-			workgroupBarrier();
-			for ( let s = W / 2; s > 0; s >>= 1 ) {
+fn lensSharp( uv: vec2f ) -> vec3f {
+	var c = mbApply( rcas( uv ), uv ) + bloomAt( uv );
+${ this.flare ? '	c += flareLight( uv );' : '' }
+	return c;
+}
+fn lensBlurred( uv: vec2f ) -> vec3f { return textureSampleLevel( postHalf, smpLinearClamp, uv, 0.0 ).rgb + bloomAt( uv ); }
 
-				If( t.lessThan( uint( s ) ), () => {
+fn fragment( in: FSIn ) -> vec4f {
+	let uv = in.uv;
+	var c = lensDroplets( uv ) * postExposure[ 0 ];
+	// white balance nudge + saturation + contrast around mid grey (in linear HDR)
+	c = c * vec3f( 1.0 + post.warmth, 1.0, 1.0 - post.warmth );
+	let l = luminance( c );
+	c = mix( vec3f( l ), c, post.saturation );
+	c = pow( max( c, vec3f( 0.0 ) ) / 0.18, vec3f( post.contrast ) ) * 0.18;
+	// vignette (elliptical, soft)
+	let dv = ( uv - 0.5 ) * vec2f( 1.0, 0.8 );
+	let v = 1.0 - smoothstep( 0.25, 0.75, length( dv ) ) * post.vignette;
+	c = c * v;
+	// fine film grain (luminance-weighted, hides banding in dark gradients)
+	let n = fract( sin( dot( uv * vec2f( 1920.0, 1080.0 ), vec2f( 12.9898, 78.233 ) ) ) * 43758.5453 ) - 0.5;
+	c = c + c * ( n * post.grain );
+	// renderOutput: ACES filmic tone mapping with the exposure, sRGB transfer
+	let t = acesFilmicToneMapping( c, frame.exposure );
+	return vec4f( linearToSrgb( t ), 1.0 );
+}
+`,
+		} );
 
-					sumL.element( t ).addAssign( sumL.element( t.add( uint( s ) ) ) );
-					sumW.element( t ).addAssign( sumW.element( t.add( uint( s ) ) ) );
+	}
 
-				} );
-				workgroupBarrier();
+	// ---------------------------------------------------------------- sizes
 
-			}
+	_outputSize() {
 
-			If( t.equal( uint( 0 ) ), () => {
+		if ( this.outputSize ) return this.outputSize;
+		const r = this.renderer;
+		if ( r && r.width ) return { width: r.width, height: r.height };
+		if ( GPU.canvas ) return { width: GPU.canvas.width, height: GPU.canvas.height };
+		return { width: 1, height: 1 };
 
-				const avg = exp2( sumL.element( uint( 0 ) ).div( max( sumW.element( uint( 0 ) ), 1e-4 ) ) );
-				// the eye only partly compensates: dark scenes stay darker (dusk and night must not
-				// look like day), and at night at most one extra stop
-				const ratio = A.ref.div( avg );
-				const partial = select( ratio.greaterThan( 1 ), pow( ratio, 0.8 ), ratio );
-				const target = clamp( partial, A.min, mix( A.max, float( 2 ), G.night ) );
-				const cur = exposure.element( uint( 0 ) );
-				const rate = select( target.greaterThan( cur ), A.up, A.down );
-				const k = float( 1 ).sub( exp( G.dt.mul( rate ).negate() ) );
-				const next = exp2( mix( log2( max( cur, 1e-3 ) ), log2( target ), k ) );
-				cur.assign( select( A.enabled.greaterThan( 0.5 ), next, float( 1 ) ) );
+	}
 
-			} );
+	_resize() {
 
-		} )().computeKernel( [ W, 1, 1 ] ).setName( 'Auto Exposure' );
+		const { width: ow, height: oh } = this._outputSize();
+		const iw = Math.max( 1, Math.round( ow * this.scale ) ), ih = Math.max( 1, Math.round( oh * this.scale ) );
+		if ( ow === this._outW && oh === this._outH && iw === this._inW && ih === this._inH ) return;
+		this._outW = ow; this._outH = oh; this._inW = iw; this._inH = ih;
+		this.sceneRenderer.setSize( iw, ih );
+		this.beauty.setSize( iw, ih );
+		this.medium.setSize( iw, ih );
+		// rtt resolution scales of the original are relative to the drawing buffer (output) size
+		this.aoPass.resolutionScale = 0.5 * this.scale;
+		this.aoPass.setSize( ow, oh );
+		const aw = Math.round( ow * 0.5 * this.scale ), ah = Math.round( oh * 0.5 * this.scale );
+		this.aoBlurX.setSize( aw, ah );
+		this.aoBlurY.setSize( aw, ah );
+		if ( this.haze ) this.haze.setSize( ow, oh );
+		this.taau.setSize( ow, oh );
+		if ( this.bloomDown ) {
+
+			this.bloomScales.forEach( ( s, i ) => this.bloomDown[ i ].setSize( Math.round( ow * s ), Math.round( oh * s ) ) );
+			this.bloomScales.slice( 0, 4 ).forEach( ( s, i ) => this.bloomUp[ i ].setSize( Math.round( ow * s ), Math.round( oh * s ) ) );
+
+		}
+
+		if ( this.flare ) this.flare.setDepthHeight( ih );
+		this.lens.aspect.value = ow / oh;
 
 	}
 
@@ -348,14 +533,9 @@ export class PostFX {
 		if ( s === this.scale ) return;
 		this.scale = s;
 		this.sceneRenderer.scale = s;
-		this.beauty.setResolutionScale( s );
-		this.medium.setResolutionScale( s );
 		if ( this.haze ) this.haze.setScale( s );
 		// upscaling needs more frames to fill the output grid; at 1:1 respond faster (less smear)
-		this.taau.frameWeight.value = THREE.MathUtils.lerp( 0.035, 0.06, THREE.MathUtils.clamp( ( s - 0.6 ) / 0.4, 0, 1 ) );
-		this.aoPass.resolutionScale = 0.5 * s;
-		this.aoBlurX.setResolutionScale( 0.5 * s );
-		this.aoBlurY.setResolutionScale( 0.5 * s );
+		this.taau.frameWeight.value = MathUtils.lerp( 0.035, 0.06, MathUtils.clamp( ( s - 0.6 ) / 0.4, 0, 1 ) );
 
 	}
 
@@ -365,30 +545,100 @@ export class PostFX {
 
 	}
 
-	// jitter the camera for this frame (call before rendering the scene)
+	// the internal (scene) size of this frame
+	internalSize( target = new Vector2() ) {
+
+		return target.set( this._inW, this._inH );
+
+	}
+
+	// size the targets, jitter the camera for this frame and write it into the frame uniforms (call
+	// before rendering the scene)
 	beginFrame() {
 
-		this.motionBlur.updateCamera( this.camera );
-		this.sceneRenderer.internalSize( this._size );
-		this.taau.setViewOffset( this._size.x, this._size.y );
+		if ( ! this._built ) {
+
+			this._build();
+			this._outW = 0; // bloom targets now exist
+
+		}
+
+		this._resize();
+		const cam = this.camera;
+		cam.updateMatrixWorld();
+		if ( cam.matrixWorldInverse ) cam.matrixWorldInverse.copy( cam.matrixWorld ).invert();
+		this.motionBlur.updateCamera( cam );
+		this.taau.advance();
+		const [ jx, jy ] = this.taau.jitter();
+		// three's setViewOffset( w, h, jx, jy, w, h ) moves the view window by +jx px right / +jy px down,
+		// i.e. a clip-space translation of ( -2 jx / w, +2 jy / h )
+		setFrameCamera( cam, this._inW, this._inH, {
+			jitterX: - jx, jitterY: jy,
+			prevViewProj: this._hasPrev ? this._prevVP : null,
+			prevCameraPos: this._hasPrev ? this._prevCamPos : null,
+		} );
+		const F = FrameUniforms.fields;
+		F.outputResolution.value.set( this._outW, this._outH );
+		this._prevVP.copy( F.viewProjNoJitter.value );
+		this._prevCamPos.copy( F.cameraPos.value );
+		this._hasPrev = true;
 
 	}
 
 	render() {
 
-		this.motionBlur.compute( this.renderer );
-		if ( this.haze ) this.haze.update();
-		this.pipeline.render();
+		if ( ! this._built ) this.beginFrame();
+		const T = this._timers || null;
+		this.motionBlur.compute( this._outW, this._outH );
+		this.aoPass.render();
+		this._aoBlurXPass.render( { colorViews: [ this.aoBlurX.texture ] } );
+		this._aoBlurYPass.render( { colorViews: [ this.aoBlurY.texture ] } );
+		this._mediumPass.render( { colorViews: [ this.medium.texture ] } );
+		if ( this.haze ) {
+
+			this.haze.update();
+			this.haze.render();
+
+		}
+
+		this._beautyPass.render( { colorViews: [ this.beauty.texture ] } );
+		this.taau.render();
+		for ( const [ pass, rt ] of this._bloomPasses ) pass.render( { colorViews: [ rt.texture ] } );
+		const out = this.outputTexture ? this.outputTexture.view( { dimension: '2d', mipLevelCount: 1 } ) : GPU.context.getCurrentTexture().createView();
+		this._finalPass.render( { colorViews: [ out ] } );
 		// meter this frame's image; the result is used from the next frame on
-		this.renderer.compute( this.meterKernel, [ 1, 1, 1 ] );
+		this.meterKernel.dispatch( [ 1, 1, 1 ] );
+		void T;
 
 	}
 
 	endFrame() {
 
 		this.taau.clearViewOffset();
+		this.taau.endFrame();
+
+	}
+
+	// every pass with its GPU object, for the profiler: [ name, pass ]
+	passes() {
+
+		const list = [ [ 'motion blur tiles', this.motionBlur.tileKernel ], [ 'motion blur neighbours', this.motionBlur.neighborKernel ],
+			[ 'GTAO', this.aoPass._pass ], [ 'AO blur x', this._aoBlurXPass ], [ 'AO blur y', this._aoBlurYPass ], [ 'medium', this._mediumPass ] ];
+		if ( this.haze && this.haze._passes ) {
+
+			list.push( [ 'haze march', this.haze._passes.march ], [ 'haze sun mask', this.haze._passes.mask ] );
+			this.haze._passes.blur.forEach( ( p, i ) => list.push( [ 'haze god rays ' + i, p ] ) );
+
+		}
+
+		list.push( [ 'beauty', this._beautyPass ], [ 'TAAU', this.taau._resolve[ 0 ] ], [ 'TAAU ', this.taau._resolve[ 1 ] ] );
+		this._bloomPasses.forEach( ( [ p ], i ) => list.push( [ 'bloom ' + i, p ] ) );
+		list.push( [ 'final', this._finalPass ], [ 'auto exposure', this.meterKernel ] );
+		if ( this.flare ) list.push( [ 'flare visibility', this.flare.kernel ] );
+		return list;
 
 	}
 
 }
 
+export { Texture };

@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 
 // Accumulates vertices with the vegetation attribute layout:
 //   position, normal, uv, aVeg (vec4: u, s, flutter, phase), aMat (vec4: part, p1, p2, p3)

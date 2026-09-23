@@ -1,74 +1,48 @@
-import * as THREE from 'three/webgpu';
-import {
-	float, vec2, vec3, normalize, mix, smoothstep, max, min, abs, dot, cross, dFdx, dFdy, sign, fwidth, length,
-	positionWorld, texture, luminance,
-} from 'three/tsl';
+import { Color, SRGBColorSpace } from '../../engine/math/index.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
+import { commonModule } from '../../engine/render/wgsl/common.js';
+import { getDetailTexture } from './DetailTextures.js';
 
-// Shared TSL building blocks for the terrain and the scattered rocks.
+// Shared WGSL building blocks for the terrain and the scattered rocks (the former TSL helpers).
+//
+// JS helpers (build WGSL source):
+//   srgb( r, g, b )  -> 'vec3f( ... )' linear constant of an sRGB triplet
+//   rot2( v, a )     -> WGSL expression rotating the vec2 expression v by a constant angle
+// WGSL (terrainShadingModule(); the detail texture is bound as `terrainDetailTex`):
+//   fn terrainPerturbNormal( P: vec3f, N: vec3f, hd: f32, scale: f32 ) -> vec3f   surface-gradient bump
+//   fn terrainTriWeights( N: vec3f ) -> vec3f
+//   fn terrainTriplanar( p: vec3f, w: vec3f, tile: f32, g: RockGrad ) -> vec4f
+//   fn terrainRockSurface( p, N, h, mcr, seed, mossAmount, g: RockGrad ) -> RockSurface
+//   fn terrainImplicitGrad( p: vec3f ) -> RockGrad       (call in uniform control flow)
+//   fn terrainSaturation( c: vec3f, s: f32 ) -> vec3f
+//   fn terrainMeadowTone( mA, mB, slope, south, detail, hasDetail: bool ) -> MeadowTone
+//   const PAL_<name> (rock palette), MEADOW_<name> (meadow palette)
+// RockGrad { dpdx, dpdy: world position derivatives, fwY: fwidth of the bedding coordinate,
+// useGrad: true = use these gradients everywhere (branch safe; the former `grad` option),
+// false = implicit derivatives for px / fwY / strata like the TSL version without `grad` }.
 
-// sRGB triplet -> linear vec3 constant
+// sRGB triplet -> linear vec3 constant (WGSL source)
 export const srgb = ( r, g, b ) => {
 
-	const c = new THREE.Color().setRGB( r, g, b, THREE.SRGBColorSpace );
-	return vec3( c.r, c.g, c.b );
+	const c = new Color().setRGB( r, g, b, SRGBColorSpace );
+	return `vec3f( ${ f( c.r ) }, ${ f( c.g ) }, ${ f( c.b ) } )`;
 
 };
 
-// 2D rotation of a vec2 node by a constant angle
+// 2D rotation of a vec2 WGSL expression by a constant angle
 export const rot2 = ( v, a ) => {
 
 	const c = Math.cos( a ), s = Math.sin( a );
-	return vec2( v.x.mul( c ).sub( v.y.mul( s ) ), v.x.mul( s ).add( v.y.mul( c ) ) );
+	return `( mat2x2f( ${ f( c ) }, ${ f( s ) }, ${ f( - s ) }, ${ f( c ) } ) * ( ${ v } ) )`;
 
 };
 
-// Mikkelsen surface-gradient bump: perturb world normal N by the scalar height field hd
-// (screen-space derivatives, so any mix of projections / scales works). Robustness for terrain:
-//  - the tilt is limited to ~55 degrees (at grazing angles |det| collapses and the unclamped
-//    gradient would swing the normal into the tangent plane: 'chrome' patches on steep faces)
-//  - the bump fades out where the screen-space frame is degenerate (the thin sliver triangles
-//    of CDLOD geomorphing, which otherwise light up as bright lines along the grid) or where the
-//    rendered facet disagrees with N (sub-texel crags)
-export const perturbNormal = ( N, hd, scale = 1 ) => {
+function f( x ) {
 
-	const p = positionWorld;
-	const dpdx = dFdx( p ), dpdy = dFdy( p );
-	const dhdx = dFdx( hd ).mul( scale ), dhdy = dFdy( hd ).mul( scale );
-	const r1 = cross( dpdy, N );
-	const r2 = cross( N, dpdx );
-	const det = dot( dpdx, r1 );
-	const ad = abs( det );
-	const grad = r1.mul( dhdx ).add( r2.mul( dhdy ) ).mul( sign( det ) );
-	const area = length( cross( dpdx, dpdy ) );
-	const frame = area.div( max( length( dpdx ).mul( length( dpdy ) ), 1e-20 ) ); // sin of the footprint angle
-	const facet = ad.div( max( area, 1e-20 ) ); // cos between the facet and N
-	const k = smoothstep( 0.12, 0.35, frame ).mul( smoothstep( 0.3, 0.6, facet ) );
-	const g = grad.mul( min( float( 1 ), ad.mul( 1.4 ).div( max( length( grad ), 1e-20 ) ) ) ).mul( k );
-	return normalize( N.mul( max( ad, 1e-20 ) ).sub( g ) );
+	const s = Number( x ).toPrecision( 9 );
+	return s.includes( '.' ) || s.includes( 'e' ) ? s : s + '.0';
 
-};
-
-// triplanar blend weights (sharp)
-export const triWeights = ( N ) => {
-
-	const a = abs( N );
-	const w = a.mul( a ).mul( a.mul( a ) );
-	return w.div( w.x.add( w.y ).add( w.z ) );
-
-};
-
-// one channel-set of the detail texture, triplanar. With `grad` ({ dpdx, dpdy } of the world
-// position) the samples use explicit gradients so they may run in non-uniform control flow.
-export const triplanar = ( tex, p, w, tile, grad = null ) => {
-
-	const s = 1 / tile;
-	const sample = ( uv, sw ) => grad ? texture( tex, uv ).grad( grad.dpdx[ sw ].mul( s ), grad.dpdy[ sw ].mul( s ) ) : texture( tex, uv );
-	const x = sample( p.zy.mul( s ), 'zy' );
-	const y = sample( p.xz.mul( s ).add( 0.37 ), 'xz' );
-	const z = sample( p.xy.mul( s ).add( 0.71 ), 'xy' );
-	return x.mul( w.x ).add( y.mul( w.y ) ).add( z.mul( w.z ) );
-
-};
+}
 
 // ---- palette (sRGB picked from photo references, stored linear)
 export const PALETTE = {
@@ -86,88 +60,6 @@ export const PALETTE = {
 	mossDry: srgb( 0.3, 0.34, 0.14 ),
 };
 
-// Weathered volcanic rock seen on the headlands, sea stacks and boulders.
-//   p world position, N world normal (geometric / macro), h height above sea level
-//   macro: 0..1 large scale variation, seed: per object variation (0..1)
-// Returns { albedo, rough, hd (bump height, m), moss (0..1), wetness }
-// With `grad` = { dpdx, dpdy, fwY } every sample uses explicit gradients (branch safe).
-export function rockSurface( { tex, p, N, h, macro, seed = float( 0.5 ), mossAmount = float( 1 ), grad = null } ) {
-
-	const w = triWeights( N );
-	// big blocks (4 m cells), plates (0.9 m) and grain / chips
-	const big = triplanar( tex, p, w, 27, grad );
-	const mid = triplanar( tex, p, w, 6.1, grad );
-	const fine = triplanar( tex, p, w, 1.3, grad );
-	// pixel footprint (m): features smaller than a few pixels fade out instead of sparkling
-	const px = grad ? max( length( grad.dpdx ), length( grad.dpdy ) ) : length( fwidth( p ) );
-	const fineK = float( 1 ).sub( smoothstep( 0.006, 0.02, px ) ).toVar();
-	const midK = float( 1 ).sub( smoothstep( 0.03, 0.1, px ) );
-	const hr = big.x.mul( 0.45 ).add( mid.x.mul( 0.35 ) ).add( fine.x.sub( 0.5 ).mul( fineK ).add( 0.5 ).mul( 0.2 ) ).toVar();
-
-	// layered lava flows / bedding on steep faces: irregular bands (1D lookup of the fbm channel
-	// along the height, warped), faded out once a band gets thinner than a few pixels
-	const steep = float( 1 ).sub( smoothstep( 0.55, 0.85, N.y ) );
-	const bandY = p.y.add( mid.w.mul( 2.5 ) ).add( macro.mul( 6 ) );
-	const fwY = grad ? grad.fwY : fwidth( bandY );
-	const bandUV = vec2( bandY.div( 14 ), seed.mul( 0.37 ).add( 0.13 ) );
-	const strata = grad ? texture( tex, bandUV ).grad( vec2( fwY.div( 14 ), 0 ), vec2( 0, 0 ) ).w : texture( tex, bandUV ).w;
-	const strataAA = float( 1 ).sub( smoothstep( 0.15, 0.6, fwY ) );
-	const tone = hr.mul( 0.9 ).add( macro.sub( 0.5 ).mul( 0.7 ) ).add( strata.sub( 0.5 ).mul( 0.8 ).mul( steep ).mul( strataAA ) ).add( seed.sub( 0.5 ).mul( 0.3 ) );
-	let col = mix( PALETTE.rockDark, PALETTE.rockMid, smoothstep( 0.1, 0.5, tone ) );
-	col = mix( col, PALETTE.rockLight, smoothstep( 0.5, 0.85, tone ) );
-	// iron staining / warm weathering in patches
-	col = mix( col, PALETTE.rockWarm, smoothstep( 0.62, 0.8, mid.w.add( macro.mul( 0.3 ) ) ).mul( 0.18 ) );
-	// joints between the big blocks, fainter between plates
-	col = col.mul( smoothstep( 0.05, 0.25, big.x ).mul( 0.35 ).add( 0.65 ) ).mul( smoothstep( 0.05, 0.25, mid.x ).mul( 0.15 ).add( 0.85 ) );
-	// rain streaks: dark stains running down steep faces, paler bands between (the fbm channel
-	// stretched vertically on the two vertical projection planes)
-	const sUVa = vec2( p.z.div( 3.1 ), p.y.div( 41 ) ), sUVb = vec2( p.x.div( 3.1 ).add( 0.5 ), p.y.div( 41 ).add( 0.3 ) );
-	const sa = grad ? texture( tex, sUVa ).grad( vec2( grad.dpdx.z.div( 3.1 ), grad.dpdx.y.div( 41 ) ), vec2( grad.dpdy.z.div( 3.1 ), grad.dpdy.y.div( 41 ) ) ) : texture( tex, sUVa );
-	const sb = grad ? texture( tex, sUVb ).grad( vec2( grad.dpdx.x.div( 3.1 ), grad.dpdx.y.div( 41 ) ), vec2( grad.dpdy.x.div( 3.1 ), grad.dpdy.y.div( 41 ) ) ) : texture( tex, sUVb );
-	const sw4 = N.xz.abs().pow( vec2( 4 ) );
-	const stainS = sa.w.mul( sw4.x ).add( sb.w.mul( sw4.y ) ).div( sw4.x.add( sw4.y ).add( 1e-5 ) );
-	const stain = smoothstep( 0.52, 0.72, stainS ).mul( steep );
-	col = col.mul( float( 1 ).sub( stain.mul( 0.4 ) ) ).mul( smoothstep( 0.35, 0.2, stainS ).mul( steep ).mul( 0.12 ).add( 1 ) );
-
-	// lichens on the dry upper faces
-	const dry = smoothstep( 2.6, 4.0, h );
-	const lichen = smoothstep( 0.6, 0.78, mid.y ).mul( smoothstep( 0.2, 0.7, N.y ) ).mul( dry ).mul( smoothstep( 0.45, 0.65, macro ) );
-	col = mix( col, PALETTE.lichenPale, lichen.mul( 0.45 ) );
-	col = mix( col, PALETTE.lichenOrange, smoothstep( 0.8, 0.88, mid.y ).mul( dry ).mul( smoothstep( 0.5, 0.8, N.y ) ).mul( 0.3 ) );
-
-	// moss / grass on ledges and tops, ferns hanging along the bedding planes of steep faces
-	const ledge = smoothstep( 0.55, 0.7, strata ).mul( steep ).mul( strataAA ).mul( smoothstep( 0.4, 0.6, mid.w.add( macro.sub( 0.5 ).mul( 0.4 ) ) ) );
-	const moss = max( smoothstep( 0.62, 0.9, N.y.add( big.x.sub( 0.5 ).mul( 0.5 ) ).add( macro.sub( 0.5 ).mul( 0.3 ) ) ), ledge.mul( 0.8 ) )
-		.mul( smoothstep( 2.5, 5.0, h ) ).mul( mossAmount ).toVar();
-	col = mix( col, mix( PALETTE.moss, PALETTE.mossDry, mid.w ), moss.mul( 0.9 ) );
-
-	// shoreline zonation: black lichen band (splash zone), barnacles and algae in the intertidal
-	const splash = smoothstep( 0.5, 1.0, h ).mul( smoothstep( 2.8, 1.8, h.add( mid.w.mul( 1.2 ) ) ) ).mul( smoothstep( 0.35, 0.6, macro.add( mid.w.mul( 0.3 ) ) ) );
-	col = mix( col, PALETTE.blackZone, splash.mul( 0.55 ) );
-	// sun-bleached, weathered upper faces
-	col = mix( col, PALETTE.rockLight, smoothstep( 0.35, 0.95, N.y ).mul( smoothstep( 1.5, 3.0, h ) ).mul( 0.3 ) );
-	const inter = smoothstep( - 0.7, - 0.2, h ).mul( smoothstep( 0.7, 0.2, h ) );
-	const barn = smoothstep( 0.62, 0.72, fine.z ).mul( inter ).mul( fineK );
-	col = mix( col, PALETTE.algae, inter.mul( smoothstep( 0.4, 0.6, mid.y ) ).mul( 0.6 ) );
-	col = mix( col, PALETTE.barnacle, barn.mul( 0.8 ) );
-	// below the water: algae films and pink coralline crusts
-	const sub = smoothstep( - 0.3, - 1.2, h );
-	col = mix( col, mix( PALETTE.algae, PALETTE.coralline, smoothstep( 0.45, 0.7, mid.w ) ), sub.mul( 0.55 ) );
-
-	// wet below the swash line (dark, glossy)
-	const wet = smoothstep( 1.0, 0.25, h.add( mid.w.mul( 0.3 ) ) ).toVar();
-	col = col.mul( mix( float( 1 ), float( 0.55 ), wet ) );
-
-	const rough = mix( mix( float( 0.88 ), float( 0.8 ), steep ), float( 0.45 ), wet ).add( moss.mul( 0.06 ) );
-	// relief (m): tilted blocks and plates with bevelled joints, then grain
-	const hd = big.x.mul( 0.25 ).add( mid.x.mul( 0.07 ).mul( midK.mul( 0.6 ).add( 0.4 ) ) ).add( fine.x.mul( 0.012 ).mul( fineK ).mul( float( 1 ).sub( wet.mul( 0.6 ) ) ) ).add( barn.mul( 0.005 ) );
-	return { albedo: col, rough, hd, moss, wet, height: hr };
-
-}
-
-// saturation helper
-export const saturation = ( c, s ) => mix( vec3( luminance( c ) ), c, s );
-
 // ---- tropical meadow (tall guinea / elephant grass)
 // The tone is shared by the terrain and the grass field (blade base colour): both evaluate it from
 // the same inputs, so the geometric grass fades into the ground without a visible boundary.
@@ -180,24 +72,225 @@ export const MEADOW = {
 	soil: srgb( 0.17, 0.13, 0.08 ),
 };
 
+const consts = ( prefix, o ) => Object.entries( o ).map( ( [ k, v ] ) => `const ${ prefix }${ k }: vec3f = ${ v };` ).join( '\n' );
+
+const SHADING_WGSL = /* wgsl */`
+${ consts( 'PAL_', PALETTE ) }
+${ consts( 'MEADOW_', MEADOW ) }
+
+struct RockGrad {
+	dpdx: vec3f,
+	dpdy: vec3f,
+	fwY: f32,
+	useGrad: bool,
+};
+
+// implicit-derivative RockGrad for a world position (call in uniform control flow)
+fn terrainImplicitGrad( p: vec3f ) -> RockGrad {
+	var g: RockGrad;
+	g.dpdx = dpdx( p ); g.dpdy = dpdy( p ); g.fwY = 0.0; g.useGrad = false;
+	return g;
+}
+
+// Mikkelsen surface-gradient bump: perturb world normal N by the scalar height field hd
+// (screen-space derivatives, so any mix of projections / scales works). Robustness for terrain:
+//  - the tilt is limited to ~55 degrees (at grazing angles |det| collapses and the unclamped
+//    gradient would swing the normal into the tangent plane: 'chrome' patches on steep faces)
+//  - the bump fades out where the screen-space frame is degenerate (the thin sliver triangles
+//    of CDLOD geomorphing, which otherwise light up as bright lines along the grid) or where the
+//    rendered facet disagrees with N (sub-texel crags)
+fn terrainPerturbNormal( p: vec3f, N: vec3f, hd: f32, scale: f32 ) -> vec3f {
+	let dpx = dpdx( p ); let dpy = dpdy( p );
+	let dhdx = dpdx( hd ) * scale; let dhdy = dpdy( hd ) * scale;
+	let r1 = cross( dpy, N );
+	let r2 = cross( N, dpx );
+	let det = dot( dpx, r1 );
+	let ad = abs( det );
+	let grad = ( r1 * dhdx + r2 * dhdy ) * sign( det );
+	let area = length( cross( dpx, dpy ) );
+	let fr = area / max( length( dpx ) * length( dpy ), 1e-20 ); // sin of the footprint angle
+	let facet = ad / max( area, 1e-20 ); // cos between the facet and N
+	let k = smoothstep( 0.12, 0.35, fr ) * smoothstep( 0.3, 0.6, facet );
+	let g = grad * min( 1.0, ad * 1.4 / max( length( grad ), 1e-20 ) ) * k;
+	return normalize( N * max( ad, 1e-20 ) - g );
+}
+
+// triplanar blend weights (sharp)
+fn terrainTriWeights( N: vec3f ) -> vec3f {
+	let a = abs( N );
+	let w = a * a * ( a * a );
+	return w / ( w.x + w.y + w.z );
+}
+
+fn terrainDetailGrad( uv: vec2f, gx: vec2f, gy: vec2f ) -> vec4f {
+	return textureSampleGrad( terrainDetailTex, smpAniso4Repeat, uv, gx, gy );
+}
+
+// one channel-set of the detail texture, triplanar. The samples use explicit gradients (the
+// derivatives of the world position in g), so they may run in non-uniform control flow.
+fn terrainTriplanar( p: vec3f, w: vec3f, tile: f32, g: RockGrad ) -> vec4f {
+	let s = 1.0 / tile;
+	let x = terrainDetailGrad( p.zy * s, g.dpdx.zy * s, g.dpdy.zy * s );
+	let y = terrainDetailGrad( p.xz * s + 0.37, g.dpdx.xz * s, g.dpdy.xz * s );
+	let z = terrainDetailGrad( p.xy * s + 0.71, g.dpdx.xy * s, g.dpdy.xy * s );
+	return x * w.x + y * w.y + z * w.z;
+}
+
+struct RockSurface {
+	albedo: vec3f,
+	rough: f32,
+	hd: f32,     // bump height (m)
+	moss: f32,   // 0..1
+	wet: f32,
+	height: f32,
+};
+
+// Weathered volcanic rock seen on the headlands, sea stacks and boulders.
+//   p world position, N world normal (geometric / mcr), h height above sea level
+//   mcr: 0..1 large scale variation, seed: per object variation (0..1)
+// With g.useGrad every sample uses the gradients in g (branch safe).
+fn terrainRockSurface( p: vec3f, N: vec3f, h: f32, mcr: f32, seed: f32, mossAmount: f32, g: RockGrad ) -> RockSurface {
+	let w = terrainTriWeights( N );
+	// big blocks (4 m cells), plates (0.9 m) and grain / chips
+	let big = terrainTriplanar( p, w, 27.0, g );
+	let mid = terrainTriplanar( p, w, 6.1, g );
+	let fine = terrainTriplanar( p, w, 1.3, g );
+	// pixel footprint (m): features smaller than a few pixels fade out instead of sparkling
+	let px = select( length( abs( g.dpdx ) + abs( g.dpdy ) ), max( length( g.dpdx ), length( g.dpdy ) ), g.useGrad );
+	let fineK = 1.0 - smoothstep( 0.006, 0.02, px );
+	let midK = 1.0 - smoothstep( 0.03, 0.1, px );
+	let hr = big.x * 0.45 + mid.x * 0.35 + ( ( fine.x - 0.5 ) * fineK + 0.5 ) * 0.2;
+
+	// layered lava flows / bedding on steep faces: irregular bands (1D lookup of the fbm channel
+	// along the height, warped), faded out once a band gets thinner than a few pixels
+	let steep = 1.0 - smoothstep( 0.55, 0.85, N.y );
+	let bandY = p.y + mid.w * 2.5 + mcr * 6.0;
+	var fwY = g.fwY;
+	if ( ! g.useGrad ) { fwY = fwidth( bandY ); }
+	let bandUV = vec2f( bandY / 14.0, seed * 0.37 + 0.13 );
+	var strata: f32;
+	if ( g.useGrad ) {
+		strata = terrainDetailGrad( bandUV, vec2f( fwY / 14.0, 0.0 ), vec2f( 0.0 ) ).w;
+	} else {
+		strata = textureSample( terrainDetailTex, smpAniso4Repeat, bandUV ).w;
+	}
+	let strataAA = 1.0 - smoothstep( 0.15, 0.6, fwY );
+	let tone = hr * 0.9 + ( mcr - 0.5 ) * 0.7 + ( strata - 0.5 ) * 0.8 * steep * strataAA + ( seed - 0.5 ) * 0.3;
+	var col = mix( PAL_rockDark, PAL_rockMid, smoothstep( 0.1, 0.5, tone ) );
+	col = mix( col, PAL_rockLight, smoothstep( 0.5, 0.85, tone ) );
+	// iron staining / warm weathering in patches
+	col = mix( col, PAL_rockWarm, smoothstep( 0.62, 0.8, mid.w + mcr * 0.3 ) * 0.18 );
+	// joints between the big blocks, fainter between plates
+	col = col * ( smoothstep( 0.05, 0.25, big.x ) * 0.35 + 0.65 ) * ( smoothstep( 0.05, 0.25, mid.x ) * 0.15 + 0.85 );
+	// rain streaks: dark stains running down steep faces, paler bands between (the fbm channel
+	// stretched vertically on the two vertical projection planes)
+	let sUVa = vec2f( p.z / 3.1, p.y / 41.0 );
+	let sUVb = vec2f( p.x / 3.1 + 0.5, p.y / 41.0 + 0.3 );
+	let sa = terrainDetailGrad( sUVa, vec2f( g.dpdx.z / 3.1, g.dpdx.y / 41.0 ), vec2f( g.dpdy.z / 3.1, g.dpdy.y / 41.0 ) );
+	let sb = terrainDetailGrad( sUVb, vec2f( g.dpdx.x / 3.1, g.dpdx.y / 41.0 ), vec2f( g.dpdy.x / 3.1, g.dpdy.y / 41.0 ) );
+	let sw4 = pow( abs( N.xz ), vec2f( 4.0 ) );
+	let stainS = ( sa.w * sw4.x + sb.w * sw4.y ) / ( sw4.x + sw4.y + 1e-5 );
+	let stain = smoothstep( 0.52, 0.72, stainS ) * steep;
+	col = col * ( 1.0 - stain * 0.4 ) * ( smoothstep( 0.35, 0.2, stainS ) * steep * 0.12 + 1.0 );
+
+	// lichens on the dry upper faces
+	let dry = smoothstep( 2.6, 4.0, h );
+	let lichen = smoothstep( 0.6, 0.78, mid.y ) * smoothstep( 0.2, 0.7, N.y ) * dry * smoothstep( 0.45, 0.65, mcr );
+	col = mix( col, PAL_lichenPale, lichen * 0.45 );
+	col = mix( col, PAL_lichenOrange, smoothstep( 0.8, 0.88, mid.y ) * dry * smoothstep( 0.5, 0.8, N.y ) * 0.3 );
+
+	// moss / grass on ledges and tops, ferns hanging along the bedding planes of steep faces
+	let ledge = smoothstep( 0.55, 0.7, strata ) * steep * strataAA * smoothstep( 0.4, 0.6, mid.w + ( mcr - 0.5 ) * 0.4 );
+	let moss = max( smoothstep( 0.62, 0.9, N.y + ( big.x - 0.5 ) * 0.5 + ( mcr - 0.5 ) * 0.3 ), ledge * 0.8 )
+		* smoothstep( 2.5, 5.0, h ) * mossAmount;
+	col = mix( col, mix( PAL_moss, PAL_mossDry, mid.w ), moss * 0.9 );
+
+	// shoreline zonation: black lichen band (splash zone), barnacles and algae in the intertidal
+	let splash = smoothstep( 0.5, 1.0, h ) * smoothstep( 2.8, 1.8, h + mid.w * 1.2 ) * smoothstep( 0.35, 0.6, mcr + mid.w * 0.3 );
+	col = mix( col, PAL_blackZone, splash * 0.55 );
+	// sun-bleached, weathered upper faces
+	col = mix( col, PAL_rockLight, smoothstep( 0.35, 0.95, N.y ) * smoothstep( 1.5, 3.0, h ) * 0.3 );
+	let inter = smoothstep( -0.7, -0.2, h ) * smoothstep( 0.7, 0.2, h );
+	let barn = smoothstep( 0.62, 0.72, fine.z ) * inter * fineK;
+	col = mix( col, PAL_algae, inter * smoothstep( 0.4, 0.6, mid.y ) * 0.6 );
+	col = mix( col, PAL_barnacle, barn * 0.8 );
+	// below the water: algae films and pink coralline crusts
+	let sub = smoothstep( -0.3, -1.2, h );
+	col = mix( col, mix( PAL_algae, PAL_coralline, smoothstep( 0.45, 0.7, mid.w ) ), sub * 0.55 );
+
+	// wet below the swash line (dark, glossy)
+	let wet = smoothstep( 1.0, 0.25, h + mid.w * 0.3 );
+	col = col * mix( 1.0, 0.55, wet );
+
+	var r: RockSurface;
+	r.albedo = col;
+	r.rough = mix( mix( 0.88, 0.8, steep ), 0.45, wet ) + moss * 0.06;
+	// relief (m): tilted blocks and plates with bevelled joints, then grain
+	r.hd = big.x * 0.25 + mid.x * 0.07 * ( midK * 0.6 + 0.4 ) + fine.x * 0.012 * fineK * ( 1.0 - wet * 0.6 ) + barn * 0.005;
+	r.moss = moss;
+	r.wet = wet;
+	r.height = hr;
+	return r;
+}
+
+// saturation helper
+fn terrainSaturation( c: vec3f, s: f32 ) -> vec3f {
+	return mix( vec3f( luminance( c ) ), c, s );
+}
+
+struct MeadowTone {
+	tone: vec3f,
+	dry: f32,
+	lush: f32,
+};
+
 //   mA, mB: detail fbm channel at the 173 m / 47 m scales (~0.5 +- 0.1): the samples at
 //   rot2( xz, 0.7 ) / 173 and rot2( xz, 2.1 ) / 47 that the terrain takes anyway; slope: 1 - N.y;
 //   south: N.z (the sun side); detail: optional finer fbm (~0.5 +- 0.1) that breaks up the patches
+//   (hasDetail = false: none)
 // Returns { tone, dry, lush }: mostly fresh green grass with olive, sun-bleached yellow and a few
 // straw-dry patches (more on exposed slopes), darker lush grass in the damp patches (the hollows
 // are darkened further by the AO).
-export const meadowTone = ( mA, mB, slope, south, detail = null ) => {
+fn terrainMeadowTone( mA: f32, mB: f32, slope: f32, south: f32, detail: f32, hasDetail: bool ) -> MeadowTone {
+	var m = mA * 0.55 + mB * 0.45 + slope * 0.25 + south * 0.04;
+	let dd = select( 0.0, detail - 0.5, hasDetail );
+	m += dd * 0.28;
+	let olive = smoothstep( 0.52, 0.6, m );
+	let yellow = smoothstep( 0.6, 0.67, m );
+	let straw = smoothstep( 0.66, 0.73, m + ( mB - 0.5 ) * 0.2 );
+	let lush = smoothstep( 0.46, 0.37, mB * 0.7 + mA * 0.3 + slope * 0.2 + dd * 0.2 );
+	var c = mix( MEADOW_green, MEADOW_olive, olive );
+	c = mix( c, MEADOW_yellow, yellow * 0.8 );
+	c = mix( c, MEADOW_straw, straw * 0.55 );
+	c = mix( c, MEADOW_lush, lush * 0.75 );
+	var o: MeadowTone;
+	o.tone = c;
+	o.dry = olive * 0.4 + yellow * 0.6;
+	o.lush = lush;
+	return o;
+}
+`;
 
-	let m = mA.mul( 0.55 ).add( mB.mul( 0.45 ) ).add( slope.mul( 0.25 ) ).add( south.mul( 0.04 ) );
-	if ( detail ) m = m.add( detail.sub( 0.5 ).mul( 0.28 ) );
-	const olive = smoothstep( 0.52, 0.6, m );
-	const yellow = smoothstep( 0.6, 0.67, m );
-	const straw = smoothstep( 0.66, 0.73, m.add( mB.sub( 0.5 ).mul( 0.2 ) ) );
-	const lush = smoothstep( 0.46, 0.37, mB.mul( 0.7 ).add( mA.mul( 0.3 ) ).add( slope.mul( 0.2 ) ).add( detail ? detail.sub( 0.5 ).mul( 0.2 ) : 0 ) );
-	let c = mix( MEADOW.green, MEADOW.olive, olive );
-	c = mix( c, MEADOW.yellow, yellow.mul( 0.8 ) );
-	c = mix( c, MEADOW.straw, straw.mul( 0.55 ) );
-	c = mix( c, MEADOW.lush, lush.mul( 0.75 ) );
-	return { tone: c, dry: olive.mul( 0.4 ).add( yellow.mul( 0.6 ) ), lush };
+let _module = null;
+let _detailSpec = null;
 
-};
+// the binding spec of the shared detail texture (terrain, rocks, debris, vegetation), bound under
+// the name `terrainDetailTex`
+export function detailBinding() {
+
+	return _detailSpec || ( _detailSpec = { texture: getDetailTexture() } );
+
+}
+
+export function terrainShadingModule() {
+
+	if ( _module ) return _module;
+	_module = new ShaderModule( {
+		name: 'terrainShading',
+		deps: [ commonModule ],
+		bindings: { terrainDetailTex: detailBinding() },
+		code: SHADING_WGSL,
+	} );
+	return _module;
+
+}

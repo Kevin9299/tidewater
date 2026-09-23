@@ -2,16 +2,15 @@
   "name": "tidewater",
   "version": "1.0.0",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 5188",
+    "dev": "vite --host 127.0.0.1 --port 5189",
     "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "three": "^0.186.0"
+    "preview": "vite preview",
+    "test": "node test/engine-math.test.mjs && node test/engine-parity.test.mjs && node test/engine-smoke.mjs"
   },
   "devDependencies": {
     "vite": "^8.3.0",
-    "webgpu": "^0.6.1"
+    "webgpu": "^0.6.1",
+    "three": "^0.186.0"
   },
   "license": "MIT",
   "private": true,

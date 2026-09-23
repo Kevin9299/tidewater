@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../engine/index.js';
 import { mulberry32 } from '../util/Noise.js';
 import { ReefBatch } from './reef/ReefBatch.js';
 import { WORLD } from './WorldLayout.js';
@@ -8,6 +8,7 @@ import { rayGeometry, turtleGeometry } from './fish/CreatureGeometry.js';
 import { createSwimMaterial } from './fish/FishMaterial.js';
 import { bandFade } from '../materials/LODFade.js';
 import { WhaleWater } from '../ocean/WhaleWater.js';
+import { FrameUniforms } from '../engine/render/Frame.js';
 
 // Fish and other swimmers of the reef and the bay, simulated on the CPU and drawn in a single
 // render object (ReefBatch: one indirect draw per model and level of detail) with the
@@ -214,7 +215,8 @@ export class FishSchools {
 
 			if ( camera.isPerspectiveCamera ) {
 
-				this.viewHeight = renderer.domElement.height || this.viewHeight;
+				// (the engine passes no renderer: the internal render height comes from the frame uniforms)
+				this.viewHeight = renderer?.domElement?.height || FrameUniforms.fields.resolution.value.y || this.viewHeight;
 				this.cull( camera );
 
 			}

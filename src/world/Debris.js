@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Group, BufferGeometry, Mesh } from '../engine/index.js';
 import { Builder, Batch } from './village/GeoBuilder.js';
 import { InstancedProps } from './Props.js';
 import { LAYERS } from '../core/SceneRenderer.js';
@@ -37,7 +37,7 @@ export class Debris {
 		this.scene = scene;
 		this.terrainData = terrain.data || terrain;
 		this.gpu = terrain.gpu;
-		this.group = new THREE.Group();
+		this.group = new Group();
 		this.group.name = 'Debris';
 		this.group.matrixAutoUpdate = false;
 		const t0 = performance.now();
@@ -119,38 +119,47 @@ export class Debris {
 		this.materials = { nature: natureMat };
 		const mats = { wood: village.materials.wood, hard: village.materials.hard, nature: natureMat };
 		this.meshes = [];
+		// the village materials' baked textures: the TSL materials baked on first use (a trigger node);
+		// the engine's village meshes call bake() themselves, so the debris meshes drawn with those
+		// materials do too (records into the frame encoder during collection, once)
+		const bakeVillage = () => {
+
+			if ( village.textures && village.textures.bake ) village.textures.bake();
+
+		};
+
 		for ( const key in ranges ) {
 
-			const geo = new THREE.BufferGeometry();
+			const geo = new BufferGeometry();
 			for ( const name in shared.attributes ) geo.setAttribute( name, shared.attributes[ name ] );
 			geo.setIndex( shared.index );
 			geo.boundingBox = shared.boundingBox;
 			geo.boundingSphere = shared.boundingSphere;
 			const r = ranges[ key ];
 			geo.setDrawRange( r.start, r.count );
-			const mesh = new THREE.Mesh( geo, mats[ key ] );
+			const mesh = new Mesh( geo, mats[ key ] );
 			mesh.name = 'debris_' + key;
 			mesh.receiveShadow = true;
 			mesh.castShadow = key === 'wood';
 			if ( key === 'wood' ) {
 
+				// the shadow passes draw wood, hard and the nature casters with this mesh. (The
+				// engine has no onBeforeShadow / onAfterShadow: onBeforeRender runs per pass with that
+				// pass's camera, and the shadow cascade cameras are the only ones with standard depth.)
 				const range = geo.drawRange;
-				mesh.onBeforeShadow = () => {
+				mesh.onBeforeRender = ( renderer, scene, camera ) => {
 
-					range.start = shadowStart;
-					range.count = shadowCount;
-
-				};
-
-				mesh.onAfterShadow = () => {
-
-					range.start = r.start;
-					range.count = r.count;
+					bakeVillage();
+					const shadow = !! camera && ( camera.isShadowCamera === true || camera.reversedDepth === false );
+					range.start = shadow ? shadowStart : r.start;
+					range.count = shadow ? shadowCount : r.count;
 
 				};
 
-			}
+			} else if ( key === 'hard' ) mesh.onBeforeRender = bakeVillage;
 
+			// (the TSL version used staticVelocityMRT on the nature material)
+			mesh.staticVelocity = true;
 			this.meshes.push( mesh );
 
 		}
@@ -159,12 +168,14 @@ export class Debris {
 
 		if ( fabric.vcount > 0 ) {
 
-			const mesh = new THREE.Mesh( fabric.build(), village.materials.fabric );
+			const mesh = new Mesh( fabric.build(), village.materials.fabric );
 			mesh.name = 'debris_fabric';
 			mesh.receiveShadow = true;
 			mesh.castShadow = false;
 			// alpha-tested nets are drawn in the late pass (see App: village_fabric)
 			mesh.layers.set( LAYERS.TRANSPARENT );
+			mesh.staticVelocity = true;
+			mesh.onBeforeRender = bakeVillage;
 			this.meshes.push( mesh );
 
 		}

@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../engine/index.js';
 
 // Shared world layout. Coordinates in meters, y up, sea level y = 0.
 // The open ocean lies to the south (+z); the island to the north (-z).

@@ -85,9 +85,12 @@ export const ShadowUniforms = new UniformBlock( 'SunShadow', {
 	fade: [ 'f32', 1 ],
 	// cascades below this index use the contact-hardening (PCSS) filter
 	pcssCascades: [ 'u32', 1 ],
-	sunAngularDiameter: [ 'f32', 0.0093 ],
+	sunAngularDiameter: [ 'f32', 0.00925 ], // rad (tan of the 0.53 deg angular diameter)
 	enabled: [ 'f32', 0 ],
 	pad: [ 'f32', 0 ],
+	// per cascade seam blending (SoftCSMShadowNode): x, y = the cascade's view distance range (m), z / w =
+	// blend band (m) centred on its near / far seam
+	blend: [ 'vec4f[4]', [ new Vector4(), new Vector4(), new Vector4(), new Vector4() ] ],
 } );
 
 let _shadowMap = null;
@@ -123,7 +126,20 @@ fn _shadowDepth( uv: vec2f, layer: i32 ) -> f32 {
 	return textureLoad( sunShadowMap, px, layer, 0 );
 }
 
-fn sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32 ) -> f32 {
+// Contact-hardening sun shadows (PCSS, the former SunShadowFilter) on the near cascades. The penumbra of a
+// real sun shadow grows with the distance from the occluder to the receiver (the sun is a 0.53 deg disc):
+// sharp where an object touches the ground, soft under a palm crown 10 m up. Per pixel:
+//  1. blocker search: average depth of the occluders around the pixel (raw depth loads, no sampler)
+//  2. penumbra width = occluder-receiver distance * sun diameter, converted to this cascade's texels
+//  3. percentage-closer filtering over that width
+// Both sample sets are Vogel disks rotated per pixel and per frame (interleaved gradient noise): the
+// TAA resolves the noise into a smooth gradient. Farther cascades: three's PCFShadowFilter (5 Vogel taps
+// of hardware comparisons over one texel, rotated per pixel).
+const SHADOW_MAX_OCCLUDER_HEIGHT: f32 = 30.0; // m: search radius covers penumbrae of occluders up to this far above
+const SHADOW_SEARCH_TAPS: i32 = 8;
+const SHADOW_FILTER_TAPS: i32 = 12;
+
+fn sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32, pcfNoise: f32 ) -> f32 {
 	let info = shadowParams.cascades[ c ];
 	let Pb = P + N * info.z;
 	let sc = shadowParams.matrices[ c ] * vec4f( Pb, 1.0 );
@@ -131,45 +147,92 @@ fn sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32 ) -> f32 {
 	if ( any( uvz.xy < vec2f( 0.0 ) ) || any( uvz.xy > vec2f( 1.0 ) ) || uvz.z > 1.0 ) { return 1.0; }
 	let z = uvz.z - shadowParams.bias;
 	let texel = 1.0 / shadowParams.mapSize;
-	let phi = noise * TWO_PI;
-	var radius = texel * 1.5;
 	if ( u32( c ) < shadowParams.pcssCascades ) {
-		// blocker search -> penumbra = occluder distance * sun diameter (in this cascade's texels)
-		let searchUV = min( 30.0 * shadowParams.sunAngularDiameter / info.y, 24.0 ) * texel;
-		var blockers = 0.0; var sumZ = 0.0;
-		for ( var i = 0; i < 12; i++ ) {
-			let o = vogelDiskSample( i, 12, phi ) * searchUV;
-			let d = _shadowDepth( uvz.xy + o, c );
-			if ( d < z ) { blockers += 1.0; sumZ += d; }
+		// moved every frame (Jimenez 2014): a noise pattern fixed on screen would never average out
+		let phi = noise * TWO_PI;
+		let width = info.y * shadowParams.mapSize; // cascade width (m)
+		let range = info.w; // depth range (m)
+		let SD = shadowParams.sunAngularDiameter;
+		// 1. blockers within the widest penumbra this cascade can show. The texel straight along the light
+		// ray comes first: a thin occluder (a log, a rope, a rail) can fall between the disk taps, which
+		// left lit dots inside its umbra.
+		let searchUV = max( min( SHADOW_MAX_OCCLUDER_HEIGHT * SD / width, texel * 24.0 ), texel * 1.5 );
+		let d0 = _shadowDepth( uvz.xy, c );
+		var blockSum = select( 0.0, d0, d0 < z );
+		var blockCount = select( 0.0, 1.0, d0 < z );
+		for ( var i = 0; i < SHADOW_SEARCH_TAPS; i++ ) {
+			let d = _shadowDepth( uvz.xy + vogelDiskSample( i, SHADOW_SEARCH_TAPS, phi ) * searchUV, c );
+			// standard depth: an occluder is closer to the light = smaller depth
+			if ( d < z ) { blockSum += d; blockCount += 1.0; }
 		}
-		if ( blockers < 0.5 ) { return 1.0; }
-		let dz = ( z - sumZ / blockers ) * info.w; // metres between occluder and receiver
-		radius = clamp( dz * shadowParams.sunAngularDiameter / info.y * texel, texel * 1.2, texel * 32.0 );
+		if ( blockCount < 0.5 ) { return 1.0; }
+		// 2. occluder-receiver distance (orthographic: depth is linear over the camera range)
+		let dz = abs( blockSum / blockCount - z ) * range;
+		let penumbraUV = clamp( dz * SD / width, texel * 1.2, texel * 32.0 );
+		// 3. PCF over the penumbra
+		var sum = 0.0;
+		for ( var i = 0; i < SHADOW_FILTER_TAPS; i++ ) {
+			let d = _shadowDepth( uvz.xy + vogelDiskSample( i, SHADOW_FILTER_TAPS, phi + 1.7 ) * penumbraUV, c );
+			sum += select( 0.0, 1.0, z <= d );
+		}
+		return sum / f32( SHADOW_FILTER_TAPS );
 	}
+	// three's PCFShadowFilter: 5 samples on a Vogel disk of one texel, rotated per pixel
+	let phiP = pcfNoise * TWO_PI;
 	var sum = 0.0;
-	for ( var i = 0; i < 16; i++ ) {
-		sum += _shadowTap( uvz.xy + vogelDiskSample( i, 16, phi + 1.7 ) * radius, c, z );
+	for ( var i = 0; i < 5; i++ ) {
+		sum += _shadowTap( uvz.xy + vogelDiskSample( i, 5, phiP ) * texel, c, z );
 	}
-	return sum / 16.0;
+	return sum / 5.0;
 }
 
-// visibility of the sun at P (1 = lit); pixel = fragment coordinate for the dither
+// visibility of the sun at P (1 = lit); pixel = fragment coordinate for the dither.
+// Cascade seams blended over a band that grows with their distance (SoftCSMShadowNode: a quarter of it,
+// 2.5 m at the 10 m seam, 15 m at 60 m, and the last cascade fades out over its final 100 m); each
+// cascade's map is widened to cover its part of the overlap.
 fn sunShadow( P: vec3f, N: vec3f, pixel: vec2f ) -> f32 {
+	if ( shadowParams.enabled < 0.5 ) { return 1.0; }
+	let dist = dot( P - frame.cameraPos, - vec3f( frame.view[ 0 ][ 2 ], frame.view[ 1 ][ 2 ], frame.view[ 2 ][ 2 ] ) );
+	let noise = interleavedGradientNoise( pixel + f32( frame.frameIndex % 64u ) * 5.588238 );
+	let pcfNoise = interleavedGradientNoise( pixel );
+	if ( shadowParams.fade < 0.5 ) {
+		let c = shadowCascadeOf( dist );
+		if ( c < 0 ) { return 1.0; }
+		return sunShadowCascade( P, N, c, noise, pcfNoise );
+	}
+	var ret = 1.0;
+	let last = i32( shadowParams.count ) - 1;
+	for ( var i = 0; i <= last; i++ ) {
+		let b = shadowParams.blend[ i ]; // x, y: cascade range, z / w: blend margin at its near / far seam
+		let center = ( b.x + b.y ) * 0.5;
+		let margin = max( select( b.w, b.z, dist < center ), 1e-5 );
+		let csmX = b.x - margin * 0.5;
+		let csmY = select( b.y + margin * 0.5, b.y, i == last );
+		if ( dist >= csmX && dist <= csmY ) {
+			var ratio = clamp( min( dist - csmX, csmY - dist ) / margin, 0.0, 1.0 );
+			// no fade at the near edge of the first cascade
+			if ( i == 0 && dist <= center ) { ratio = 1.0; }
+			ret -= ( 1.0 - sunShadowCascade( P, N, i, noise, pcfNoise ) ) * ratio;
+		}
+	}
+	return max( ret, 0.0 );
+}
+
+// one depth comparison in cascade c (1 = lit; outside the map: lit). For volumetric marches (haze shafts,
+// motes) where the jitter and the temporal resolve do the filtering.
+fn sunShadowCascadeHard( P: vec3f, c: i32 ) -> f32 {
+	let sc = shadowParams.matrices[ c ] * vec4f( P, 1.0 );
+	let uv = vec2f( sc.x * 0.5 + 0.5, 0.5 - sc.y * 0.5 );
+	if ( any( uv <= vec2f( 0.0 ) ) || any( uv >= vec2f( 1.0 ) ) || sc.z > 1.0 ) { return 1.0; }
+	return select( 0.0, 1.0, sc.z - 2e-5 <= _shadowDepth( uv, c ) );
+}
+// same in the cascade covering P (by view distance), 1 beyond the last one or with shadows off
+fn sunShadowHard( P: vec3f ) -> f32 {
 	if ( shadowParams.enabled < 0.5 ) { return 1.0; }
 	let dist = dot( P - frame.cameraPos, - vec3f( frame.view[ 0 ][ 2 ], frame.view[ 1 ][ 2 ], frame.view[ 2 ][ 2 ] ) );
 	let c = shadowCascadeOf( dist );
 	if ( c < 0 ) { return 1.0; }
-	let noise = interleavedGradientNoise( pixel + f32( frame.frameIndex % 64u ) * 5.588238 );
-	var s = sunShadowCascade( P, N, c, noise );
-	// blend into the next cascade (or out to unshadowed) over the last 10% of this one
-	let far = shadowParams.cascades[ c ].x;
-	let near = select( 0.0, shadowParams.cascades[ max( c - 1, 0 ) ].x, c > 0 );
-	let t = sat( ( dist - mix( near, far, 0.9 ) ) / ( far - mix( near, far, 0.9 ) ) );
-	if ( t > 0.0 && shadowParams.fade > 0.5 ) {
-		let next = select( 1.0, sunShadowCascade( P, N, c + 1, noise ), c + 1 < i32( shadowParams.count ) );
-		s = mix( s, next, t );
-	}
-	return s;
+	return sunShadowCascadeHard( P, c );
 }
 `,
 } );
@@ -292,6 +355,10 @@ fn shadeSurface( s: Surface, P: vec3f, V: vec3f, pixel: vec2f ) -> vec3f {
 	let L = frame.sunDir;
 	let dotNL = sat( dot( N, L ) );
 	var lightColor = frame.sunColor * hookDirectModulation( P, N );
+#if MATERIAL_SUN_MODULATION
+	// per-material key-light multiplier (the former TerrainLightingModel: heightfield hill shadow)
+	lightColor *= materialSunModulation( P, N );
+#endif
 	let geomN = N;
 	let shadow = sunShadow( P, geomN, pixel ) * hookContactShadow( P, N );
 	lightColor *= shadow;

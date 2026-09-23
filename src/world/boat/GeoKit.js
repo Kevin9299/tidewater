@@ -1,6 +1,4 @@
-import * as THREE from 'three/webgpu';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { BoxGeometry, BufferGeometry, CatmullRomCurve3, Color, CylinderGeometry, Euler, Float32BufferAttribute, LatheGeometry, Matrix4, Quaternion, ShapeUtils, SphereGeometry, TorusGeometry, TubeGeometry, Vector2, Vector3, RoundedBoxGeometry, mergeGeometries } from '../../engine/index.js';
 
 // Geometry helpers for the procedural boat. Every geometry is normalized to the
 // same attribute layout so parts can be merged per material:
@@ -8,17 +6,17 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 //   aux = (roughness, metalness, pattern id, animation weight)
 
 const KEEP = new Set( [ 'position', 'normal', 'uv', 'color', 'aux' ] );
-const _color = new THREE.Color();
-const _v = new THREE.Vector3();
-const _q = new THREE.Quaternion();
-const _e = new THREE.Euler();
-const _s = new THREE.Vector3();
+const _color = new Color();
+const _v = new Vector3();
+const _q = new Quaternion();
+const _e = new Euler();
+const _s = new Vector3();
 
 export function mat4( x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sx = 1, sy = sx, sz = sx, order = 'XYZ' ) {
 
 	_e.set( rx, ry, rz, order );
 	_q.setFromEuler( _e );
-	return new THREE.Matrix4().compose( _v.set( x, y, z ), _q, _s.set( sx, sy, sz ) );
+	return new Matrix4().compose( _v.set( x, y, z ), _q, _s.set( sx, sy, sz ) );
 
 }
 
@@ -26,15 +24,15 @@ export function mat4( x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sx = 1, sy = 
 export function alignY( pos, dir, roll = 0 ) {
 
 	const d = dir.clone().normalize();
-	const q = new THREE.Quaternion().setFromUnitVectors( new THREE.Vector3( 0, 1, 0 ), d );
-	if ( roll ) q.multiply( new THREE.Quaternion().setFromAxisAngle( new THREE.Vector3( 0, 1, 0 ), roll ) );
-	return new THREE.Matrix4().compose( pos, q, new THREE.Vector3( 1, 1, 1 ) );
+	const q = new Quaternion().setFromUnitVectors( new Vector3( 0, 1, 0 ), d );
+	if ( roll ) q.multiply( new Quaternion().setFromAxisAngle( new Vector3( 0, 1, 0 ), roll ) );
+	return new Matrix4().compose( pos, q, new Vector3( 1, 1, 1 ) );
 
 }
 
 export function linearColor( c ) {
 
-	return c instanceof THREE.Color ? c : _color.set( c ).clone();
+	return c instanceof Color ? c : _color.set( c ).clone();
 
 }
 
@@ -54,7 +52,7 @@ export function prepare( geo, { color = 0xffffff, rough = 0.5, metal = 0, patter
 	}
 
 	if ( ! geo.attributes.normal ) geo.computeVertexNormals();
-	if ( ! geo.attributes.uv ) geo.setAttribute( 'uv', new THREE.Float32BufferAttribute( new Float32Array( n * 2 ), 2 ) );
+	if ( ! geo.attributes.uv ) geo.setAttribute( 'uv', new Float32BufferAttribute( new Float32Array( n * 2 ), 2 ) );
 
 	if ( ! geo.attributes.color ) {
 
@@ -66,7 +64,7 @@ export function prepare( geo, { color = 0xffffff, rough = 0.5, metal = 0, patter
 
 		}
 
-		geo.setAttribute( 'color', new THREE.Float32BufferAttribute( arr, 3 ) );
+		geo.setAttribute( 'color', new Float32BufferAttribute( arr, 3 ) );
 
 	}
 
@@ -79,7 +77,7 @@ export function prepare( geo, { color = 0xffffff, rough = 0.5, metal = 0, patter
 
 		}
 
-		geo.setAttribute( 'aux', new THREE.Float32BufferAttribute( arr, 4 ) );
+		geo.setAttribute( 'aux', new Float32BufferAttribute( arr, 4 ) );
 
 	}
 
@@ -89,7 +87,7 @@ export function prepare( geo, { color = 0xffffff, rough = 0.5, metal = 0, patter
 		const a = geo.attributes[ name ];
 		if ( ! ( a.array instanceof Float32Array ) || a.isInterleavedBufferAttribute ) {
 
-			geo.setAttribute( name, new THREE.Float32BufferAttribute( Float32Array.from( { length: a.count * a.itemSize }, ( _, i ) => a.array[ i ] ), a.itemSize ) );
+			geo.setAttribute( name, new Float32BufferAttribute( Float32Array.from( { length: a.count * a.itemSize }, ( _, i ) => a.array[ i ] ), a.itemSize ) );
 
 		}
 
@@ -147,7 +145,7 @@ export function mergePrepared( list ) {
 // Box with UVs in meters.
 export function box( w, h, d ) {
 
-	const g = new THREE.BoxGeometry( w, h, d );
+	const g = new BoxGeometry( w, h, d );
 	const uv = g.attributes.uv;
 	// face order: px, nx, py, ny, pz, nz (4 vertices each)
 	const dims = [ [ d, h ], [ d, h ], [ w, d ], [ w, d ], [ w, h ], [ w, h ] ];
@@ -177,7 +175,7 @@ export function roundedBox( w, h, d, radius = 0.02, segments = 2 ) {
 
 export function cylinder( rTop, rBottom, h, radial = 12, heightSegs = 1, open = false, thetaStart = 0, thetaLength = Math.PI * 2 ) {
 
-	const g = new THREE.CylinderGeometry( rTop, rBottom, h, radial, heightSegs, open, thetaStart, thetaLength );
+	const g = new CylinderGeometry( rTop, rBottom, h, radial, heightSegs, open, thetaStart, thetaLength );
 	const uv = g.attributes.uv;
 	const circ = Math.max( rTop, rBottom ) * thetaLength;
 	for ( let i = 0; i < uv.count; i ++ ) uv.setXY( i, uv.getX( i ) * circ, uv.getY( i ) * h );
@@ -188,23 +186,23 @@ export function cylinder( rTop, rBottom, h, radial = 12, heightSegs = 1, open = 
 // Cylinder between two points.
 export function rod( a, b, radius, radial = 8, rEnd = radius ) {
 
-	const dir = new THREE.Vector3().subVectors( b, a );
+	const dir = new Vector3().subVectors( b, a );
 	const len = dir.length();
 	const g = cylinder( rEnd, radius, len, radial, 1, false );
-	g.applyMatrix4( alignY( new THREE.Vector3().addVectors( a, b ).multiplyScalar( 0.5 ), dir ) );
+	g.applyMatrix4( alignY( new Vector3().addVectors( a, b ).multiplyScalar( 0.5 ), dir ) );
 	return g;
 
 }
 
 export function sphere( r, w = 12, h = 8, phiStart = 0, phiLength = Math.PI * 2, thetaStart = 0, thetaLength = Math.PI ) {
 
-	return new THREE.SphereGeometry( r, w, h, phiStart, phiLength, thetaStart, thetaLength );
+	return new SphereGeometry( r, w, h, phiStart, phiLength, thetaStart, thetaLength );
 
 }
 
 export function torus( R, r, radial = 8, tubular = 24, arc = Math.PI * 2 ) {
 
-	const g = new THREE.TorusGeometry( R, r, radial, tubular, arc );
+	const g = new TorusGeometry( R, r, radial, tubular, arc );
 	const uv = g.attributes.uv;
 	for ( let i = 0; i < uv.count; i ++ ) uv.setXY( i, uv.getX( i ) * R * arc, uv.getY( i ) * 2 * Math.PI * r );
 	return g;
@@ -214,8 +212,8 @@ export function torus( R, r, radial = 8, tubular = 24, arc = Math.PI * 2 ) {
 // Lathe around +Y from [ [r, y], ... ] (bottom to top).
 export function lathe( profile, segments = 16 ) {
 
-	const pts = profile.map( ( p ) => new THREE.Vector2( Math.max( 0, p[ 0 ] ), p[ 1 ] ) );
-	const g = new THREE.LatheGeometry( pts, segments );
+	const pts = profile.map( ( p ) => new Vector2( Math.max( 0, p[ 0 ] ), p[ 1 ] ) );
+	const g = new LatheGeometry( pts, segments );
 	// three's lathe winds so normals face outward for bottom-to-top profiles
 	return g;
 
@@ -223,8 +221,8 @@ export function lathe( profile, segments = 16 ) {
 
 export function tube( points, radius, tubular = 32, radial = 6, closed = false, tension = 0.5 ) {
 
-	const curve = new THREE.CatmullRomCurve3( points, closed, 'catmullrom', tension );
-	const g = new THREE.TubeGeometry( curve, tubular, radius, radial, closed );
+	const curve = new CatmullRomCurve3( points, closed, 'catmullrom', tension );
+	const g = new TubeGeometry( curve, tubular, radius, radial, closed );
 	const len = curve.getLength();
 	const uv = g.attributes.uv;
 	for ( let i = 0; i < uv.count; i ++ ) uv.setXY( i, uv.getX( i ) * len, uv.getY( i ) );
@@ -280,9 +278,9 @@ export function gridSurface( rows, { flip = false, uvFn = null, closeJ = false }
 
 	}
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 	g.setIndex( idx );
 	g.computeVertexNormals();
 	return g;
@@ -292,15 +290,15 @@ export function gridSurface( rows, { flip = false, uvFn = null, closeJ = false }
 // Flat polygon (Vector3 loop, assumed planar-ish and convex-ish) as a fan from its centroid.
 export function fanCap( loop, normalHint ) {
 
-	const c = new THREE.Vector3();
+	const c = new Vector3();
 	for ( const p of loop ) c.add( p );
 	c.divideScalar( loop.length );
 	const pos = [ c.x, c.y, c.z ];
 	for ( const p of loop ) pos.push( p.x, p.y, p.z );
 	const idx = [];
 	for ( let i = 0; i < loop.length; i ++ ) idx.push( 0, 1 + i, 1 + ( ( i + 1 ) % loop.length ) );
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
 	g.setIndex( idx );
 	orientTowards( g, normalHint );
 	g.computeVertexNormals();
@@ -313,7 +311,7 @@ export function fanCap( loop, normalHint ) {
 export function orientTowards( g, dir ) {
 
 	const p = g.attributes.position, idx = g.index.array;
-	const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), n = new THREE.Vector3(), acc = new THREE.Vector3();
+	const a = new Vector3(), b = new Vector3(), c = new Vector3(), n = new Vector3(), acc = new Vector3();
 	for ( let i = 0; i < idx.length; i += 3 ) {
 
 		a.fromBufferAttribute( p, idx[ i ] ); b.fromBufferAttribute( p, idx[ i + 1 ] ); c.fromBufferAttribute( p, idx[ i + 2 ] );
@@ -343,11 +341,11 @@ export function orientTowards( g, dir ) {
 export function planarUV( g, normal ) {
 
 	const n = normal.clone().normalize();
-	const t = Math.abs( n.y ) > 0.9 ? new THREE.Vector3( 1, 0, 0 ) : new THREE.Vector3( 0, 1, 0 ).cross( n ).normalize();
-	const b = new THREE.Vector3().crossVectors( n, t );
+	const t = Math.abs( n.y ) > 0.9 ? new Vector3( 1, 0, 0 ) : new Vector3( 0, 1, 0 ).cross( n ).normalize();
+	const b = new Vector3().crossVectors( n, t );
 	const p = g.attributes.position;
 	const uv = new Float32Array( p.count * 2 );
-	const v = new THREE.Vector3();
+	const v = new Vector3();
 	for ( let i = 0; i < p.count; i ++ ) {
 
 		v.fromBufferAttribute( p, i );
@@ -355,7 +353,7 @@ export function planarUV( g, normal ) {
 
 	}
 
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uv, 2 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( uv, 2 ) );
 	return g;
 
 }
@@ -365,11 +363,11 @@ export function planarUV( g, normal ) {
 // Faces are oriented automatically (front faces away from the back face, edges outward).
 export function slab( outline, holes, map, { edges = true, back = true, front = true } = {} ) {
 
-	const contour = outline.map( ( p ) => new THREE.Vector2( p[ 0 ], p[ 1 ] ) );
-	const holeVs = holes.map( ( h ) => h.map( ( p ) => new THREE.Vector2( p[ 0 ], p[ 1 ] ) ) );
-	if ( THREE.ShapeUtils.isClockWise( contour ) ) contour.reverse();
-	for ( const h of holeVs ) if ( ! THREE.ShapeUtils.isClockWise( h ) ) h.reverse();
-	const tris = THREE.ShapeUtils.triangulateShape( contour, holeVs );
+	const contour = outline.map( ( p ) => new Vector2( p[ 0 ], p[ 1 ] ) );
+	const holeVs = holes.map( ( h ) => h.map( ( p ) => new Vector2( p[ 0 ], p[ 1 ] ) ) );
+	if ( ShapeUtils.isClockWise( contour ) ) contour.reverse();
+	for ( const h of holeVs ) if ( ! ShapeUtils.isClockWise( h ) ) h.reverse();
+	const tris = ShapeUtils.triangulateShape( contour, holeVs );
 	const all = contour.concat( ...holeVs );
 
 	const parts = [];
@@ -393,9 +391,9 @@ export function slab( outline, holes, map, { edges = true, back = true, front = 
 
 		}
 
-		const g = new THREE.BufferGeometry();
-		g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-		g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+		const g = new BufferGeometry();
+		g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+		g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 		g.setIndex( idx );
 		// orient: front normal points from back face toward front face
 		const c = contour[ 0 ];
@@ -422,8 +420,8 @@ export function slab( outline, holes, map, { edges = true, back = true, front = 
 
 		const pos = [], uvs = [], idx = [];
 		const loops = [ contour, ...holeVs ];
-		const a0 = new THREE.Vector3(), a1 = new THREE.Vector3(), b0 = new THREE.Vector3(), b1 = new THREE.Vector3();
-		const n = new THREE.Vector3(), out = new THREE.Vector3();
+		const a0 = new Vector3(), a1 = new Vector3(), b0 = new Vector3(), b1 = new Vector3();
+		const n = new Vector3(), out = new Vector3();
 		for ( const loop of loops ) {
 
 			let len = 0;
@@ -453,9 +451,9 @@ export function slab( outline, holes, map, { edges = true, back = true, front = 
 
 		if ( pos.length ) {
 
-			const g = new THREE.BufferGeometry();
-			g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-			g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+			const g = new BufferGeometry();
+			g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+			g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 			g.setIndex( idx );
 			g.computeVertexNormals();
 			parts.push( g );
@@ -479,7 +477,7 @@ export function loft( profiles, { closed = false, flip = false } = {} ) {
 
 		const nj = rows[ 0 ].length;
 		const nrm = g.attributes.normal;
-		const a = new THREE.Vector3(), b = new THREE.Vector3();
+		const a = new Vector3(), b = new Vector3();
 		for ( let i = 0; i < rows.length; i ++ ) {
 
 			const i0 = i * nj, i1 = i * nj + nj - 1;
@@ -500,7 +498,7 @@ export function paintVertices( g, fn ) {
 
 	const p = g.attributes.position;
 	const arr = new Float32Array( p.count * 3 );
-	const v = new THREE.Vector3();
+	const v = new Vector3();
 	for ( let i = 0; i < p.count; i ++ ) {
 
 		v.fromBufferAttribute( p, i );
@@ -509,7 +507,7 @@ export function paintVertices( g, fn ) {
 
 	}
 
-	g.setAttribute( 'color', new THREE.Float32BufferAttribute( arr, 3 ) );
+	g.setAttribute( 'color', new Float32BufferAttribute( arr, 3 ) );
 	return g;
 
 }
@@ -519,7 +517,7 @@ export function auxVertices( g, fn ) {
 
 	const p = g.attributes.position;
 	const arr = new Float32Array( p.count * 4 );
-	const v = new THREE.Vector3();
+	const v = new Vector3();
 	for ( let i = 0; i < p.count; i ++ ) {
 
 		v.fromBufferAttribute( p, i );
@@ -528,7 +526,7 @@ export function auxVertices( g, fn ) {
 
 	}
 
-	g.setAttribute( 'aux', new THREE.Float32BufferAttribute( arr, 4 ) );
+	g.setAttribute( 'aux', new Float32BufferAttribute( arr, 4 ) );
 	return g;
 
 }

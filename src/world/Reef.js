@@ -1,10 +1,9 @@
-import * as THREE from 'three/webgpu';
-import { uniform } from 'three/tsl';
+import * as THREE from '../engine/index.js';
 import { WORLD } from './WorldLayout.js';
 import { mulberry32, Noise2D, smoothstep } from '../util/Noise.js';
 import * as Geo from './reef/ReefGeometry.js';
 import { ReefBatch } from './reef/ReefBatch.js';
-import { createReefMaterials, SURFACE, packColor } from './reef/ReefMaterials.js';
+import { createReefMaterials, createReefView, SURFACE, packColor } from './reef/ReefMaterials.js';
 import { bandFade } from '../materials/LODFade.js';
 import { createNoiseVolume } from './reef/ReefNoise.js';
 import { FishSchools } from './Fish.js';
@@ -1168,11 +1167,14 @@ export class Reef {
 
 		this.noise3D = createNoiseVolume();
 		// the main camera and the draw distance, for the distance fade (the shadow pass has its own camera)
-		this.view = { position: uniform( new THREE.Vector3() ).setName( 'reefCam' ), range: uniform( RANGE ).setName( 'reefRange' ) };
-		const mats = createReefMaterials( { hard: this.batches.hard, soft: this.batches.soft, getOcean: () => this.fft, noise: this.noise3D, view: this.view } );
+		this.viewBlock = createReefView();
+		this.view = this.viewBlock.fields; // { position, range } handles (WGSL reefView.position / .range)
+		this.view.position.value = new THREE.Vector3();
+		this.view.range.value = RANGE;
+		const mats = createReefMaterials( { hard: this.batches.hard, soft: this.batches.soft, getOcean: () => this.fft, noise: this.noise3D, view: this.viewBlock } );
 		this.materials = mats;
 		// level-of-detail cross-fades: dithered second draws of the instances in transition bands
-		const fadeMats = createReefMaterials( { hard: this.batches.hard, soft: this.batches.soft, getOcean: () => this.fft, noise: this.noise3D, view: this.view, fade: true } );
+		const fadeMats = createReefMaterials( { hard: this.batches.hard, soft: this.batches.soft, getOcean: () => this.fft, noise: this.noise3D, view: this.viewBlock, fade: true } );
 		this.fadeMaterials = fadeMats;
 		this.group.add( this.batches.hard.createFadeMesh( fadeMats.hard ), this.batches.soft.createFadeMesh( fadeMats.soft ) );
 		const hard = this.batches.hard.createMesh( mats.hard, { castShadow: true } );
@@ -1414,7 +1416,7 @@ export class Reef {
 
 		for ( const b of Object.values( this.batches ) ) b.dispose();
 		for ( const m of [ ...Object.values( this.materials ), ...Object.values( this.fadeMaterials ) ] ) m.dispose();
-		this.noise3D.dispose();
+		this.noise3D.destroy();
 		this.fish.dispose();
 		this.group.removeFromParent();
 

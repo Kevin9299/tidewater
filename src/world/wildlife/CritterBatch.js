@@ -1,13 +1,9 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, If, float, int, uint, vec2, vec3, vec4, storage, uniformArray, vertexIndex, varyingProperty, normalLocal, attribute,
-	select, mix, smoothstep, abs, sin, cos, asin, clamp, normalize, cross, length, max, fract, mx_noise_float, Discard,
-	interleavedGradientNoise, screenCoordinate, atan,
-} from 'three/tsl';
-import { G } from '../../core/Globals.js';
-import { standard } from '../../materials/Materials.js';
+import * as THREE from '../../engine/index.js';
+import { Material } from '../../engine/render/Material.js';
+import { StorageBuffer } from '../../engine/gpu/Texture.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
 import { buildCritters, BODY_VERTS, LIMBS, CRITTER } from './CritterShapes.js';
-import { InstanceRecords, instancedMesh, rotateQ, motionVelocity } from './Kit.js';
+import { InstanceRecords, instancedMesh, kitModule } from './Kit.js';
 
 // One instanced draw for the beach critters: ghost crabs, hermit crabs and burrows.
 //
@@ -19,7 +15,14 @@ import { InstanceRecords, instancedMesh, rotateQ, motionVelocity } from './Kit.j
 //   4 previous position, previous gait phase     5 previous orientation
 
 const REC = 6;
-const srgb = ( r, g, b ) => vec3( Math.pow( r, 2.2 ), Math.pow( g, 2.2 ), Math.pow( b, 2.2 ) );
+// WGSL: an sRGB-ish colour literal, linearised on the CPU (as the TSL version's srgb())
+const f = ( x ) => {
+
+	const t = String( + x.toFixed( 6 ) );
+	return t.includes( '.' ) || t.includes( 'e' ) ? t : t + '.0';
+
+};
+const srgb = ( r, g, b ) => `vec3f( ${ f( Math.pow( r, 2.2 ) ) }, ${ f( Math.pow( g, 2.2 ) ) }, ${ f( Math.pow( b, 2.2 ) ) } )`;
 
 // tetrapod gait: legs 0, 2, 5, 7 swing together, 1, 3, 4, 6 half a cycle later
 const GAIT = [ 0, Math.PI, 0, Math.PI, Math.PI, 0, Math.PI, 0 ];
@@ -30,8 +33,8 @@ export class CritterBatch {
 
 		const T = buildCritters();
 		this.template = T;
-		this.bodyNode = storage( new THREE.StorageBufferAttribute( T.bodyData, 4 ), 'vec4', T.bodyData.length / 4 ).toReadOnly().setName( 'critterBodies' );
-		this.limbs = uniformArray( T.limbs, 'vec4' ).setName( 'critterLimbs' );
+		this.bodyBuffer = new StorageBuffer( { label: 'critterBodies', count: T.bodyData.length / 4, type: 'vec4f', data: T.bodyData } );
+		this.limbs = T.limbs;
 		this.records = new InstanceRecords( 'critterInstances', capacity, REC );
 		this.material = this.createMaterial();
 		this.mesh = instancedMesh( 'Critters', T.geometry, this.material, this.records, { castShadow: false } );
@@ -74,202 +77,204 @@ export class CritterBatch {
 
 	createMaterial() {
 
-		const R = this.records, BODY = this.bodyNode, LT = this.limbs;
-		const aLimb = attribute( 'aLimb', 'vec4' ), aRing = attribute( 'aRing', 'vec2' );
-		const vInfo = varyingProperty( 'vec4', 'vCritInfo' ); // part (0 body, 1 leg, 2 claw, 3 eye), u, v, species + seed
-		const vLocal = varyingProperty( 'vec3', 'vCritLocal' );
-		const vDelta = varyingProperty( 'vec3', 'vCritDelta' );
-		const gait = uniformArray( GAIT.map( ( g ) => new THREE.Vector4( g, 0, 0, 0 ) ), 'vec4' );
-
-		const mat = standard( { roughness: 0.6, metalness: 0 } );
-		mat.name = 'Critters';
-		mat.underwaterLighting = 'none';
+		const R = this.records;
+		const F = ( k ) => R.field( k );
+		const gait = GAIT.map( ( g ) => new THREE.Vector4( g, 0, 0, 0 ) );
 
 		// joints of limb k for gait phase ph: j0 (at the body) .. j3 (tip)
-		const joints = ( si, k, ph, stride, lift, out, eyes, claws ) => {
+		const helpers = new ShaderModule( {
+			name: 'critterJoints',
+			deps: [ kitModule ],
+			code: /* wgsl */`
+struct CritterJoints { j0: vec3f, j1: vec3f, j2: vec3f, j3: vec3f, r: f32 };
 
-			const a = LT.element( si.mul( LIMBS * 2 ).add( k.mul( 2 ) ) );
-			const L = LT.element( si.mul( LIMBS * 2 ).add( k.mul( 2 ) ).add( 1 ) );
-			const dir = ( az, el ) => vec3( cos( az ).mul( cos( el ) ), sin( el ), sin( az ).mul( cos( el ) ) );
-			const kf = float( k );
-			const isLeg = kf.lessThan( 7.5 ), isClaw = kf.greaterThan( 7.5 ).and( kf.lessThan( 9.5 ) );
-			const side = select( a.x.greaterThan( 0 ), float( 1 ), float( - 1 ) );
-			const p = ph.add( gait.element( k.min( uint( 7 ) ) ).x );
-			const swing = max( sin( p ), 0 ).mul( stride );
-			const az = a.w.add( cos( p ).mul( stride ).mul( 0.28 ).mul( select( isLeg, 1, 0 ) ) );
-			const j0 = vec3( a.x, a.y.add( lift ), a.z ).toVar();
-			const j1 = vec3( 0 ).toVar(), j2 = vec3( 0 ).toVar(), j3 = vec3( 0 ).toVar();
-			If( isLeg, () => {
+fn critterDir( az: f32, el: f32 ) -> vec3f { return vec3f( cos( az ) * cos( el ), sin( el ), sin( az ) * cos( el ) ); }
 
-				// merus up and out, carpus level, dactyl reaching down to the ground
-				j1.assign( j0.add( dir( az, float( 0.62 ).add( swing.mul( 0.22 ) ) ).mul( L.x ) ) );
-				j2.assign( j1.add( dir( az, float( - 0.15 ).add( swing.mul( 0.15 ) ) ).mul( L.y ) ) );
-				const e3 = asin( clamp( j2.y.negate().div( max( L.z, 1e-4 ) ), - 0.99, - 0.25 ) ).add( swing.mul( 0.25 ) );
-				j3.assign( j2.add( dir( az, e3 ).mul( L.z ) ) );
+fn critterJoints( si: u32, k: u32, ph: f32, stride: f32, lift: f32, outK: f32, eyes: f32, claws: f32 ) -> CritterJoints {
+	let a = mat.critterLimbs[ si * ${ LIMBS * 2 }u + k * 2u ];
+	let L = mat.critterLimbs[ si * ${ LIMBS * 2 }u + k * 2u + 1u ];
+	let kf = f32( k );
+	let isLeg = kf < 7.5; let isClaw = kf > 7.5 && kf < 9.5;
+	let side = select( -1.0, 1.0, a.x > 0.0 );
+	let p = ph + mat.critterGait[ min( k, 7u ) ].x;
+	let swing = max( sin( p ), 0.0 ) * stride;
+	let az = a.w + cos( p ) * stride * 0.28 * select( 0.0, 1.0, isLeg );
+	let j0 = vec3f( a.x, a.y + lift, a.z );
+	var j1 = vec3f( 0.0 ); var j2 = vec3f( 0.0 ); var j3 = vec3f( 0.0 );
+	if ( isLeg ) {
+		// merus up and out, carpus level, dactyl reaching down to the ground
+		j1 = j0 + critterDir( az, 0.62 + swing * 0.22 ) * L.x;
+		j2 = j1 + critterDir( az, -0.15 + swing * 0.15 ) * L.y;
+		let e3 = asin( clamp( - j2.y / max( L.z, 1e-4 ), -0.99, -0.25 ) ) + swing * 0.25;
+		j3 = j2 + critterDir( az, e3 ) * L.z;
+	} else if ( isClaw ) {
+		// chelipeds folded in front of the mouth, lifted when feeding / threatening
+		let inward = side * 0.95;
+		j1 = j0 + critterDir( az, -0.35 + claws * 0.5 ) * L.x;
+		j2 = j1 + critterDir( az + inward, 0.25 + claws * 0.6 ) * L.y;
+		j3 = j2 + critterDir( az + inward * 1.55, -0.25 + claws * 0.4 ) * L.z;
+	} else {
+		// eyestalks: up when alert, folded along the front edge when running for the burrow
+		let el = mix( 0.05, 1.3, eyes );
+		j1 = j0 + critterDir( az, el * 0.8 ) * L.x;
+		j2 = j1 + critterDir( az, el ) * L.y;
+		j3 = j2;
+	}
+	// hermit crabs pull everything back into the aperture
+	let hole = vec3f( 0.0, lift + 0.32, 0.5 );
+	let isHermit = si == ${ CRITTER.HERMIT }u;
+	let k2 = select( 1.0, outK, isHermit );
+	var J: CritterJoints;
+	J.j0 = mix( hole, j0, k2 ); J.j1 = mix( hole, j1, k2 ); J.j2 = mix( hole, j2, k2 ); J.j3 = mix( hole, j3, k2 );
+	J.r = L.w * select( 1.0, outK * 0.7 + 0.3, isHermit );
+	return J;
+}
 
-			} ).ElseIf( isClaw, () => {
+// a vertex of limb k at ( segment, t, radius ) around the segment; returns position (xyz) and
+// writes the normal
+fn critterLimbVertex( J: CritterJoints, seg: f32, t: f32, rs: f32, ring: vec2f, n: ptr<function, vec3f> ) -> vec3f {
+	let a = select( select( J.j2, J.j1, seg < 1.5 ), J.j0, seg < 0.5 );
+	let b = select( select( J.j3, J.j2, seg < 1.5 ), J.j1, seg < 0.5 );
+	let d0 = b - a;
+	let d = d0 / max( length( d0 ), 1e-5 );
+	let rf = select( vec3f( 0.0, 1.0, 0.0 ), vec3f( 1.0, 0.0, 0.0 ), abs( d.y ) > 0.9 );
+	let ax = normalize( cross( d, rf ) );
+	let ay = cross( ax, d );
+	let radial = ax * ring.x + ay * ring.y;
+	*n = normalize( radial + d * select( 0.0, 1.0, rs < 0.01 ) );
+	return mix( a, b, t ) + radial * ( J.r * rs );
+}
+`,
+		} );
 
-				// chelipeds folded in front of the mouth, lifted when feeding / threatening
-				const inward = side.mul( 0.95 );
-				j1.assign( j0.add( dir( az, float( - 0.35 ).add( claws.mul( 0.5 ) ) ).mul( L.x ) ) );
-				j2.assign( j1.add( dir( az.add( inward ), float( 0.25 ).add( claws.mul( 0.6 ) ) ).mul( L.y ) ) );
-				j3.assign( j2.add( dir( az.add( inward.mul( 1.55 ) ), float( - 0.25 ).add( claws.mul( 0.4 ) ) ).mul( L.z ) ) );
+		const mat = new Material( {
+			name: 'Critters',
+			roughness: 0.6, metalness: 0,
+			underwaterLighting: 'none',
+			modules: [ kitModule, helpers ],
+			uniforms: {
+				critterLimbs: [ `vec4f[${ this.limbs.length }]`, this.limbs ],
+				critterGait: [ 'vec4f[8]', gait ],
+			},
+			storage: { critterInstances: R.buffer, critterBodies: this.bodyBuffer },
+			attributes: { aLimb: 'vec4f', aRing: 'vec2f' },
+			varyings: {
+				vCritInfo: 'vec4f', // part (0 body, 1 leg, 2 claw, 3 eye), u, v, species + seed
+				vCritLocal: 'vec3f',
+			},
+			vertex: /* wgsl */`
+	let r0 = ${ F( 0 ) }; let q = ${ F( 1 ) }; let r2 = ${ F( 2 ) }; let r3 = ${ F( 3 ) }; let p4 = ${ F( 4 ) }; let pq = ${ F( 5 ) };
+	let si = u32( r2.x + 0.5 );
+	let lift = r2.w; let outK = r3.x;
+	var pl = vec3f( 0.0 ); var pp = vec3f( 0.0 ); var nl = vec3f( 0.0, 1.0, 0.0 );
+	var info = vec4f( 0.0 );
+	let k = v.aLimb.x;
 
-			} ).Else( () => {
+	if ( k < 0.0 ) {
 
-				// eyestalks: up when alert, folded along the front edge when running for the burrow
-				const el = mix( float( 0.05 ), float( 1.3 ), eyes );
-				j1.assign( j0.add( dir( az, el.mul( 0.8 ) ).mul( L.x ) ) );
-				j2.assign( j1.add( dir( az, el ).mul( L.y ) ) );
-				j3.assign( j2 );
+		// body grid: carapace / shell (lifted on the legs) or the burrow mound
+		let base = ( si * ${ BODY_VERTS }u + v.vertex ) * 2u;
+		let A = critterBodies[ base ]; let B = critterBodies[ base + 1u ];
+		let up = select( lift, 0.0, si == ${ CRITTER.BURROW }u );
+		pl = A.xyz + vec3f( 0.0, up, 0.0 );
+		nl = B.xyz;
+		pp = pl;
+		info = vec4f( 0.0, A.w, B.w, 0.0 );
 
-			} );
+	} else {
 
-			// hermit crabs pull everything back into the aperture
-			const hole = vec3( 0, lift.add( 0.32 ), 0.5 );
-			const k2 = select( si.equal( uint( CRITTER.HERMIT ) ), out, float( 1 ) );
-			return {
-				j0: mix( hole, j0, k2 ), j1: mix( hole, j1, k2 ), j2: mix( hole, j2, k2 ), j3: mix( hole, j3, k2 ),
-				r: L.w.mul( select( si.equal( uint( CRITTER.HERMIT ) ), out.mul( 0.7 ).add( 0.3 ), float( 1 ) ) ),
-			};
+		let ki = u32( k );
+		let J = critterJoints( si, ki, r2.y, r2.z, lift, outK, r3.y, r3.z );
+		var n = vec3f( 0.0 );
+		pl = critterLimbVertex( J, v.aLimb.y, v.aLimb.z, v.aLimb.w, v.aRing, &n );
+		nl = n;
+		let Jp = critterJoints( si, ki, p4.w, r2.z, lift, outK, r3.y, r3.z );
+		var np = vec3f( 0.0 );
+		pp = critterLimbVertex( Jp, v.aLimb.y, v.aLimb.z, v.aLimb.w, v.aRing, &np );
+		let part = select( select( 3.0, 2.0, k < 9.5 ), 1.0, k < 7.5 );
+		info = vec4f( part, v.aLimb.y + v.aLimb.z, v.aLimb.w, 0.0 );
 
-		};
+	}
 
-		// a vertex of limb k at ( segment, t, radius ) around the segment
-		const limbVertex = ( J, seg, t, rs, ring ) => {
+	// ghost crabs sink into their burrow (the sand hides what is below)
+	let sink = select( 0.0, ( 1.0 - outK ) * 1.3, si == ${ CRITTER.GHOST }u );
+	pl.y -= sink;
+	pp.y -= sink;
+	o.vCritLocal = pl;
+	o.vCritInfo = vec4f( info.xyz, r2.x + fract( r3.w ) * 0.9 );
+	let world = r0.xyz + rotateQ( q, pl * r0.w );
+	let prev = p4.xyz + rotateQ( pq, pp * r0.w );
+	v.useWorld = true;
+	v.worldPos = world;
+	v.worldNormal = rotateQ( q, nl );
+	v.prevWorldPos = prev;
+`,
+			surface: /* wgsl */`
+	let vInfo = in.vs.vCritInfo;
+	let part = floor( vInfo.x + 0.5 );
+	let u = vInfo.y; let v = vInfo.z;
+	let species = floor( vInfo.w ); let seed = fract( vInfo.w ) / 0.9;
+	let P = in.vs.vCritLocal;
+	let n = mx_noise_float3( P * 14.0 + seed * 17.0 );
+	var c = vec3f( 0.5 );
+	var rough = 0.6;
 
-			const a = select( seg.lessThan( 0.5 ), J.j0, select( seg.lessThan( 1.5 ), J.j1, J.j2 ) );
-			const b = select( seg.lessThan( 0.5 ), J.j1, select( seg.lessThan( 1.5 ), J.j2, J.j3 ) );
-			const d0 = b.sub( a );
-			const d = d0.div( max( length( d0 ), 1e-5 ) );
-			const ref = select( abs( d.y ).greaterThan( 0.9 ), vec3( 1, 0, 0 ), vec3( 0, 1, 0 ) );
-			const ax = normalize( cross( d, ref ) );
-			const ay = cross( ax, d );
-			const radial = ax.mul( ring.x ).add( ay.mul( ring.y ) );
-			return { p: mix( a, b, t ).add( radial.mul( J.r.mul( rs ) ) ), n: normalize( radial.add( d.mul( select( rs.lessThan( 0.01 ), 1, 0 ) ) ) ) };
+	if ( species == ${ f( CRITTER.GHOST ) } ) {
 
-		};
+		// ghost crab: pale straw carapace with fine granules, whitish legs and claws, black
+		// club-shaped eyes on the stalks
+		let straw = mix( ${ srgb( 0.8, 0.73, 0.58 ) }, ${ srgb( 0.88, 0.83, 0.7 ) }, n * 0.5 + 0.5 );
+		let body = straw * mix( 0.86, 1.04, smoothstep( 0.0, 0.18, P.y ) );
+		let legs = mix( ${ srgb( 0.86, 0.82, 0.72 ) }, ${ srgb( 0.7, 0.62, 0.5 ) }, smoothstep( 0.8, 1.0, fract( u ) ) * 0.5 );
+		let claw = mix( ${ srgb( 0.9, 0.87, 0.8 ) }, ${ srgb( 0.78, 0.7, 0.75 ) }, smoothstep( 1.6, 2.3, u ) );
+		let eye = mix( ${ srgb( 0.8, 0.75, 0.62 ) }, ${ srgb( 0.04, 0.04, 0.045 ) }, smoothstep( 1.25, 1.4, u ) );
+		c = select( select( select( eye, claw, part == 2.0 ), legs, part == 1.0 ), body, part == 0.0 );
+		rough = select( 0.55, 0.15, part == 3.0 && u > 1.3 );
 
-		mat.positionNode = Fn( () => {
+	} else if ( species == ${ f( CRITTER.HERMIT ) } ) {
 
-			const r0 = R.field( 0 ), q = R.field( 1 ), r2 = R.field( 2 ), r3 = R.field( 3 ), p4 = R.field( 4 ), pq = R.field( 5 );
-			const si = uint( r2.x.add( 0.5 ) ).toVar();
-			const lift = r2.w, out = r3.x;
-			const pl = vec3( 0 ).toVar(), pp = vec3( 0 ).toVar(), nl = vec3( 0, 1, 0 ).toVar();
-			const info = vec4( 0 ).toVar();
-			const k = aLimb.x;
+		// hermit crab: turban shell (banded / mottled / chequered by seed), red-orange legs
+		// with pale tips, a purple claw; the aperture shows the crab's dark body
+		let turns = u + v * 3.2; // spiral: sutures along u + v * turns
+		let suture = smoothstep( 0.9, 0.97, fract( turns ) ) * smoothstep( 0.05, 0.3, v );
+		let kind = floor( fract( seed * 3.7 ) * 3.0 );
+		let c1 = select( select( ${ srgb( 0.85, 0.8, 0.7 ) }, ${ srgb( 0.72, 0.42, 0.2 ) }, kind == 1.0 ), ${ srgb( 0.9, 0.86, 0.78 ) }, kind == 0.0 );
+		let c2 = select( select( ${ srgb( 0.55, 0.35, 0.22 ) }, ${ srgb( 0.35, 0.18, 0.08 ) }, kind == 1.0 ), ${ srgb( 0.12, 0.11, 0.1 ) }, kind == 0.0 );
+		let bands = select(
+			smoothstep( 0.2, 0.8, sin( v * 31.0 + n * 2.0 ) ),
+			smoothstep( 0.3, 0.7, sin( u * ${ f( 6.2832 * 7 ) } + sin( v * 40.0 ) * 1.5 ) ), // zigzag
+			kind == 0.0 );
+		let shellC = mix( c1, c2, bands * 0.8 ) * ( 1.0 - suture * 0.5 ) * ( n * 0.12 + 0.94 );
+		let aperture = smoothstep( 0.86, 0.93, v );
+		let body = mix( shellC, ${ srgb( 0.35, 0.12, 0.08 ) }, aperture );
+		let legs = mix( ${ srgb( 0.72, 0.28, 0.12 ) }, ${ srgb( 0.9, 0.78, 0.6 ) }, smoothstep( 2.6, 3.0, u ) );
+		let claw = mix( ${ srgb( 0.42, 0.14, 0.4 ) }, ${ srgb( 0.85, 0.5, 0.2 ) }, smoothstep( 2.5, 3.1, u ) );
+		c = select( select( select( ${ srgb( 0.1, 0.08, 0.06 ) }, claw, part == 2.0 ), legs, part == 1.0 ), body, part == 0.0 );
+		rough = select( 0.5, 0.45, part == 0.0 );
 
-			If( k.lessThan( 0 ), () => {
+	} else {
 
-				// body grid: carapace / shell (lifted on the legs) or the burrow mound
-				const base = si.mul( BODY_VERTS ).add( vertexIndex ).mul( 2 );
-				const A = BODY.element( base ), B = BODY.element( base.add( 1 ) );
-				const up = select( si.equal( uint( CRITTER.BURROW ) ), float( 0 ), lift );
-				pl.assign( A.xyz.add( vec3( 0, up, 0 ) ) );
-				nl.assign( B.xyz );
-				pp.assign( pl );
-				info.assign( vec4( 0, A.w, B.w, 0 ) );
+		// burrow: dark shaft, damp dug-out sand around the lip, loose clumps fanned out; the
+		// rim fades into the beach
+		let dry = ${ srgb( 0.86, 0.79, 0.64 ) } * ( n * 0.1 + 0.95 );
+		let damp = ${ srgb( 0.66, 0.58, 0.45 ) };
+		let clumps = smoothstep( 0.35, 0.55, mx_noise_float3( P * 38.0 + seed * 5.0 ) );
+		let sand = mix( mix( damp, dry, smoothstep( 0.4, 0.75, v ) ), dry * 1.06, clumps * 0.5 );
+		let hole = smoothstep( 0.36, 0.2, v );
+		c = mix( sand, ${ srgb( 0.035, 0.03, 0.025 ) }, hole );
+		rough = 0.9;
+		// dithered fade at the outer edge (resolved by the temporal filter)
+		let fade = smoothstep( 1.0, 0.72, v );
+		let noise = interleavedGradientNoise( in.pixel + fract( frame.time * 7.13 ) * 97.0 );
+		if ( noise > fade ) { discard; }
 
-			} ).Else( () => {
+	}
 
-				const ki = uint( k );
-				const J = joints( si, ki, r2.y, r2.z, lift, out, r3.y, r3.z );
-				const v = limbVertex( J, aLimb.y, aLimb.z, aLimb.w, aRing );
-				pl.assign( v.p );
-				nl.assign( v.n );
-				const Jp = joints( si, ki, p4.w, r2.z, lift, out, r3.y, r3.z );
-				pp.assign( limbVertex( Jp, aLimb.y, aLimb.z, aLimb.w, aRing ).p );
-				const part = select( k.lessThan( 7.5 ), float( 1 ), select( k.lessThan( 9.5 ), float( 2 ), float( 3 ) ) );
-				info.assign( vec4( part, aLimb.y.add( aLimb.z ), aLimb.w, 0 ) );
+	s.albedo = c;
+	s.roughness = rough;
+`,
+		} );
 
-			} );
-
-			// ghost crabs sink into their burrow (the sand hides what is below)
-			const sink = select( si.equal( uint( CRITTER.GHOST ) ), float( 1 ).sub( out ).mul( 1.3 ), float( 0 ) );
-			pl.y.subAssign( sink );
-			pp.y.subAssign( sink );
-			vLocal.assign( pl );
-			vInfo.assign( vec4( info.xyz, r2.x.add( fract( r3.w ).mul( 0.9 ) ) ) );
-			const world = r0.xyz.add( rotateQ( q, pl.mul( r0.w ) ) ).toVar();
-			const prev = p4.xyz.add( rotateQ( pq, pp.mul( r0.w ) ) );
-			vDelta.assign( world.sub( prev ) );
-			normalLocal.assign( rotateQ( q, nl ) );
-			return world;
-
-		} )();
-
-		mat.mrtNode = motionVelocity( vDelta );
-
-		const rough = float( 0.6 ).toVar( 'critRough' );
-		mat.colorNode = Fn( () => {
-
-			const part = vInfo.x.add( 0.5 ).floor().toVar();
-			const u = vInfo.y.toVar(), v = vInfo.z.toVar();
-			const species = vInfo.w.floor().toVar(), seed = fract( vInfo.w ).div( 0.9 ).toVar();
-			const P = vLocal.toVar();
-			const n = mx_noise_float( P.mul( 14 ).add( seed.mul( 17 ) ) ).toVar();
-			const c = vec3( 0.5 ).toVar();
-			rough.assign( 0.6 );
-
-			If( species.equal( CRITTER.GHOST ), () => {
-
-				// ghost crab: pale straw carapace with fine granules, whitish legs and claws, black
-				// club-shaped eyes on the stalks
-				const straw = mix( srgb( 0.8, 0.73, 0.58 ), srgb( 0.88, 0.83, 0.7 ), n.mul( 0.5 ).add( 0.5 ) );
-				const body = straw.mul( mix( 0.86, 1.04, smoothstep( 0.0, 0.18, P.y ) ) );
-				const legs = mix( srgb( 0.86, 0.82, 0.72 ), srgb( 0.7, 0.62, 0.5 ), smoothstep( 0.8, 1.0, fract( u ) ).mul( 0.5 ) );
-				const claw = mix( srgb( 0.9, 0.87, 0.8 ), srgb( 0.78, 0.7, 0.75 ), smoothstep( 1.6, 2.3, u ) );
-				const eye = mix( srgb( 0.8, 0.75, 0.62 ), srgb( 0.04, 0.04, 0.045 ), smoothstep( 1.25, 1.4, u ) );
-				c.assign( select( part.equal( 0 ), body, select( part.equal( 1 ), legs, select( part.equal( 2 ), claw, eye ) ) ) );
-				rough.assign( select( part.equal( 3 ).and( u.greaterThan( 1.3 ) ), float( 0.15 ), float( 0.55 ) ) );
-
-			} ).ElseIf( species.equal( CRITTER.HERMIT ), () => {
-
-				// hermit crab: turban shell (banded / mottled / chequered by seed), red-orange legs
-				// with pale tips, a purple claw; the aperture shows the crab's dark body
-				const turns = u.add( v.mul( 3.2 ) ); // spiral: sutures along u + v * turns
-				const suture = smoothstep( 0.9, 0.97, fract( turns ) ).mul( smoothstep( 0.05, 0.3, v ) );
-				const kind = fract( seed.mul( 3.7 ) ).mul( 3 ).floor();
-				const c1 = select( kind.equal( 0 ), srgb( 0.9, 0.86, 0.78 ), select( kind.equal( 1 ), srgb( 0.72, 0.42, 0.2 ), srgb( 0.85, 0.8, 0.7 ) ) );
-				const c2 = select( kind.equal( 0 ), srgb( 0.12, 0.11, 0.1 ), select( kind.equal( 1 ), srgb( 0.35, 0.18, 0.08 ), srgb( 0.55, 0.35, 0.22 ) ) );
-				const bands = select( kind.equal( 0 ),
-					smoothstep( 0.3, 0.7, sin( u.mul( 6.2832 * 7 ).add( sin( v.mul( 40 ) ).mul( 1.5 ) ) ) ), // zigzag
-					smoothstep( 0.2, 0.8, sin( v.mul( 31 ).add( n.mul( 2 ) ) ) ) );
-				const shellC = mix( c1, c2, bands.mul( 0.8 ) ).mul( float( 1 ).sub( suture.mul( 0.5 ) ) ).mul( n.mul( 0.12 ).add( 0.94 ) );
-				const aperture = smoothstep( 0.86, 0.93, v );
-				const body = mix( shellC, srgb( 0.35, 0.12, 0.08 ), aperture );
-				const legs = mix( srgb( 0.72, 0.28, 0.12 ), srgb( 0.9, 0.78, 0.6 ), smoothstep( 2.6, 3.0, u ) );
-				const claw = mix( srgb( 0.42, 0.14, 0.4 ), srgb( 0.85, 0.5, 0.2 ), smoothstep( 2.5, 3.1, u ) );
-				c.assign( select( part.equal( 0 ), body, select( part.equal( 1 ), legs, select( part.equal( 2 ), claw, srgb( 0.1, 0.08, 0.06 ) ) ) ) );
-				rough.assign( select( part.equal( 0 ), float( 0.45 ), float( 0.5 ) ) );
-
-			} ).Else( () => {
-
-				// burrow: dark shaft, damp dug-out sand around the lip, loose clumps fanned out; the
-				// rim fades into the beach
-				const dry = srgb( 0.86, 0.79, 0.64 ).mul( n.mul( 0.1 ).add( 0.95 ) );
-				const damp = srgb( 0.66, 0.58, 0.45 );
-				const clumps = smoothstep( 0.35, 0.55, mx_noise_float( P.mul( 38 ).add( seed.mul( 5 ) ) ) );
-				const sand = mix( mix( damp, dry, smoothstep( 0.4, 0.75, v ) ), dry.mul( 1.06 ), clumps.mul( 0.5 ) );
-				const hole = smoothstep( 0.36, 0.2, v );
-				c.assign( mix( sand, srgb( 0.035, 0.03, 0.025 ), hole ) );
-				rough.assign( 0.9 );
-				// dithered fade at the outer edge (resolved by the temporal filter)
-				const fade = smoothstep( 1.0, 0.72, v );
-				const noise = interleavedGradientNoise( screenCoordinate.xy.add( fract( G.time.mul( 7.13 ) ).mul( 97 ) ) );
-				If( noise.greaterThan( fade ), () => {
-
-					Discard();
-
-				} );
-
-			} );
-
-			return c;
-
-		} )();
-
-		mat.roughnessNode = rough;
 		return mat;
 
 	}

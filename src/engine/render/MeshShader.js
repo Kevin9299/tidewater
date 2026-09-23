@@ -1,5 +1,5 @@
 import { commonModule } from './wgsl/common.js';
-import { surfaceModule, lightingModule, hookModules } from './wgsl/lighting.js';
+import { surfaceModule, lightingModule, hookModules, shadowModule } from './wgsl/lighting.js';
 import { collectModules } from '../gpu/Shader.js';
 
 // Builds the WGSL of a mesh pipeline: vertex fetch + material vertex hook + transform, fragment
@@ -280,7 +280,12 @@ struct FragOut {
 #if PASS_MAIN
 #if PASS_LATE
 	// premultiplied: opaque outputs overwrite, blended ones weight their motion by coverage
+#if VELOCITY_OPAQUE
+	// the fragment owns the motion of its pixel even when its colour is blended (AirMotes specks)
+	let a = VELOCITY_WEIGHT;
+#else
 	let a = select( 1.0, r.color.a, TRANSPARENT_F ) * VELOCITY_WEIGHT;
+#endif
 	out.velocity = vec4f( r.velocity.xy * a, 0.0, a );
 #else
 	out.velocity = r.velocity;
@@ -306,6 +311,9 @@ struct FragOut {
 	let modules = [ commonModule, surfaceModule, ...material.modules ];
 	const needsLighting = kind !== 'depth' || collectModules( material.modules ).includes( lightingModule );
 	if ( needsLighting ) modules = [ commonModule, surfaceModule, ...hookModules(), lightingModule, ...material.modules ];
+	// custom-shaded materials (the water) that only need sunShadow(): no scene lighting hooks, whose
+	// modules would add their uniform buffers / textures to the pipeline (12 uniform buffers per stage)
+	if ( material.lightingHooks === false && ! collectModules( material.modules ).includes( lightingModule ) ) modules = [ commonModule, surfaceModule, shadowModule, ...material.modules ];
 
 	return {
 		code,

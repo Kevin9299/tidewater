@@ -1,18 +1,18 @@
-import * as THREE from 'three/webgpu';
+import { Vector3, Matrix4, Box3, MathUtils } from '../engine/index.js';
 import { GRAVITY } from '../core/Globals.js';
 import { SPRAY } from '../fx/Spray.js';
 
-const _a = new THREE.Vector3();
-const _b = new THREE.Vector3();
-const _m = new THREE.Vector3();
-const _n = new THREE.Vector3();
-const _v = new THREE.Vector3();
-const _w = new THREE.Vector3();
-const _r = new THREE.Vector3();
-const _fwd = new THREE.Vector3();
-const _M = new THREE.Matrix4();
-const _la = new THREE.Vector3();
-const _one = new THREE.Vector3( 1, 1, 1 );
+const _a = new Vector3();
+const _b = new Vector3();
+const _m = new Vector3();
+const _n = new Vector3();
+const _v = new Vector3();
+const _w = new Vector3();
+const _r = new Vector3();
+const _fwd = new Vector3();
+const _M = new Matrix4();
+const _la = new Vector3();
+const _one = new Vector3( 1, 1, 1 );
 const _opts = { to: null, spread: 0.3, jitter: 0.05, life: 0.8, sizeJitter: 0.5 };
 
 // A spray source (after SpraySource in threejs-water-pro): the driving speed (m/s) above a
@@ -92,7 +92,7 @@ export class BoatSpray {
 				// stations bunched toward the stem, where the entrance is sharpest
 				const f = ( i / SEGMENTS ) ** 1.3;
 				const z = zStem + ( zSh - zStem ) * f;
-				pts.push( new THREE.Vector3( s * ( lines.halfBeamAt( z ) + 0.03 ), 0.05, z ) );
+				pts.push( new Vector3( s * ( lines.halfBeamAt( z ) + 0.03 ), 0.05, z ) );
 
 			}
 
@@ -103,7 +103,7 @@ export class BoatSpray {
 				this.contacts.push( {
 					side: s, a, b, mid: a.clone().add( b ).multiplyScalar( 0.5 ),
 					length: a.distanceTo( b ),
-					normal: new THREE.Vector3( - s * t.z, 0, s * t.x ), // outward (and forward)
+					normal: new Vector3( - s * t.z, 0, s * t.x ), // outward (and forward)
 					depth: 0, rate: 0, primed: false,
 					carry: [ 0, 0, 0, 0, 0 ], // fractional particles: drops, sheet, ligaments, white water, mist
 				} );
@@ -119,7 +119,7 @@ export class BoatSpray {
 		while ( zShTop > lines.zAft && lines.sheerX( lines.tAtSheerZ( zShTop ) ) < 0.95 * hbTop ) zShTop -= 0.05;
 		let zShWL = zStem;
 		while ( zShWL > lines.wlStart && lines.halfBeamAt( zShWL ) < 0.95 * maxHB ) zShWL -= 0.05;
-		const box = new THREE.Box3();
+		const box = new Box3();
 		for ( const c of boat.model.colliders || [] ) {
 
 			if ( c.tag !== 'houseWall' && c.tag !== 'roof' ) continue;
@@ -128,7 +128,7 @@ export class BoatSpray {
 
 		}
 
-		if ( box.isEmpty() ) box.set( new THREE.Vector3( 0, - 10, 0 ), new THREE.Vector3( 0, - 10, 0 ) );
+		if ( box.isEmpty() ) box.set( new Vector3( 0, - 10, 0 ), new Vector3( 0, - 10, 0 ) );
 		this.shape = {
 			zAft: lines.zAft, zShoulder: zShTop, zStem: lines.zBow, halfBeam: hbTop + 0.02,
 			wlShoulder: zShWL, wlStem: lines.wlEnd, wlHalfBeam: maxHB + 0.01,
@@ -137,7 +137,7 @@ export class BoatSpray {
 		};
 		if ( spray.setBodyShape ) spray.setBodyShape( this.shape );
 
-		this.stern = new THREE.Vector3( 0, 0.05, lines.wlStart + 0.1 );
+		this.stern = new Vector3( 0, 0.05, lines.wlStart + 0.1 );
 		this.washCarry = 0;
 		this.slamCooldown = 0;
 		this.burst = 0;
@@ -148,7 +148,7 @@ export class BoatSpray {
 	// half breadth of the spray collision outline at boat-frame z and height y (as Spray._collideBody)
 	_halfBeam( z, y ) {
 
-		const S = this.shape, cl = THREE.MathUtils.clamp, lerp = THREE.MathUtils.lerp;
+		const S = this.shape, cl = MathUtils.clamp, lerp = MathUtils.lerp;
 		const sheer = lerp( S.ySheerAft, S.ySheerStem, cl( ( z - S.zAft ) / ( S.zStem - S.zAft ), 0, 1 ) );
 		const f = cl( y / Math.max( sheer, 0.1 ), 0, 1 );
 		const zSh = lerp( S.wlShoulder, S.zShoulder, f ), zSt = lerp( S.wlStem, S.zStem, f ), HB = lerp( S.wlHalfBeam, S.halfBeam, f );
@@ -203,21 +203,21 @@ export class BoatSpray {
 			c.depth = depth;
 			c.primed = true;
 			// the surface crosses this part of the hull (bow out of the water: dry; buried to the sheer: no sheet)
-			const wet = THREE.MathUtils.smoothstep( depth, - 0.35, - 0.08 ) * ( 1 - THREE.MathUtils.smoothstep( depth, 0.7, 1.1 ) );
+			const wet = MathUtils.smoothstep( depth, - 0.35, - 0.08 ) * ( 1 - MathUtils.smoothstep( depth, 0.7, 1.1 ) );
 			c.wet = wet;
 			// point velocity and the horizontal outward normal
 			_r.subVectors( _m, b.position );
 			_w.copy( b.angular ).cross( _r ).add( b.velocity );
-			c.vel = c.vel || new THREE.Vector3();
+			c.vel = c.vel || new Vector3();
 			c.vel.copy( _w );
-			c.n = c.n || new THREE.Vector3();
+			c.n = c.n || new Vector3();
 			c.n.copy( c.normal ).applyQuaternion( b.quaternion ).setY( 0 ).normalize();
 			c.hw = hw;
 			const vn = Math.max( 0, _w.x * c.n.x + _w.z * c.n.z );
 			c.rV = VS.response( vn );
 			c.rI = IS.response( c.rate );
 			c.demandV = c.length * c.rV * VS.intensity * wet;
-			c.demandI = c.length * c.rI * IS.intensity * wet * ( 0.15 + 0.85 * THREE.MathUtils.smoothstep( speed, 2, 6 ) );
+			c.demandI = c.length * c.rI * IS.intensity * wet * ( 0.15 + 0.85 * MathUtils.smoothstep( speed, 2, 6 ) );
 			dV += c.demandV; dI += c.demandI;
 			total += c.demandV + c.demandI;
 			// slam: the stem dropping hard into the water in a head sea
@@ -238,8 +238,8 @@ export class BoatSpray {
 		const burst = this.burst;
 		const boost = 1 + 2.5 * burst;
 		const budget = Math.min( 1, MAX_PER_FRAME / Math.max( 1e-6, total * EMIT_RATE * dt * boost * 1.3 ) );
-		const fast = THREE.MathUtils.smoothstep( speed, 4, 10 );
-		const making = THREE.MathUtils.smoothstep( speed, 3, 6 );
+		const fast = MathUtils.smoothstep( speed, 4, 10 );
+		const making = MathUtils.smoothstep( speed, 3, 6 );
 		// per side: the segment that throws most also throws the sheet, ligaments, white water and mist
 		const side = this._side || ( this._side = [ { best: null, n: 0 }, { best: null, n: 0 } ] );
 		side[ 0 ].best = side[ 1 ].best = null;
@@ -289,9 +289,9 @@ export class BoatSpray {
 			// a few fragments of the clear sheet at the root (they tear into strands and drop clusters)
 			this._emit( c, 1, N * 0.025 * making * ( 1 - burst * 0.5 ), SPRAY.SHEET, 0.12 + 0.02 * r, 0.45, spread * 0.5, 0.06, _v );
 			// ligaments torn off the sheet: the readable blobs of water
-			this._emit( c, 2, N * 0.3 * THREE.MathUtils.smoothstep( r, 1.0, 5 ), SPRAY.LIGAMENT, 0.011 + 0.0012 * r, life, spread, 0.05, _v );
+			this._emit( c, 2, N * 0.3 * MathUtils.smoothstep( r, 1.0, 5 ), SPRAY.LIGAMENT, 0.011 + 0.0012 * r, life, spread, 0.05, _v );
 			// white water only on impacts: torn white sheets
-			this._emit( c, 3, N * ( 0.06 * imp * THREE.MathUtils.smoothstep( c.rI, 1.5, 5 ) + 0.1 * burst ) * making, SPRAY.SPRAY, 0.04 + 0.004 * r + 0.03 * burst, 0.6 + 0.4 * imp, spread, 0.12, _v );
+			this._emit( c, 3, N * ( 0.06 * imp * MathUtils.smoothstep( c.rI, 1.5, 5 ) + 0.1 * burst ) * making, SPRAY.SPRAY, 0.04 + 0.004 * r + 0.03 * burst, 0.6 + 0.4 * imp, spread, 0.12, _v );
 			// a fine, faint mist on impacts that the relative wind carries aft over the boat
 			this._emit( c, 4, N * ( 0.04 * imp + 0.15 * burst ) * making, SPRAY.MIST, 0.3 + 0.2 * burst, 2.0, spread * 0.5, 0.15, _w.copy( _v ).multiplyScalar( 0.6 ) );
 

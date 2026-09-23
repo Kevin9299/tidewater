@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Vector3 } from '../../engine/index.js';
 
 // Lines plan of an ~8.2 m Downeast lobster boat, in the boat's local frame:
 // +Z forward (bow), +Y up, +X port. y = 0 is the design waterline, x = 0 the
@@ -255,7 +255,7 @@ export class HullLines {
 		const H = this.setback( density );
 		const zs = this.sheerZ( t ), D = this.bowBlend( t );
 		const pts = [];
-		for ( let j = 0; j < H.length; j ++ ) pts.push( new THREE.Vector3( sec[ 2 * j ], sec[ 2 * j + 1 ], zs - D * H[ j ] ) );
+		for ( let j = 0; j < H.length; j ++ ) pts.push( new Vector3( sec[ 2 * j ], sec[ 2 * j + 1 ], zs - D * H[ j ] ) );
 		return pts;
 
 	}
@@ -507,7 +507,7 @@ export class HullLines {
 		this.waterplaneArea = area;
 		this.canoeVolume = volume;
 		this.centerOfFlotationZ = mz / area;
-		this.centerOfBuoyancy = new THREE.Vector3( 0, vy / volume, vz / volume );
+		this.centerOfBuoyancy = new Vector3( 0, vy / volume, vz / volume );
 
 	}
 
@@ -583,8 +583,8 @@ export class HullLines {
 				if ( c.a <= 0 ) continue;
 				const x = Math.sqrt( c.x2 / c.a ), z = c.z / c.a, y = - c.v / c.a;
 				const bottomY = Math.min( 0, this.bottomAt( x, z ) );
-				samples.push( { position: new THREE.Vector3( x, y, z ), area: c.a, depth: - y, bottomY } );
-				samples.push( { position: new THREE.Vector3( - x, y, z ), area: c.a, depth: - y, bottomY } );
+				samples.push( { position: new Vector3( x, y, z ), area: c.a, depth: - y, bottomY } );
+				samples.push( { position: new Vector3( - x, y, z ), area: c.a, depth: - y, bottomY } );
 
 			}
 

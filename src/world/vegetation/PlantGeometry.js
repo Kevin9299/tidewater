@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 import { GeoBuilder } from './GeoBuilder.js';
 import { mulberry32 } from '../../util/Noise.js';
 

@@ -1,23 +1,9 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, float, vec2, vec3, vec4, ivec2, attribute, texture, varyingProperty, normalLocal, normalViewGeometry,
-	positionWorld, positionViewDirection, cameraPosition,
-	sin, cos, floor, mix, smoothstep, clamp, min, max, length, normalize, dot, select, saturate, pow, abs,
-} from 'three/tsl';
-import { physical } from '../../materials/Materials.js';
-import { G } from '../../core/Globals.js';
+import * as THREE from '../../engine/index.js';
+import { Texture } from '../../engine/gpu/Texture.js';
+import { ShaderModule } from '../../engine/gpu/Shader.js';
+import { Material } from '../../engine/render/Material.js';
 import { mulberry32 } from '../../util/Noise.js';
-import { hash12, vnoise, windStrength, windDir3, windPerp3, gustAt, uCamPos, UP } from './VegNodes.js';
-import { getDetailTexture } from '../terrain/DetailTextures.js';
-import { meadowTone, MEADOW } from '../terrain/TerrainShading.js';
-
-// 2D rotation of an xz node by a constant angle (matches TerrainShading.rot2)
-const rotXZ = ( v, a ) => {
-
-	const c = Math.cos( a ), s = Math.sin( a );
-	return vec2( v.x.mul( c ).sub( v.y.mul( s ) ), v.x.mul( s ).add( v.y.mul( c ) ) );
-
-};
+import { vegModule, uCamPos, C, f } from './VegNodes.js';
 
 // Camera-following ground flora: tall meadow grass (knee to waist high), dune grass, sea oats and
 // beach creeper.
@@ -411,16 +397,6 @@ function buildPatch( level, clumps, seed = 7 ) {
 
 }
 
-// per-tier visibility at camera distance d (1 = full width, 0 = gone); tier 0 thins out per blade
-const tierFade = ( tier, d, cut ) => {
-
-	const f2 = float( 1 ).sub( smoothstep( FADE_T2[ 0 ], FADE_T2[ 1 ], d ) );
-	const f1 = float( 1 ).sub( smoothstep( FADE_T1[ 0 ], FADE_T1[ 1 ], d ) );
-	const f0 = float( 1 ).sub( smoothstep( cut.sub( 5 ), cut, d ) );
-	return select( tier.greaterThan( 1.5 ), f2, select( tier.greaterThan( 0.5 ), f1, f0 ) );
-
-};
-
 export class GrassField {
 
 	constructor( { terrain, mask } ) {
@@ -430,14 +406,14 @@ export class GrassField {
 		const maskData = mask.data, mres = mask.res;
 
 		// terrain heights (float, loaded + bilinearly filtered manually) and density mask
-		this.heightTex = new THREE.DataTexture( terrain.heights, res, res, THREE.RedFormat, THREE.FloatType );
-		this.heightTex.minFilter = this.heightTex.magFilter = THREE.NearestFilter;
-		this.heightTex.generateMipmaps = false;
-		this.heightTex.needsUpdate = true;
-		this.maskTex = new THREE.DataTexture( maskData, mres, mres, THREE.RGBAFormat, THREE.UnsignedByteType );
-		this.maskTex.minFilter = this.maskTex.magFilter = THREE.LinearFilter;
-		this.maskTex.generateMipmaps = false;
-		this.maskTex.needsUpdate = true;
+		this.heightTex = new Texture( { label: 'grassHeights', width: res, height: res, format: 'r32float', data: terrain.heights } );
+		// three-style handle: `heightTex.needsUpdate = true` re-uploads terrain.heights (Vegetation.refreshTerrain)
+		Object.defineProperty( this.heightTex, 'needsUpdate', { set: ( v ) => {
+
+			if ( v ) this.heightTex.upload( terrain.heights );
+
+		} } );
+		this.maskTex = new Texture( { label: 'grassMask', width: mres, height: mres, format: 'rgba8unorm', data: maskData, sampler: 'linearClamp' } );
 
 		// per-cell occupancy + height range (for skipping empty cells and frustum tests)
 		const cellsPerSide = Math.ceil( terrain.size / CELL );
@@ -549,193 +525,7 @@ export class GrassField {
 
 	_createMaterial() {
 
-		const t = this.terrain;
-		const res = t.res;
-		const hTex = texture( this.heightTex );
-		const mTex = texture( this.maskTex );
-
-		const heightAt = Fn( ( [ xz ] ) => {
-
-			const f = xz.sub( t.origin ).div( t.texel ).sub( 0.5 );
-			const fi = floor( f );
-			const fr = f.sub( fi );
-			const ij = ivec2( clamp( fi, vec2( 0 ), vec2( res - 2 ) ) );
-			const a = hTex.load( ij ).x;
-			const b = hTex.load( ij.add( ivec2( 1, 0 ) ) ).x;
-			const c = hTex.load( ij.add( ivec2( 0, 1 ) ) ).x;
-			const d = hTex.load( ij.add( ivec2( 1, 1 ) ) ).x;
-			return mix( mix( a, b, fr.x ), mix( c, d, fr.x ), fr.y );
-
-		} ).setLayout( { name: 'vegTerrainHeight', type: 'float', inputs: [ { name: 'xz', type: 'vec2' } ] } );
-
-		const vG = varyingProperty( 'vec4', 'vVegGrass' ); // hf, kind, dune fraction, rand
-		const vTone = varyingProperty( 'vec4', 'vVegGrassTone' ); // meadow tone (shared with the terrain), dryness
-		const det = texture( getDetailTexture() );
-		const vG2 = varyingProperty( 'vec4', 'vVegGrass2' ); // density, leaf / flower centre flag, across, dry blade
-		const vGust = varyingProperty( 'float', 'vVegGust' ); // current gust bend (wind sheen)
-
-		const mat = physical( { side: THREE.DoubleSide, specularIntensity: 0.4 } );
-		mat.name = 'veg-grass';
-
-		mat.positionNode = Fn( () => {
-
-			const cell = attribute( 'iCell', 'vec4' ).xy;
-			const slot = attribute( 'aSlot', 'vec4' );
-			const blade = attribute( 'aBlade', 'vec4' );
-			const side4 = attribute( 'aSide', 'vec4' );
-			const side = side4.xyz;
-			const P = attribute( 'position', 'vec3' );
-			const N = attribute( 'normal', 'vec3' );
-
-			const xz = cell.add( slot.xy );
-			const hf = blade.x;
-			const kind = blade.y;
-			const bRnd = blade.z;
-
-			const m = mTex.sample( xz.sub( t.origin ).div( t.size ) ).level( 0 );
-			const isGrass = kind.lessThan( 0.5 );
-			const isOat = kind.greaterThan( 0.5 ).and( kind.lessThan( 2.5 ) );
-			const lush = m.g;
-			const dune = m.r;
-			// dune tufts are sparse, the meadow is a closed sward
-			const duneF = dune.div( dune.add( lush ).add( 1e-3 ) );
-			const grassP = mix( lush, dune.mul( 0.4 ), duneF );
-			const density = select( isGrass, grassP, select( isOat, m.b, m.a ) );
-			const r = hash12( xz.mul( 1.37 ).add( 0.51 ) );
-			const r2 = hash12( xz.mul( 2.11 ).add( 7.3 ) );
-			const flowerOk = select( kind.greaterThan( 3.5 ), select( r2.lessThan( 0.35 ), 1, 0 ), 1 );
-			const present = select( r.lessThan( density ), 1, 0 ).mul( flowerOk );
-
-			// meadow tone at the clump: the same function and inputs as the terrain's meadow shading
-			const mA = det.sample( rotXZ( xz, 0.7 ).div( 173 ) ).level( 0 ).w;
-			const mB = det.sample( rotXZ( xz, 2.1 ).div( 47 ) ).level( 0 ).w;
-			const mt = meadowTone( mA, mB, float( 0 ), float( 0 ) );
-			// size: tall meadow grass, knee to waist high: swathes of taller grass in the lush patches,
-			// lower where it is dry; wiry dune tufts
-			const patch = vnoise( xz.mul( 1 / 6.5 ).add( 17.3 ) ).mul( 0.7 ).add( vnoise( xz.mul( 1 / 2.3 ) ).mul( 0.3 ) );
-			const lushH = mix( 0.7, 1.3, patch ).mul( mt.lush.mul( 0.25 ).add( 1 ) ).mul( float( 1 ).sub( mt.dry.mul( 0.25 ) ) );
-			const grassH = mix( lushH, float( 0.55 ), duneF ).mul( r2.mul( 0.35 ).add( 0.83 ) ).mul( density.mul( 0.35 ).add( 0.65 ) );
-			const oatH = r2.mul( 0.55 ).add( 1.0 );
-			const vineS = r2.mul( 0.4 ).add( 0.8 );
-			const hScale = select( isGrass, grassH, select( isOat, oatH, vineS ) );
-			// meadow clumps fan out wider than the wiry dune tufts
-			const spread = select( isGrass, mix( 1.35, 1.0, duneF ), float( 1 ) );
-
-			// distance LOD: tiers fade out (narrow to nothing), the remaining blades widen so the
-			// coverage (blade density x width) stays constant; tier 0 thins out per blade near R_FAR
-			const dist = length( xz.sub( uCamPos.xz ) );
-			// tier: grass blades and oats carry their own (aBlade.w), otherwise the slot's
-			const tier = max( select( kind.lessThan( 2.5 ), blade.w, float( 0 ) ), slot.w );
-			const cut = mix( float( FADE_T0[ 0 ] + 5 ), float( FADE_T0[ 1 ] ), fract01( bRnd.mul( 7.13 ).add( r2 ) ) );
-			const own = tierFade( tier, dist, cut );
-			const f2 = float( 1 ).sub( smoothstep( FADE_T2[ 0 ], FADE_T2[ 1 ], dist ) );
-			const f1 = float( 1 ).sub( smoothstep( FADE_T1[ 0 ], FADE_T1[ 1 ], dist ) );
-			const comp = float( TIER_N[ 0 ] + TIER_N[ 1 ] + TIER_N[ 2 ] ).div( f2.mul( TIER_N[ 2 ] ).add( f1.mul( TIER_N[ 1 ] ) ).add( TIER_N[ 0 ] ) );
-			// oats and creeper simply shrink out
-			const widthK = select( isGrass, comp.mul( own ), float( 1 ) );
-			const sizeK = select( isGrass, float( 1 ), own );
-			const scale = hScale.mul( present ).mul( sizeK );
-
-			// per-slot random yaw
-			const yaw = hash12( xz.mul( 0.73 ).add( 3.3 ) ).mul( 6.2832 );
-			const cy = cos( yaw ), sy = sin( yaw );
-			const rot = ( v ) => vec3( v.x.mul( cy ).sub( v.z.mul( sy ) ), v.y, v.x.mul( sy ).add( v.z.mul( cy ) ) );
-
-			const ground = heightAt( xz );
-			const base = vec3( xz.x, ground.sub( 0.03 ), xz.y );
-			const o = rot( vec3( P.x.mul( spread ), P.y, P.z.mul( spread ) ) ).mul( scale );
-
-			// wind: travelling gusts bend blades downwind (length preserving), plus flutter
-			const w = windStrength;
-			const g = gustAt( xz );
-			const tm = G.time;
-			const ph = r.mul( 6.2832 );
-			const bendAmt = w.mul( g.mul( 0.55 ).add( 0.22 ) ).add( sin( tm.mul( 1.9 ).add( ph ).add( xz.x.mul( 0.2 ) ) ).mul( w ).mul( 0.1 ) );
-			const flut = sin( tm.mul( 7.3 ).add( ph.mul( 3 ) ).add( bRnd.mul( 20 ) ) ).mul( w.mul( 0.06 ).add( 0.015 ) );
-			const stiff = select( isGrass, float( 1 ), select( isOat, float( 0.8 ), float( 0.08 ) ) );
-			const hf2 = hf.mul( hf );
-			const disp = windDir3.mul( bendAmt.mul( hf2 ).mul( stiff ) ).add( windPerp3.mul( flut.mul( hf2 ).mul( stiff ) ) ).mul( length( o ).add( 1e-4 ) );
-			const oL = length( o );
-			const ob = normalize( o.add( disp ).add( vec3( 0, 1e-5, 0 ) ) ).mul( oL );
-
-			const wScale = select( isGrass, mix( 1.5, 1.2, duneF ), float( 1 ) );
-			const wide = wScale.mul( widthK ).mul( min( scale.mul( 2 ), max( scale, 0.5 ) ) );
-			const pos = base.add( ob ).add( rot( side ).mul( wide ) );
-
-			// lighting normal: blade normal bent towards up (soft, grass-like shading), rounded across
-			// the blade (a folded leaf is lit differently on its two halves)
-			const across = side4.w;
-			const sideDir = normalize( rot( side ).add( vec3( 1e-5, 0, 0 ) ) );
-			normalLocal.assign( normalize( rot( N ).mul( 0.5 ).add( UP ).add( sideDir.mul( across.mul( 0.35 ) ) ) ) );
-
-			// a share of the blades is dead / straw coloured (more in the dry patches)
-			const dryBlade = select( fract01( bRnd.mul( 13.7 ).add( r.mul( 3.1 ) ) ).lessThan( mt.dry.mul( 0.3 ).add( 0.07 ) ), float( 1 ), float( 0 ) );
-			vG.assign( vec4( hf, kind, duneF, bRnd ) );
-			vTone.assign( vec4( mt.tone, mt.dry ) );
-			vG2.assign( vec4( density, select( kind.lessThan( 2.5 ), float( 0 ), blade.w ), across, dryBlade ) );
-			vGust.assign( saturate( g.mul( w ).mul( 0.6 ) ).mul( stiff ) );
-
-			return pos;
-
-		} )();
-
-		const albedo = Fn( () => {
-
-			const hf = vG.x;
-			const kind = vG.y;
-			const duneF = vG.z;
-			const rnd = vG.w;
-			const across = vG2.z;
-			const dryBlade = vG2.w;
-			// self-shadowing of the sward: dark at the base of the clump
-			const ao = mix( 0.32, 1.0, smoothstep( 0.0, 0.75, hf ) );
-			// dune grass: olive base, straw tips; meadow: the terrain's meadow tone, dark and brownish
-			// (dead leaf sheaths) at the base, lighter / sun-bleached towards the tips
-			const duneBase = mix( C( 0x5d6232 ), C( 0x7f8a40 ), rnd );
-			const duneTip = mix( C( 0xb8ab6c ), C( 0x9aa452 ), rnd );
-			const tone = vTone.xyz.mul( rnd.mul( 0.34 ).add( 0.83 ) );
-			const lushBase = mix( tone.mul( 0.5 ), MEADOW.soil, 0.3 );
-			const tipDry = vTone.w.mul( 0.4 ).add( smoothstep( 0.8, 1.0, rnd ).mul( 0.35 ) );
-			const lushTip = mix( tone.mul( vec3( 1.25, 1.25, 1.05 ) ), MEADOW.straw, tipDry.mul( smoothstep( 0.55, 1.0, hf ) ) );
-			const base = mix( lushBase, duneBase, duneF );
-			const tip = mix( lushTip, duneTip, duneF );
-			let grass0 = mix( base, tip, smoothstep( 0.05, 0.95, hf ) );
-			// dead blades: straw to brown
-			grass0 = mix( grass0, mix( MEADOW.straw, MEADOW.soil.mul( 1.8 ), rnd.mul( 0.6 ) ).mul( smoothstep( 0.0, 0.5, hf ).mul( 0.4 ).add( 0.6 ) ), dryBlade.mul( float( 1 ).sub( duneF ) ) );
-			// pale midrib
-			grass0 = grass0.mul( pow( float( 1 ).sub( abs( across ) ), 6 ).mul( smoothstep( 0.05, 0.4, hf ) ).mul( 0.18 ).add( 1 ) );
-			// wind sheen: blades flattened by a gust show their paler undersides, so gusts read
-			// as bright waves rolling across the grass
-			const grass = mix( grass0, grass0.mul( vec3( 1.3, 1.28, 1.1 ) ).add( vec3( 0.03, 0.03, 0.015 ) ), vGust.mul( smoothstep( 0.15, 0.9, hf ) ).mul( 0.6 ) );
-			const oatStalk = mix( C( 0x9c9a62 ), C( 0xc2b27a ), hf );
-			const oatHead = mix( C( 0xc9b27a ), C( 0xa8905a ), rnd );
-			const centre = vG2.y; // 1 at leaf / flower centre
-			const vine = mix( mix( C( 0x2e5219 ), C( 0x4a7328 ), rnd ), C( 0x7a8f4a ), centre.mul( 0.3 ) ).mul( select( hf.lessThan( 0.075 ), vec3( 1.25, 1.05, 0.8 ), vec3( 1 ) ) );
-			const flower = mix( C( 0xb8479c ), C( 0xf2e8ee ), smoothstep( 0.35, 0.9, centre ) );
-			const c = select( kind.lessThan( 0.5 ), grass,
-				select( kind.lessThan( 1.5 ), oatStalk,
-					select( kind.lessThan( 2.5 ), oatHead,
-						select( kind.lessThan( 3.5 ), vine, flower ) ) ) );
-			return c.mul( select( kind.lessThan( 2.5 ), ao, float( 1 ) ) );
-
-		} )();
-
-		mat.colorNode = albedo;
-		mat.roughnessNode = select( vG.y.greaterThan( 2.5 ).and( vG.y.lessThan( 3.5 ) ), float( 0.45 ), float( 0.8 ) );
-		mat.metalnessNode = float( 0 );
-		mat.normalNode = normalize( normalViewGeometry.add( positionViewDirection.mul( 0.4 ) ) );
-
-		// back-lit thin blades glow (evaluated in the lighting model with the shadowed light, so
-		// grass in shadow does not)
-		mat.translucencyNode = ( lightColor ) => {
-
-			const V = normalize( cameraPosition.sub( positionWorld ) );
-			const back = pow( saturate( dot( V.negate(), G.sunDir ) ), 4 );
-			return albedo.mul( vec3( 1.1, 1.3, 0.6 ) ).mul( lightColor ).mul( back.mul( 0.3 ).mul( smoothstep( 0.2, 1.0, vG.x ) ) ).mul( float( 1 ).sub( G.night ) );
-
-		};
-
-		return mat;
+		return createGrassMaterial( this );
 
 	}
 
@@ -825,8 +615,8 @@ export class GrassField {
 
 	dispose() {
 
-		this.heightTex.dispose();
-		this.maskTex.dispose();
+		this.heightTex.destroy();
+		this.maskTex.destroy();
 		this.material.dispose();
 		for ( const m of this.meshes ) m.geometry.dispose();
 
@@ -834,12 +624,255 @@ export class GrassField {
 
 }
 
-// fract() for a node (TSL's fract is imported lazily to keep the import list short)
-const fract01 = ( x ) => x.sub( floor( x ) );
+// ------------------------------------------------------------------------------------------ WGSL
 
-const C = ( hex ) => {
+// sRGB float triple -> linear WGSL vec3 (TerrainShading.srgb)
+const _lin = ( c ) => ( c < 0.04045 ? c * 0.0773993808 : Math.pow( c * 0.9478672986 + 0.0521327014, 2.4 ) );
+const srgb = ( r, g, b ) => `vec3f( ${ _lin( r ).toFixed( 6 ) }, ${ _lin( g ).toFixed( 6 ) }, ${ _lin( b ).toFixed( 6 ) } )`;
 
-	const c = new THREE.Color( hex );
-	return vec3( c.r, c.g, c.b );
+// ---- tropical meadow (tall guinea / elephant grass)
+// Local copy of TerrainShading.js's MEADOW / meadowTone (the terrain stream has not ported it yet):
+// switch to the terrain module's function once it exists. The tone is shared by the terrain and
+// the grass field (blade base colour): both evaluate it from the same inputs, so the geometric
+// grass fades into the ground without a visible boundary.
+const MEADOW = {
+	lush: srgb( 0.13, 0.2, 0.05 ),
+	green: srgb( 0.25, 0.32, 0.1 ),
+	olive: srgb( 0.36, 0.37, 0.14 ),
+	yellow: srgb( 0.5, 0.46, 0.2 ),
+	straw: srgb( 0.62, 0.54, 0.33 ),
+	soil: srgb( 0.17, 0.13, 0.08 ),
+};
+
+// the rotation of an xz vector by a constant angle (matches TerrainShading.rot2)
+const rotXZ = ( v, a ) => {
+
+	const c = Math.cos( a ), s = Math.sin( a );
+	return `vec2f( ${ v }.x * ${ f( c ) } - ${ v }.y * ${ f( s ) }, ${ v }.x * ${ f( s ) } + ${ v }.y * ${ f( c ) } )`;
 
 };
+
+export const grassModule = new ShaderModule( {
+	name: 'vegGrass',
+	deps: [ vegModule ],
+	code: /* wgsl */`
+const VEG_MEADOW_LUSH = ${ MEADOW.lush };
+const VEG_MEADOW_GREEN = ${ MEADOW.green };
+const VEG_MEADOW_OLIVE = ${ MEADOW.olive };
+const VEG_MEADOW_YELLOW = ${ MEADOW.yellow };
+const VEG_MEADOW_STRAW = ${ MEADOW.straw };
+const VEG_MEADOW_SOIL = ${ MEADOW.soil };
+
+struct VegMeadow { tone: vec3f, dry: f32, lush: f32 };
+
+//   mA, mB: detail fbm channel at the 173 m / 47 m scales (~0.5 +- 0.1): the samples at
+//   rot2( xz, 0.7 ) / 173 and rot2( xz, 2.1 ) / 47 that the terrain takes anyway; slope: 1 - N.y;
+//   south: N.z (the sun side). Mostly fresh green grass with olive, sun-bleached yellow and a few
+// straw-dry patches (more on exposed slopes), darker lush grass in the damp patches.
+// (TerrainShading's optional finer 'detail' input is not used by the grass.)
+fn vegMeadowTone( mA: f32, mB: f32, slope: f32, south: f32 ) -> VegMeadow {
+	let m = mA * 0.55 + mB * 0.45 + slope * 0.25 + south * 0.04;
+	let olive = smoothstep( 0.52, 0.6, m );
+	let yellow = smoothstep( 0.6, 0.67, m );
+	let straw = smoothstep( 0.66, 0.73, m + ( mB - 0.5 ) * 0.2 );
+	let lush = smoothstep( 0.46, 0.37, mB * 0.7 + mA * 0.3 + slope * 0.2 );
+	var c = mix( VEG_MEADOW_GREEN, VEG_MEADOW_OLIVE, olive );
+	c = mix( c, VEG_MEADOW_YELLOW, yellow * 0.8 );
+	c = mix( c, VEG_MEADOW_STRAW, straw * 0.55 );
+	c = mix( c, VEG_MEADOW_LUSH, lush * 0.75 );
+	return VegMeadow( c, olive * 0.4 + yellow * 0.6, lush );
+}
+
+// per-tier visibility at camera distance d (1 = full width, 0 = gone); tier 0 thins out per blade
+fn vegGrassTierFade( tier: f32, d: f32, cut: f32 ) -> f32 {
+	let f2 = 1.0 - smoothstep( ${ f( FADE_T2[ 0 ] ) }, ${ f( FADE_T2[ 1 ] ) }, d );
+	let f1 = 1.0 - smoothstep( ${ f( FADE_T1[ 0 ] ) }, ${ f( FADE_T1[ 1 ] ) }, d );
+	let f0 = 1.0 - smoothstep( cut - 5.0, cut, d );
+	return select( select( f0, f1, tier > 0.5 ), f2, tier > 1.5 );
+}
+`,
+} );
+
+function createGrassMaterial( field ) {
+
+	const t = field.terrain;
+	const res = t.res;
+
+	const mat = new Material( {
+		name: 'veg-grass',
+		side: 'double',
+		roughness: 0.8,
+		metalness: 0,
+		modules: [ vegModule, grassModule ],
+		textures: {
+			grassHeights: field.heightTex,
+			grassMask: field.maskTex,
+		},
+		attributes: { iCell: 'vec4f', aSlot: 'vec4f', aBlade: 'vec4f', aSide: 'vec4f' },
+		varyings: {
+			vVegGrass: 'vec4f', // hf, kind, dune fraction, rand
+			vVegGrassTone: 'vec4f', // meadow tone (shared with the terrain), dryness
+			vVegGrass2: 'vec4f', // density, leaf / flower centre flag, across, dry blade
+			vVegGust: 'f32', // current gust bend (wind sheen)
+		},
+		vertex: /* wgsl */`
+	let cell = v.iCell.xy;
+	let slot = v.aSlot;
+	let blade = v.aBlade;
+	let side4 = v.aSide;
+	let side = side4.xyz;
+	let P = v.position;
+	let N = v.normal;
+
+	let xz = cell + slot.xy;
+	let hf = blade.x;
+	let kind = blade.y;
+	let bRnd = blade.z;
+
+	let m = textureSampleLevel( grassMask, smpLinearClamp, ( xz - ${ f( t.origin ) } ) / ${ f( t.size ) }, 0.0 );
+	let isGrass = kind < 0.5;
+	let isOat = kind > 0.5 && kind < 2.5;
+	let lush = m.g;
+	let dune = m.r;
+	// dune tufts are sparse, the meadow is a closed sward
+	let duneF = dune / ( dune + lush + 1e-3 );
+	let grassP = mix( lush, dune * 0.4, duneF );
+	let density = select( select( m.a, m.b, isOat ), grassP, isGrass );
+	let r = vegHash12( xz * 1.37 + 0.51 );
+	let r2 = vegHash12( xz * 2.11 + 7.3 );
+	let flowerOk = select( 1.0, select( 0.0, 1.0, r2 < 0.35 ), kind > 3.5 );
+	let present = select( 0.0, 1.0, r < density ) * flowerOk;
+
+	// meadow tone at the clump: the same function and inputs as the terrain's meadow shading
+	let mA = textureSampleLevel( vegDetail, smpLinearRepeat, ${ rotXZ( 'xz', 0.7 ) } / 173.0, 0.0 ).w;
+	let mB = textureSampleLevel( vegDetail, smpLinearRepeat, ${ rotXZ( 'xz', 2.1 ) } / 47.0, 0.0 ).w;
+	let mt = vegMeadowTone( mA, mB, 0.0, 0.0 );
+	// size: tall meadow grass, knee to waist high: swathes of taller grass in the lush patches,
+	// lower where it is dry; wiry dune tufts
+	let patchN = vegNoise( xz * ${ f( 1 / 6.5 ) } + 17.3 ) * 0.7 + vegNoise( xz * ${ f( 1 / 2.3 ) } ) * 0.3;
+	let lushH = mix( 0.7, 1.3, patchN ) * ( mt.lush * 0.25 + 1.0 ) * ( 1.0 - mt.dry * 0.25 );
+	let grassH = mix( lushH, 0.55, duneF ) * ( r2 * 0.35 + 0.83 ) * ( density * 0.35 + 0.65 );
+	let oatH = r2 * 0.55 + 1.0;
+	let vineS = r2 * 0.4 + 0.8;
+	let hScale = select( select( vineS, oatH, isOat ), grassH, isGrass );
+	// meadow clumps fan out wider than the wiry dune tufts
+	let spread = select( 1.0, mix( 1.35, 1.0, duneF ), isGrass );
+
+	// distance LOD: tiers fade out (narrow to nothing), the remaining blades widen so the
+	// coverage (blade density x width) stays constant; tier 0 thins out per blade near R_FAR
+	let dist = length( xz - vegParams.camPos.xz );
+	// tier: grass blades and oats carry their own (aBlade.w), otherwise the slot's
+	let tier = max( select( 0.0, blade.w, kind < 2.5 ), slot.w );
+	let cutK = bRnd * 7.13 + r2;
+	let cut = mix( ${ f( FADE_T0[ 0 ] + 5 ) }, ${ f( FADE_T0[ 1 ] ) }, cutK - floor( cutK ) );
+	let own = vegGrassTierFade( tier, dist, cut );
+	let f2 = 1.0 - smoothstep( ${ f( FADE_T2[ 0 ] ) }, ${ f( FADE_T2[ 1 ] ) }, dist );
+	let f1 = 1.0 - smoothstep( ${ f( FADE_T1[ 0 ] ) }, ${ f( FADE_T1[ 1 ] ) }, dist );
+	let comp = ${ f( TIER_N[ 0 ] + TIER_N[ 1 ] + TIER_N[ 2 ] ) } / ( f2 * ${ f( TIER_N[ 2 ] ) } + f1 * ${ f( TIER_N[ 1 ] ) } + ${ f( TIER_N[ 0 ] ) } );
+	// oats and creeper simply shrink out
+	let widthK = select( 1.0, comp * own, isGrass );
+	let sizeK = select( own, 1.0, isGrass );
+	let scale = hScale * present * sizeK;
+
+	// per-slot random yaw
+	let yaw = vegHash12( xz * 0.73 + 3.3 ) * 6.2832;
+	let cy = cos( yaw ); let sy = sin( yaw );
+
+	// terrain height (float texels loaded and bilinearly filtered manually)
+	let hfp = ( xz - ${ f( t.origin ) } ) / ${ f( t.texel ) } - 0.5;
+	let hfi = floor( hfp );
+	let hfr = hfp - hfi;
+	let ij = vec2i( clamp( hfi, vec2f( 0.0 ), vec2f( ${ f( res - 2 ) } ) ) );
+	let ha = textureLoad( grassHeights, ij, 0 ).x;
+	let hb = textureLoad( grassHeights, ij + vec2i( 1, 0 ), 0 ).x;
+	let hc = textureLoad( grassHeights, ij + vec2i( 0, 1 ), 0 ).x;
+	let hd = textureLoad( grassHeights, ij + vec2i( 1, 1 ), 0 ).x;
+	let ground = mix( mix( ha, hb, hfr.x ), mix( hc, hd, hfr.x ), hfr.y );
+	let base = vec3f( xz.x, ground - 0.03, xz.y );
+	let pl = vec3f( P.x * spread, P.y, P.z * spread );
+	let o0 = vec3f( pl.x * cy - pl.z * sy, pl.y, pl.x * sy + pl.z * cy ) * scale;
+
+	// wind: travelling gusts bend blades downwind (length preserving), plus flutter
+	let w = vegWindStrength();
+	let g = vegGustAt( xz );
+	let tm = frame.time;
+	let ph = r * 6.2832;
+	let bendAmt = w * ( g * 0.55 + 0.22 ) + sin( tm * 1.9 + ph + xz.x * 0.2 ) * w * 0.1;
+	let flut = sin( tm * 7.3 + ph * 3.0 + bRnd * 20.0 ) * ( w * 0.06 + 0.015 );
+	let stiff = select( select( 0.08, 0.8, isOat ), 1.0, isGrass );
+	let hf2 = hf * hf;
+	let disp = ( vegWindDir3() * ( bendAmt * hf2 * stiff ) + vegWindPerp3() * ( flut * hf2 * stiff ) ) * ( length( o0 ) + 1e-4 );
+	let oL = length( o0 );
+	let ob = normalize( o0 + disp + vec3f( 0.0, 1e-5, 0.0 ) ) * oL;
+
+	let wScale = select( 1.0, mix( 1.5, 1.2, duneF ), isGrass );
+	let wide = wScale * widthK * min( scale * 2.0, max( scale, 0.5 ) );
+	let sideR = vec3f( side.x * cy - side.z * sy, side.y, side.x * sy + side.z * cy );
+	let pos = base + ob + sideR * wide;
+
+	// lighting normal: blade normal bent towards up (soft, grass-like shading), rounded across
+	// the blade (a folded leaf is lit differently on its two halves)
+	let across = side4.w;
+	let sideDir = normalize( sideR + vec3f( 1e-5, 0.0, 0.0 ) );
+	let nR = vec3f( N.x * cy - N.z * sy, N.y, N.x * sy + N.z * cy );
+
+	// a share of the blades is dead / straw coloured (more in the dry patches)
+	let dk = bRnd * 13.7 + r * 3.1;
+	let dryBlade = select( 0.0, 1.0, dk - floor( dk ) < mt.dry * 0.3 + 0.07 );
+	o.vVegGrass = vec4f( hf, kind, duneF, bRnd );
+	o.vVegGrassTone = vec4f( mt.tone, mt.dry );
+	o.vVegGrass2 = vec4f( density, select( blade.w, 0.0, kind < 2.5 ), across, dryBlade );
+	o.vVegGust = sat( g * w * 0.6 ) * stiff;
+
+	v.useWorld = true;
+	v.worldPos = pos;
+	v.worldNormal = normalize( nR * 0.5 + VEG_UP + sideDir * ( across * 0.35 ) );
+`,
+		surface: /* wgsl */`
+	let hf = in.vs.vVegGrass.x;
+	let kind = in.vs.vVegGrass.y;
+	let duneF = in.vs.vVegGrass.z;
+	let rnd = in.vs.vVegGrass.w;
+	let across = in.vs.vVegGrass2.z;
+	let dryBlade = in.vs.vVegGrass2.w;
+	// self-shadowing of the sward: dark at the base of the clump
+	let ao = mix( 0.32, 1.0, smoothstep( 0.0, 0.75, hf ) );
+	// dune grass: olive base, straw tips; meadow: the terrain's meadow tone, dark and brownish
+	// (dead leaf sheaths) at the base, lighter / sun-bleached towards the tips
+	let duneBase = mix( ${ C( 0x5d6232 ) }, ${ C( 0x7f8a40 ) }, rnd );
+	let duneTip = mix( ${ C( 0xb8ab6c ) }, ${ C( 0x9aa452 ) }, rnd );
+	let tone = in.vs.vVegGrassTone.xyz * ( rnd * 0.34 + 0.83 );
+	let lushBase = mix( tone * 0.5, VEG_MEADOW_SOIL, 0.3 );
+	let tipDry = in.vs.vVegGrassTone.w * 0.4 + smoothstep( 0.8, 1.0, rnd ) * 0.35;
+	let lushTip = mix( tone * vec3f( 1.25, 1.25, 1.05 ), VEG_MEADOW_STRAW, tipDry * smoothstep( 0.55, 1.0, hf ) );
+	let gBase = mix( lushBase, duneBase, duneF );
+	let gTip = mix( lushTip, duneTip, duneF );
+	var grass0 = mix( gBase, gTip, smoothstep( 0.05, 0.95, hf ) );
+	// dead blades: straw to brown
+	grass0 = mix( grass0, mix( VEG_MEADOW_STRAW, VEG_MEADOW_SOIL * 1.8, rnd * 0.6 ) * ( smoothstep( 0.0, 0.5, hf ) * 0.4 + 0.6 ), dryBlade * ( 1.0 - duneF ) );
+	// pale midrib
+	grass0 = grass0 * ( pow( 1.0 - abs( across ), 6.0 ) * smoothstep( 0.05, 0.4, hf ) * 0.18 + 1.0 );
+	// wind sheen: blades flattened by a gust show their paler undersides, so gusts read
+	// as bright waves rolling across the grass
+	let grass = mix( grass0, grass0 * vec3f( 1.3, 1.28, 1.1 ) + vec3f( 0.03, 0.03, 0.015 ), in.vs.vVegGust * smoothstep( 0.15, 0.9, hf ) * 0.6 );
+	let oatStalk = mix( ${ C( 0x9c9a62 ) }, ${ C( 0xc2b27a ) }, hf );
+	let oatHead = mix( ${ C( 0xc9b27a ) }, ${ C( 0xa8905a ) }, rnd );
+	let centre = in.vs.vVegGrass2.y; // 1 at leaf / flower centre
+	let vine = mix( mix( ${ C( 0x2e5219 ) }, ${ C( 0x4a7328 ) }, rnd ), ${ C( 0x7a8f4a ) }, centre * 0.3 ) * select( vec3f( 1.0 ), vec3f( 1.25, 1.05, 0.8 ), hf < 0.075 );
+	let flower = mix( ${ C( 0xb8479c ) }, ${ C( 0xf2e8ee ) }, smoothstep( 0.35, 0.9, centre ) );
+	let c = select( select( select( select( flower, vine, kind < 3.5 ), oatHead, kind < 2.5 ), oatStalk, kind < 1.5 ), grass, kind < 0.5 );
+	let albedo = c * select( 1.0, ao, kind < 2.5 );
+	s.albedo = albedo;
+	s.roughness = select( 0.8, 0.45, kind > 2.5 && kind < 3.5 );
+	s.metalness = 0.0;
+	s.specularIntensity = 0.4;
+	s.normal = normalize( normalize( in.vs.normal ) + in.V * 0.4 );
+	// back-lit thin blades glow (evaluated in the lighting model with the shadowed light, so
+	// grass in shadow does not)
+	let back = pow( sat( dot( - in.V, frame.sunDir ) ), 4.0 );
+	s.translucency = albedo * vec3f( 1.1, 1.3, 0.6 ) * ( back * 0.3 * smoothstep( 0.2, 1.0, hf ) ) * ( 1.0 - frame.night );
+`,
+	} );
+	return mat;
+
+}

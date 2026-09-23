@@ -1,5 +1,6 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 import { ReefBatch } from '../reef/ReefBatch.js';
+import { GPU } from '../../engine/gpu/GPU.js';
 import { SPECIES } from './FishSpecies.js';
 import { fishGeometry, splitFishGeometry, section, PART } from './FishGeometry.js';
 import { createPropMaterial } from './FishMaterial.js';
@@ -490,7 +491,8 @@ export class FishProps {
 		this._frame = - 1;
 		mesh.onBeforeRender = ( renderer, scene, camera, geometry, material, group ) => {
 
-			if ( camera.isPerspectiveCamera ) this.cull( camera, renderer.info.calls );
+			// (three: renderer.info.calls; the engine has no renderer here: the GPU frame number)
+			if ( camera.isPerspectiveCamera ) this.cull( camera, GPU.frame );
 			draw( renderer, scene, camera, geometry, material, group );
 
 		};

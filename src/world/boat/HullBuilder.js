@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { BufferGeometry, Float32BufferAttribute, Vector3 } from '../../engine/index.js';
 import { gridSurface, loft, fanCap, orientTowards, slab, box, rod, tube, auxVertices } from './GeoKit.js';
 import { sstep, lerp } from './HullLines.js';
 
@@ -11,7 +11,7 @@ export const PALETTE = {
 	stainless: 0xd0d3d6,
 };
 
-const V = ( x, y, z ) => new THREE.Vector3( x, y, z );
+const V = ( x, y, z ) => new Vector3( x, y, z );
 
 export function buildHull( kit, L ) {
 
@@ -53,9 +53,9 @@ function buildShell( kit, L ) {
 
 	}
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 	g.setIndex( idx );
 	orientTowards( g, V( 0, 0, - 1 ) );
 	g.computeVertexNormals();
@@ -109,8 +109,8 @@ export function buildHullVolume( L ) {
 
 	}
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
 	g.setIndex( clean );
 	g.computeVertexNormals();
 	g.computeBoundingBox();
@@ -308,9 +308,9 @@ function buildLining( kit, L ) {
 
 	}
 
-	const g = new THREE.BufferGeometry();
-	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
-	g.setAttribute( 'uv', new THREE.Float32BufferAttribute( uvs, 2 ) );
+	const g = new BufferGeometry();
+	g.setAttribute( 'position', new Float32BufferAttribute( pos, 3 ) );
+	g.setAttribute( 'uv', new Float32BufferAttribute( uvs, 2 ) );
 	g.setIndex( idx );
 	orientTowards( g, V( 0, 0, 1 ) );
 	g.computeVertexNormals();

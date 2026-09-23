@@ -1,5 +1,5 @@
-import * as THREE from 'three/webgpu';
-import { G } from '../core/Globals.js';
+import { Group, MathUtils, Mesh, Object3D, Quaternion, Vector3 } from '../engine/index.js';
+import { G } from '../engine/render/Frame.js';
 import { HullLines, RHO_SEAWATER } from './boat/HullLines.js';
 import { GeoKit, triangleCount } from './boat/GeoKit.js';
 import { BoatMaterials } from './boat/BoatMaterials.js';
@@ -14,10 +14,10 @@ const THROTTLE_ANGLE = 0.6; // lever travel (rad) from neutral to full
 const RADAR_RPM = 24;
 const PROP_DISPLAY_RPS = 5;
 
-const _v = new THREE.Vector3();
-const _pos = new THREE.Vector3();
-const _scale = new THREE.Vector3();
-const _q = new THREE.Quaternion();
+const _v = new Vector3();
+const _pos = new Vector3();
+const _scale = new Vector3();
+const _q = new Quaternion();
 
 function transverseInertia( lines ) {
 
@@ -56,7 +56,7 @@ export class BoatModel {
 		buildWheelhouse( kit, lines, parts );
 		buildDeckGear( kit, lines, parts );
 
-		this.group = new THREE.Group();
+		this.group = new Group();
 		this.group.name = 'LobsterBoat';
 		this.meshes = {};
 
@@ -64,7 +64,7 @@ export class BoatModel {
 
 			const geo = kit.merged( name );
 			if ( ! geo ) continue;
-			const mesh = new THREE.Mesh( geo, materials[ name ] );
+			const mesh = new Mesh( geo, materials[ name ] );
 			mesh.name = 'boat-' + name;
 			mesh.castShadow = name !== 'glass';
 			mesh.receiveShadow = true;
@@ -78,7 +78,7 @@ export class BoatModel {
 
 		const addPart = ( name, geo, mat, position, parent = this.group ) => {
 
-			const mesh = new THREE.Mesh( geo, mat );
+			const mesh = new Mesh( geo, mat );
 			mesh.name = 'boat-' + name;
 			mesh.castShadow = true;
 			mesh.receiveShadow = true;
@@ -90,12 +90,12 @@ export class BoatModel {
 		};
 
 		// helm wheel: pivot aligned with the shaft, wheel spins about its local Z
-		this.wheelPivot = new THREE.Object3D();
+		this.wheelPivot = new Object3D();
 		this.wheelPivot.name = 'boat-wheel-pivot';
 		this.wheelPivot.position.copy( parts.wheelCenter );
-		this.wheelPivot.quaternion.setFromUnitVectors( new THREE.Vector3( 0, 0, 1 ), parts.wheelAxis );
+		this.wheelPivot.quaternion.setFromUnitVectors( new Vector3( 0, 0, 1 ), parts.wheelAxis );
 		this.group.add( this.wheelPivot );
-		this.wheelMesh = addPart( 'wheel', wheelGeometry(), materials.wood, new THREE.Vector3(), this.wheelPivot );
+		this.wheelMesh = addPart( 'wheel', wheelGeometry(), materials.wood, new Vector3(), this.wheelPivot );
 
 		this.throttleMesh = addPart( 'throttle', throttleGeometry(), materials.fittings, parts.throttlePivot );
 		this.radarMesh = addPart( 'radar', radarArrayGeometry(), materials.fittings, parts.radarPivot );
@@ -145,20 +145,20 @@ export class BoatModel {
 		// Inertia from radii of gyration: roll ~0.36 B, pitch/yaw ~0.26 L.
 		const mass = this.hydro.suggestedMass;
 		const kRoll = 0.36 * this.dimensions.beam, kPitch = 0.26 * lines.length, kYaw = 0.27 * lines.length;
-		this.hydro.centerOfMass = new THREE.Vector3( 0, 0.3, lines.centerOfBuoyancy.z );
-		this.hydro.inertia = new THREE.Vector3( mass * kPitch * kPitch, mass * kYaw * kYaw, mass * kRoll * kRoll ); // about x (pitch), y (yaw), z (roll)
+		this.hydro.centerOfMass = new Vector3( 0, 0.3, lines.centerOfBuoyancy.z );
+		this.hydro.inertia = new Vector3( mass * kPitch * kPitch, mass * kYaw * kYaw, mass * kRoll * kRoll ); // about x (pitch), y (yaw), z (roll)
 		this.hydro.metacentricRadius = transverseInertia( lines ) / lines.canoeVolume; // BM (m)
 
 		// ---- anchor points (boat frame)
 
-		this.helmEye = new THREE.Vector3( HOUSE.helmX, 1.85, 0.3 );
-		this.boardPoint = new THREE.Vector3( 0, lines.deckY, - 1.75 );
+		this.helmEye = new Vector3( HOUSE.helmX, 1.85, 0.3 );
+		this.boardPoint = new Vector3( 0, lines.deckY, - 1.75 );
 
 		this.exitPoints = [];
 		for ( const z of [ - 3.0, - 2.0, - 1.2 ] ) {
 
 			const t = lines.tAtSheerZ( z );
-			for ( const s of [ 1, - 1 ] ) this.exitPoints.push( new THREE.Vector3( s * ( lines.sheerX( t ) - 0.035 ), lines.sheerY( t ) + 0.05, z ) );
+			for ( const s of [ 1, - 1 ] ) this.exitPoints.push( new Vector3( s * ( lines.sheerX( t ) - 0.035 ), lines.sheerY( t ) + 0.05, z ) );
 
 		}
 
@@ -169,7 +169,7 @@ export class BoatModel {
 		for ( const z of [ 2.0, 2.6, 3.2, 3.8 ] ) {
 
 			const hb = lines.halfBeamAt( z );
-			for ( const s of [ 1, - 1 ] ) this.bowSprayPoints.push( new THREE.Vector3( s * ( hb + 0.01 ), 0.05, z ) );
+			for ( const s of [ 1, - 1 ] ) this.bowSprayPoints.push( new Vector3( s * ( hb + 0.01 ), 0.05, z ) );
 
 		}
 
@@ -184,10 +184,10 @@ export class BoatModel {
 		this._propAngle = 0;
 		this._radarAngle = 0;
 		this._time = 0;
-		this._lastPos = new THREE.Vector3();
+		this._lastPos = new Vector3();
 		this._hasLastPos = false;
-		this._vel = new THREE.Vector3();
-		this._flagDir = new THREE.Vector3( 0, 0, - 1 );
+		this._vel = new Vector3();
+		this._flagDir = new Vector3( 0, 0, - 1 );
 		this._flagWind = 0.5;
 
 		this.setSteering( 0 );
@@ -230,7 +230,7 @@ export class BoatModel {
 	// wheel turned counter-clockwise as seen from the helm.
 	setSteering( angle ) {
 
-		const a = THREE.MathUtils.clamp( angle, - 1, 1 );
+		const a = MathUtils.clamp( angle, - 1, 1 );
 		this._steer = a;
 		this.wheelMesh.rotation.z = - a * WHEEL_TURNS * Math.PI * 2;
 		this.rudderMesh.rotation.y = - a * RUDDER.maxAngle;
@@ -240,7 +240,7 @@ export class BoatModel {
 	// -1 (full astern) .. 0 (neutral) .. 1 (full ahead); lever tips forward for ahead.
 	setThrottle( t ) {
 
-		this._throttle = THREE.MathUtils.clamp( t, - 1, 1 );
+		this._throttle = MathUtils.clamp( t, - 1, 1 );
 		this.throttleMesh.rotation.x = this._throttle * THROTTLE_ANGLE;
 
 	}
@@ -298,7 +298,7 @@ export class BoatModel {
 
 		}
 
-		this._flagWind += ( THREE.MathUtils.clamp( speed / 9, 0, 1 ) - this._flagWind ) * ( 1 - Math.exp( - dt * 2 ) );
+		this._flagWind += ( MathUtils.clamp( speed / 9, 0, 1 ) - this._flagWind ) * ( 1 - Math.exp( - dt * 2 ) );
 		this.materials.flagDir.value.copy( this._flagDir );
 		this.materials.flagWind.value = this._flagWind;
 
@@ -326,13 +326,13 @@ export class BoatModel {
 		const boxes = [];
 		const add = ( tag, min, max, walkable = false, solid = true ) => {
 
-			const center = new THREE.Vector3().addVectors( min, max ).multiplyScalar( 0.5 );
-			const half = new THREE.Vector3().subVectors( max, min ).multiplyScalar( 0.5 );
+			const center = new Vector3().addVectors( min, max ).multiplyScalar( 0.5 );
+			const half = new Vector3().subVectors( max, min ).multiplyScalar( 0.5 );
 			boxes.push( { tag, center, half, walkable, solid } );
 
 		};
 
-		const V = ( x, y, z ) => new THREE.Vector3( x, y, z );
+		const V = ( x, y, z ) => new Vector3( x, y, z );
 		const inner = ( z ) => L.halfBreadth( L.tAtSheerZ( z ), L.deckY ) - L.shell;
 		add( 'deck', V( - inner( - 1.5 ), L.deckY - 0.1, L.zAft + L.shell ), V( inner( - 1.5 ), L.deckY, HOUSE.dash.zFace ), true, false );
 		// bulwarks in three segments following the sheer

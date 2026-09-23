@@ -1,10 +1,5 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, vec3, attribute, positionLocal, sin, cos, smoothstep, abs,
-} from 'three/tsl';
-import { G } from '../core/Globals.js';
-import { standard } from '../materials/Materials.js';
-import { staticVelocityMRT } from '../post/CameraVelocity.js';
+import * as THREE from '../engine/index.js';
+import { Material } from '../engine/render/Material.js';
 
 // Seagulls soaring over the bay: each bird circles its own thermal, banking into the turn, with
 // occasional flapping bursts and the characteristic bent ("M") wing. Everything is animated in
@@ -29,51 +24,44 @@ export class Gulls {
 		geo.setAttribute( 'gA', new THREE.InstancedBufferAttribute( a, 4 ) );
 		geo.setAttribute( 'gB', new THREE.InstancedBufferAttribute( b, 4 ) );
 
-		const mat = standard( { roughness: 0.75, metalness: 0 } );
-		mat.name = 'Gull';
-		mat.vertexColors = true;
-		mat.underwaterLighting = 'none';
-		mat.mrtNode = staticVelocityMRT;
-
-		const gA = attribute( 'gA', 'vec4' ), gB = attribute( 'gB', 'vec4' );
-		const side = attribute( 'side', 'float' ); // -1 left wing, 1 right wing, 0 body
-		const span = attribute( 'span', 'float' ); // 0 at the shoulder .. 1 at the wing tip
-
-		// flight state at time t
-		const state = ( t ) => {
-
-			const R = gA.z, dir = gB.w;
-			const th = gB.x.add( t.mul( gB.y ).div( R ).mul( dir ) );
-			const p = vec3( gA.x.add( cos( th ).mul( R ) ), gA.w.add( sin( th.mul( 2 ).add( gB.z ) ).mul( 3 ) ), gA.y.add( sin( th ).mul( R ) ) );
-			// flight direction (tangent) and bank into the turn
-			const fwd = vec3( sin( th ).negate().mul( dir ), 0, cos( th ).mul( dir ) );
-			return { p, fwd, bank: dir.mul( - 0.45 ) };
-
-		};
-
-		mat.positionNode = Fn( () => {
-
-			const t = G.time;
-			const st = state( t );
-			// flapping bursts: a slow gate turns wing beats (3 Hz) on and off; gliding otherwise
-			const gate = smoothstep( 0.55, 0.8, sin( t.mul( 0.23 ).add( gB.z ) ).mul( 0.5 ).add( 0.5 ) );
-			const beat = sin( t.mul( 3.1 * 2 * Math.PI ).add( gB.z.mul( 7 ) ) );
-			const lift = gate.mul( beat ).mul( 0.55 ).add( 0.08 ); // radians at the shoulder
-			const p = positionLocal.toVar();
-			// wing: rotate about the body axis at the shoulder, the outer wing bends further
-			const ang = lift.mul( span.mul( 0.6 ).add( 0.4 ) ).add( span.mul( span ).mul( gate.oneMinus().mul( - 0.18 ) ) );
-			const ax = abs( p.x );
-			const y = p.y.add( ax.mul( sin( ang ) ) );
-			const x = p.x.mul( cos( ang ) );
-			p.assign( vec3( select3( side, x, p.x ), select3( side, y, p.y ), p.z ) );
-			// bank (roll around the flight axis), then orient along the flight direction
-			const cb = cos( st.bank ), sb = sin( st.bank );
-			const rolled = vec3( p.x.mul( cb ).sub( p.y.mul( sb ) ), p.x.mul( sb ).add( p.y.mul( cb ) ), p.z );
-			const f = st.fwd;
-			const r = vec3( f.z, 0, f.x.negate() );
-			return st.p.add( r.mul( rolled.x ) ).add( vec3( 0, rolled.y, 0 ) ).add( f.mul( rolled.z ) );
-
-		} )();
+		// velocity: camera motion only (the TSL version used staticVelocityMRT): the engine's
+		// previous position defaults to the current one for a displaced vertex
+		const mat = new Material( {
+			name: 'Gull',
+			roughness: 0.75, metalness: 0,
+			vertexColors: true,
+			underwaterLighting: 'none',
+			// gSide: -1 left wing, 1 right wing, 0 body; gSpan: 0 at the shoulder .. 1 at the wing tip
+			attributes: { gA: 'vec4f', gB: 'vec4f', gSide: 'f32', gSpan: 'f32' },
+			vertex: /* wgsl */`
+	let gA = v.gA; let gB = v.gB; let side = v.gSide; let span = v.gSpan;
+	let t = frame.time;
+	// flight state at time t
+	let R = gA.z; let dir = gB.w;
+	let th = gB.x + t * gB.y / R * dir;
+	let stP = vec3f( gA.x + cos( th ) * R, gA.w + sin( th * 2.0 + gB.z ) * 3.0, gA.y + sin( th ) * R );
+	// flight direction (tangent) and bank into the turn
+	let fwd = vec3f( - sin( th ) * dir, 0.0, cos( th ) * dir );
+	let bank = dir * -0.45;
+	// flapping bursts: a slow gate turns wing beats (3 Hz) on and off; gliding otherwise
+	let gate = smoothstep( 0.55, 0.8, sin( t * 0.23 + gB.z ) * 0.5 + 0.5 );
+	let beat = sin( t * ${ ( 3.1 * 2 * Math.PI ).toFixed( 6 ) } + gB.z * 7.0 );
+	let lift = gate * beat * 0.55 + 0.08; // radians at the shoulder
+	var p = v.position;
+	// wing: rotate about the body axis at the shoulder, the outer wing bends further
+	let ang = lift * ( span * 0.6 + 0.4 ) + span * span * ( ( 1.0 - gate ) * -0.18 );
+	let ax = abs( p.x );
+	let y = p.y + ax * sin( ang );
+	let x = p.x * cos( ang );
+	p = vec3f( select( p.x, x, side != 0.0 ), select( p.y, y, side != 0.0 ), p.z );
+	// bank (roll around the flight axis), then orient along the flight direction
+	let cb = cos( bank ); let sb = sin( bank );
+	let rolled = vec3f( p.x * cb - p.y * sb, p.x * sb + p.y * cb, p.z );
+	let f = fwd;
+	let r = vec3f( f.z, 0.0, - f.x );
+	v.position = stP + r * rolled.x + vec3f( 0.0, rolled.y, 0.0 ) + f * rolled.z;
+`,
+		} );
 
 		geo.instanceCount = count;
 		this.mesh = new THREE.Mesh( geo, mat );
@@ -85,8 +73,6 @@ export class Gulls {
 	}
 
 }
-
-const select3 = ( side, a, b ) => side.notEqual( 0 ).select( a, b );
 
 // ~1.3 m wingspan gull: slim body, bent wings with grey mantle and black tips, white underside
 function gullGeometry() {
@@ -120,12 +106,12 @@ function gullGeometry() {
 
 	}
 
-	const g = new THREE.InstancedBufferGeometry();
+	const g = new THREE.BufferGeometry();
 	g.setIndex( idx );
 	g.setAttribute( 'position', new THREE.Float32BufferAttribute( pos, 3 ) );
 	g.setAttribute( 'color', new THREE.Float32BufferAttribute( col, 3 ) );
-	g.setAttribute( 'side', new THREE.Float32BufferAttribute( side, 1 ) );
-	g.setAttribute( 'span', new THREE.Float32BufferAttribute( span, 1 ) );
+	g.setAttribute( 'gSide', new THREE.Float32BufferAttribute( side, 1 ) );
+	g.setAttribute( 'gSpan', new THREE.Float32BufferAttribute( span, 1 ) );
 	g.computeVertexNormals();
 	return g;
 

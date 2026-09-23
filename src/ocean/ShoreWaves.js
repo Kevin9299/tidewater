@@ -1,9 +1,6 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, uniform, float, vec2, vec3, vec4, normalize, length, dot, cross, mix, clamp, saturate, smoothstep,
-	sin, cos, exp, pow, sqrt, max, min, abs, floor, fract, select, If, sign, Loop, Break, textureLoad, ivec2, mat4,
-} from 'three/tsl';
-import { G, GRAVITY } from '../core/Globals.js';
+import { Vector2 } from '../engine/math/index.js';
+import { Texture, UniformBlock, ShaderModule, commonModule } from '../engine/webgpu.js';
+import { G, GRAVITY } from '../engine/render/Frame.js';
 
 // Depth-aware shoreline waves.
 //
@@ -15,294 +12,599 @@ import { G, GRAVITY } from '../core/Globals.js';
 // as a turbulent bore, which finally runs up the beach as a thin swash sheet whose leading edge
 // advances and retreats (vertical run-up R(t) compared against the sand height).
 
-const hash1 = ( x ) => fract( sin( x.mul( 127.1 ).add( 311.7 ) ).mul( 43758.5453 ) );
+// WGSL (this.module, prefix shore). Every function below is a real WGSL function (not inlined at
+// every call site): keeps the vertex, simulation and query shaders small (compile times).
+//   struct ShoreSample { disp, nShore, env, foam, breaking, u, dir, exposure, swashLevel, swashCovered (0/1),
+//                        thick, swashFoam, runup, inland, dRdt, tau, flow, flowSpeed, face, roller }
+//   fn shoreEvaluate( xz: vec2f, depth: f32, groundH: f32 ) -> ShoreSample          (with the normal: the water mesh)
+//   fn shoreEvaluateNoNormal( xz, depth, groundH ) -> ShoreSample                    (no normal: queries)
+//   fn shoreEvaluateWorld( xz, depth, groundH ) -> ShoreSample                       (a fixed world point: ShoreSim)
+//   struct ShorePhase { sh: vec4f, T: f32, dir: vec2f, exposure: f32, along: f32, s: f32 }
+//   fn shorePhaseAt( xz: vec2f ) -> ShorePhase
+//   fn shoreWaveAmp( m: f32, along: f32 ) -> f32
+//   fn shoreShape( u, A, d, lam ) -> vec4f                     ( x, y, foam, b )
+//   fn shoreCrest( A, d ) -> vec4f                             ( b, H, trough, lipThrow )   (crestParams)
+//   fn shoreBore( A, d ) -> vec4f                              ( Hb, Wt, Xc, wBore )        (boreParams)
+//   fn shoreBreakDepth( xz, dir, u, lam, d ) -> f32
+//   fn shoreDirAt( xz: vec2f ) -> vec3f                        ( dir.x, dir.z, exposure ) (buildDirTexture)
+//   struct ShoreMedium { scatter: vec3f, absorb: vec3f };  fn shoreSurfMedium( xz, depth ) -> ShoreMedium
+//   fn shoreCrestPath( lagXZ: vec2f, depth: f32, Tv: vec3f ) -> f32
+//   fn shoreSwashClip( xz: vec2f, thickness: f32 ) -> f32
+// Consumes terrainHeightAt( xz ) and terrainShoreSample( xz ) from the terrain module.
+
 const TAU = Math.PI * 2;
 const BEACH_SLOPE = 0.066; // run-up is converted to a horizontal excursion with this slope
 const SWASH_UP = 0.4, SWASH_DOWN = 0.55; // fractions of the period: uprush, backwash
 const SWASH_OVERSHOOT = 0.6; // the mesh sheet reaches this far (m) past the leading edge
+
+const f = ( x ) => {
+
+	const s = String( x );
+	return s.includes( '.' ) || s.includes( 'e' ) ? s : s + '.0';
+
+};
+
+// one evaluate() variant: mode 'normal' (the water mesh), 'plain' (withNormal: false), 'world'
+function evaluateCode( name, mode ) {
+
+	return /* wgsl */`
+fn ${ name }( xz: vec2f, depth: f32, groundH: f32 ) -> ShoreSample {
+	let ph = shorePhaseAt( xz );
+	let sh = ph.sh;
+	let exposure = ph.exposure;
+	let along = ph.along;
+	let dir = ph.dir;
+	let Tp = shoreP.period;
+
+	let d = depth;
+	let c = sqrt( clamp( d, 0.3, 25.0 ) * SHORE_GRAVITY );
+	let lam = c * Tp;
+
+	let s = ph.s;
+	let m = floor( s + 0.5 );
+	let u = s - m;
+
+	// wave height with smooth hand-over between consecutive waves at the trough
+	let A0 = shoreWaveAmp( m, along );
+	let An = shoreWaveAmp( m + sign( u ), along );
+	let A = mix( A0, An, smoothstep( 0.32, 0.5, abs( u ) ) * 0.5 );
+	// the breaking state of the whole wave comes from the depth under its crest
+	let dB = shoreBreakDepth( xz, dir, u, lam, d );
+
+	// offshore fade-in (FFT covers deep water) and fade on land (the swash sheet takes over there)
+	let env = smoothstep( 26.0, 13.0, d ) * smoothstep( -0.25, 0.05, d ) * sat( exposure * 1.4 ) * shoreP.enabled;
+
+	// finite difference along the propagation direction for the normal
+	let e = 0.15;
+	var face = 0.0;
+	var roller = 0.0;
+${ mode === 'world' ? `	let r = shoreWorld( u, A, dB, lam, env );
+	let s0 = vec4f( r.z, r.y, r.x, r.w );` : mode === 'normal' ? `	let pair = shoreShapePair( u, - e / lam, A, dB, lam );
+	let s0 = pair.s0;
+	let s1 = pair.s1;
+	face = s1.z * env;
+	roller = s1.w * env;` : `	let s0 = shoreShape( u, A, dB, lam );` }
+
+	var disp = vec3f( dir.x * s0.x, s0.y, dir.y * s0.x ) * env;
+
+	var nShore = vec3f( 0.0, 1.0, 0.0 );
+${ mode === 'normal' ? `	{
+		let dX = e + ( s1.x - s0.x ) * env;
+		let dY = ( s1.y - s0.y ) * env;
+		let tAlong = vec3f( dir.x * dX, dY, dir.y * dX );
+		let tAcross = vec3f( - dir.y, 0.0, dir.x );
+		// epsilon: never a zero vector; never facing down (the mesh doesn't overhang, the lip sheet does)
+		let n = normalize( cross( tAcross, tAlong ) + vec3f( 0.0, 1e-4, 0.0 ) );
+
+		// the whitewater roller is not a smooth tube: lumps of foam tumble along its front and over
+		// its top (relief of a few decimetres, with its slope in the normal)
+		let sx = u * lam; // rest position along the wave direction (m, seaward)
+		let t = frame.time;
+		let a3 = along * 0.61 + t * 0.9;
+		let a1 = along * 1.7 + sx * 1.1 - t * 2.3 + sin( a3 ) * 2.0;
+		let a2 = along * 4.3 - sx * 2.7 + t * 3.7;
+		let amp = roller * 0.2;
+		let lump = sin( a1 ) * 0.6 + sin( a2 ) * 0.4;
+		disp.y += lump * amp;
+		let c1a = cos( a1 );
+		let c2a = cos( a2 );
+		let dAlong = c1a * ( cos( a3 ) * ( 2.0 * 0.61 ) + 1.7 ) * 0.6 + c2a * ( 4.3 * 0.4 );
+		let dShore = c1a * ( - 1.1 * 0.6 ) + c2a * ( 2.7 * 0.4 ); // d/d(shoreward) = - d/dsx
+		let g = ( vec2f( - dir.y, dir.x ) * dAlong + dir * dShore ) * amp * n.y;
+		nShore = normalize( vec3f( n.x - g.x, max( n.y, 0.04 ), n.z - g.y ) );
+	}` : '' }
+
+	// ---- swash: run-up of the most recent wave on the sand
+	let swr = shoreSwashRunup( sh, along, groundH );
+	let front = swr.Rt - swr.inland; // signed distance to the leading edge (m), > 0 under the sheet
+	let covered = front > 0.0;
+	// leading edge velocity along the slope (m/s), positive = uphill
+	let dRdt = select( pow( max( swr.sb, 1e-3 ), 0.6 ) * ( - 1.6 / SHORE_SWASH_DOWN ), pow( 1.0 - swr.su, 0.5 ) * ( 1.5 / SHORE_SWASH_UP ), swr.isUp ) * swr.RhMax / Tp;
+	// thin sheet (a few cm, thickening behind the leading edge). The mesh sheet overshoots the
+	// leading edge a little; the water shader cuts it exactly on the front (swashClip), so the edge
+	// doesn't follow the mesh triangles.
+	let fm = front + SHORE_SWASH_OVERSHOOT;
+	let thick = clamp( min( fm * 0.3, max( fm - 0.1, 0.0 ) * ( SHORE_BEACH_SLOPE * 0.22 ) + 0.03 ), -0.1, 0.12 );
+	let swashLevel = groundH + thick;
+	// bubbly foam line riding the leading edge all the way up (left behind as the swash mark)
+	let uprush = smoothstep( 0.46, 0.32, swr.tau );
+	let edge = smoothstep( 0.8, 0.0, front ) * smoothstep( -0.05, 0.05, front ) * uprush * smoothstep( 0.0, 1.0, swr.Rt );
+	let swashFoam = edge * 0.9;
+
+	// ---- depth-averaged water velocity (along dir), for foam advection
+	// waves / bores: shallow-water particle velocity c * eta / h; swash sheet: the tip moves at
+	// dR/dt, slower toward the shoreline during uprush, faster there while it drains
+	let eta = disp.y;
+	let uWave = clamp( c * eta / ( max( d, 0.0 ) + max( eta, d * -0.8 ) + 0.15 ), -2.5, 4.0 );
+	let rel = sat( swr.inland / max( swr.Rt, 0.5 ) );
+	let uSwash = dRdt * select( ( 1.0 - rel ) * 0.6 + 0.9, clamp( ( swr.inland + 3.0 ) / ( swr.Rt + 3.0 ), 0.15, 1.0 ), swr.isUp );
+	let wSwash = smoothstep( 0.3, 0.05, d );
+	let uFlow = mix( uWave, uSwash, wSwash ) * select( 0.0, 1.0, covered || d > 0.02 );
+
+	var o: ShoreSample;
+	o.disp = disp; o.nShore = nShore; o.env = env; o.foam = s0.z * env; o.breaking = s0.w; o.u = u; o.dir = dir;
+	o.exposure = exposure; o.swashLevel = swashLevel; o.swashCovered = select( 0.0, 1.0, covered ); o.thick = thick;
+	o.swashFoam = swashFoam; o.runup = swr.Rt; o.inland = swr.inland; o.dRdt = dRdt; o.tau = swr.tau;
+	o.flow = dir * uFlow; o.flowSpeed = uFlow; o.face = face; o.roller = roller;
+	return o;
+}
+`;
+
+}
 
 export class ShoreWaves {
 
 	constructor( terrainGPU ) {
 
 		this.terrain = terrainGPU;
-		this.period = uniform( 9.0 ).setName( 'swPeriod' );
-		this.amplitude = uniform( 0.34 ).setName( 'swAmp' ); // offshore amplitude (H/2)
-		this.variation = uniform( 0.55 ).setName( 'swVar' );
-		this.gamma = uniform( 0.78 ).setName( 'swGamma' );
-		// fraction of the break depth over which the lip plunges. Also sets how fast the breaking state
-		// changes along a crest whose height varies: wide enough that a broken section joins the clean
-		// face through a shoulder where the lip is still falling (peeling), not a vertical cut
-		this.breakSpan = uniform( 0.13 ).setName( 'swBreakSpan' );
-		this.curl = uniform( 1.0 ).setName( 'swCurl' );
-		this.runup = uniform( 1.0 ).setName( 'swRunup' );
-		this.enabled = uniform( 1.0 ).setName( 'swOn' );
-		this.turbidity = uniform( 0.16 ).setName( 'swTurbidity' ); // sediment + bubble scattering in the surf zone (1/m)
+		this.uniforms = new UniformBlock( 'ShoreParams', {
+			period: [ 'f32', 9.0 ],
+			amplitude: [ 'f32', 0.34 ], // offshore amplitude (H/2)
+			variation: [ 'f32', 0.55 ],
+			gamma: [ 'f32', 0.78 ],
+			// fraction of the break depth over which the lip plunges. Also sets how fast the breaking state
+			// changes along a crest whose height varies: wide enough that a broken section joins the clean
+			// face through a shoulder where the lip is still falling (peeling), not a vertical cut
+			breakSpan: [ 'f32', 0.13 ],
+			curl: [ 'f32', 1.0 ],
+			runup: [ 'f32', 1.0 ],
+			enabled: [ 'f32', 1.0 ],
+			turbidity: [ 'f32', 0.16 ], // sediment + bubble scattering in the surf zone (1/m)
+			// direction texture region (buildDirTexture); dirOn = 0 until it exists
+			dirMin: [ 'vec2f', new Vector2() ],
+			dirSize: [ 'f32', 1 ],
+			dirOn: [ 'f32', 0 ],
+		} );
+		const F = this.uniforms.fields;
+		this.period = F.period;
+		this.amplitude = F.amplitude;
+		this.variation = F.variation;
+		this.gamma = F.gamma;
+		this.breakSpan = F.breakSpan;
+		this.curl = F.curl;
+		this.runup = F.runup;
+		this.enabled = F.enabled;
+		this.turbidity = F.turbidity;
+		this.dirMin = F.dirMin;
+		this.dirSize = F.dirSize;
 		this.time = G.time;
+		this.dirTexture = null;
+		// placeholder until buildDirTexture() (a binding needs a texture; dirOn selects the fallback)
+		this._dirPlaceholder = new Texture( { label: 'shoreDirPlaceholder', width: 1, height: 1, format: 'rgba32float', data: new Float32Array( [ 1, 0, 0, 1 ] ) } );
 
-		// Emitted as real WGSL functions (not inlined at every call site): keeps the vertex,
-		// simulation and query shaders small, which matters a lot for compile times.
-		this._waveAmpFn = Fn( ( [ m, along ] ) => this._waveAmpImpl( m, along ) ).setLayout( {
-			name: 'shoreWaveAmp', type: 'float',
-			inputs: [ { name: 'm', type: 'float' }, { name: 'along', type: 'float' } ],
-		} );
-		this._shapeFn = Fn( ( [ u, A, d, lam ] ) => {
-
-			const s = this._shapeImpl( u, A, d, lam );
-			return vec4( s.x, s.y, s.foam, s.b );
-
-		} ).setLayout( {
-			name: 'shoreShape', type: 'vec4',
-			inputs: [ { name: 'u', type: 'float' }, { name: 'A', type: 'float' }, { name: 'd', type: 'float' }, { name: 'lam', type: 'float' } ],
-		} );
-		// the cross-section at u and at u + du (for the surface normal) in one call:
-		// ( x0, y0, foam, b ), ( x1, y1, face, roller )
-		this._shapePairFn = Fn( ( [ u, du, A, d, lam ] ) => {
-
-			const P = this._breakParams( A, d );
-			const s0 = this._profile( u, lam, P, true );
-			const s1 = this._profile( u.add( du ), lam, P, false );
-			return mat4( vec4( s0.x, s0.y, s0.foam, s0.b ), vec4( s1.x, s1.y, s0.face, s0.roller ), vec4( 0 ), vec4( 0 ) );
-
-		} ).setLayout( {
-			name: 'shoreShapePair', type: 'mat4',
-			inputs: [ { name: 'u', type: 'float' }, { name: 'du', type: 'float' }, { name: 'A', type: 'float' }, { name: 'd', type: 'float' }, { name: 'lam', type: 'float' } ],
-		} );
-		// the surface at a fixed WORLD point (for the Eulerian shore simulation): whitewater there and
-		// the water height there (the parcel shown at this point rests ~x up-wave: first-order inverse
-		// of the horizontal displacement, which is large on a breaking wave)
-		// ( foam, height, displacement of the parcel resting here, b )
-		this._worldFn = Fn( ( [ u, A, d, lam, env ] ) => {
-
-			const P = this._breakParams( A, d );
-			const s0 = this._profile( u, lam, P, false );
-			const s1 = this._profile( u.add( s0.x.mul( env ).div( lam ) ), lam, P, false );
-			return vec4( this._whitewater( u.mul( lam ).negate(), lam, P ), s1.y, s0.x, P.b );
-
-		} ).setLayout( {
-			name: 'shoreWorld', type: 'vec4',
-			inputs: [ { name: 'u', type: 'float' }, { name: 'A', type: 'float' }, { name: 'd', type: 'float' }, { name: 'lam', type: 'float' }, { name: 'env', type: 'float' } ],
-		} );
-		this._boreFn = Fn( ( [ A, d ] ) => {
-
-			const P = this._breakParams( A, d );
-			return vec4( P.Hb, P.Wt, P.Xc, P.wBore );
-
-		} ).setLayout( {
-			name: 'shoreBore', type: 'vec4',
-			inputs: [ { name: 'A', type: 'float' }, { name: 'd', type: 'float' } ],
-		} );
-		this._crestFn = Fn( ( [ A, d ] ) => {
-
-			const P = this._breakParams( A, d );
-			return vec4( P.b, P.yc.sub( P.yt ), P.ytB, P.Xi );
-
-		} ).setLayout( {
-			name: 'shoreCrest', type: 'vec4',
-			inputs: [ { name: 'A', type: 'float' }, { name: 'd', type: 'float' } ],
+		this.module = new ShaderModule( {
+			name: 'shore',
+			deps: [ commonModule, terrainGPU && terrainGPU.module ],
+			uniforms: this.uniforms,
+			uniformName: 'shoreP',
+			bindings: {
+				// float data, read with exact loads: no sampler binding (fragment shaders are at their sampler limit)
+				shoreDirTex: { texture: () => this.dirTexture || this._dirPlaceholder },
+			},
+			code: this._code(),
 		} );
 
 	}
 
-	waveAmp( m, along ) {
+	_code() {
 
-		return this._waveAmpFn( m, along );
+		return /* wgsl */`
+const SHORE_GRAVITY: f32 = ${ f( GRAVITY ) };
+const SHORE_TAU: f32 = ${ f( TAU ) };
+const SHORE_BEACH_SLOPE: f32 = ${ f( BEACH_SLOPE ) };
+const SHORE_SWASH_UP: f32 = ${ f( SWASH_UP ) };
+const SHORE_SWASH_DOWN: f32 = ${ f( SWASH_DOWN ) };
+const SHORE_SWASH_OVERSHOOT: f32 = ${ f( SWASH_OVERSHOOT ) };
 
-	}
+struct ShoreSample {
+	disp: vec3f,
+	nShore: vec3f,
+	env: f32,
+	foam: f32,
+	breaking: f32,
+	u: f32,
+	dir: vec2f,
+	exposure: f32,
+	swashLevel: f32,
+	swashCovered: f32,
+	thick: f32,
+	swashFoam: f32,
+	runup: f32,
+	inland: f32,
+	dRdt: f32,
+	tau: f32,
+	flow: vec2f,
+	flowSpeed: f32,
+	face: f32,
+	roller: f32,
+};
 
-	shape( u, A, d, lam ) {
+struct ShoreMedium { scatter: vec3f, absorb: vec3f };
 
-		const r = this._shapeFn( u, A, d, lam ).toVar();
-		return { x: r.x, y: r.y, foam: r.z, b: r.w };
+struct ShorePhase { sh: vec4f, T: f32, dir: vec2f, exposure: f32, along: f32, s: f32 };
 
-	}
+struct ShoreBreak {
+	db: f32, b: f32, Ash: f32, p: f32, meanP: f32, crestPeak: f32, yc: f32, yt: f32,
+	H: f32, wBore: f32, Xi: f32, Hb: f32, ycB: f32, ytB: f32, Xc: f32, Wt: f32,
+};
 
-	// breaking progress b, wave height H, trough level (relative to mean) and how far the lip is thrown
-	crestParams( A, d ) {
+struct ShoreProfile { x: f32, y: f32, b: f32, foam: f32, face: f32, roller: f32 };
 
-		const r = this._crestFn( A, d ).toVar();
-		return { b: r.x, H: r.y, trough: r.z, lipThrow: r.w };
+struct ShorePair { s0: vec4f, s1: vec4f };
 
-	}
+struct ShoreRunup { tau: f32, Rt: f32, inland: f32, RhMax: f32, su: f32, sb: f32, isUp: bool };
 
-	// Depth that sets the breaking state of the wave a parcel belongs to: the depth under that wave's
-	// crest, not under the parcel. Breaking is a property of the wave: a parcel ahead of the crest is
-	// in shallower water and would otherwise "break" first (whitewater creeping up the foot of a still
-	// glassy face). Near the troughs it hands over to the local depth, where the neighbouring wave
-	// takes over (the profile stays continuous at u = +-0.5). u: local phase, lam: local wavelength.
-	breakDepth( xz, dir, u, lam, d ) {
+fn shoreHash1( x: f32 ) -> f32 { return fract( sin( x * 127.1 + 311.7 ) * 43758.5453 ); }
 
-		const pc = xz.add( dir.mul( u.mul( lam ) ) );
-		const dc = G.seaLevel.sub( this.terrain.heightAt( pc ) );
-		return mix( dc, d, smoothstep( 0.3, 0.5, abs( u ) ) );
+// along-shore phase wobble (in periods): crests bend over the uneven bottom
+fn shoreWobble( along: f32 ) -> f32 {
+	return sin( along * 0.029 + 0.7 ) * 0.07 + sin( along * 0.083 + 2.1 ) * 0.035;
+}
 
-	}
+// ------------------------------------------------------------ per-wave height
 
-	// the bore that follows the plunge: roller height Hb, horizontal extent of its front Wt, forward
-	// shift of the crest Xc (to where the lip landed), bore weight (0 while plunging .. 1)
-	boreParams( A, d ) {
+fn shoreWaveAmp( m: f32, along: f32 ) -> f32 {
+	// sets: groups of ~7 waves with larger ones in the middle, plus per-wave randomness
+	let waveSet = abs( sin( m * ${ f( Math.PI / 7 ) } ) ) * 0.6 + 0.55;
+	let rnd = ( shoreHash1( m ) - 0.5 ) * 2.0;
+	// along-shore variation so waves peel instead of closing out
+	// peaks ~40-50 m wide with lower shoulders between them, different for every wave (the warp keeps
+	// them from repeating along the beach); each peak breaks first and peels outward from it
+	let warp = sin( along * 0.016 + m * 0.9 ) * 1.6;
+	let a1 = sin( along * 0.062 + m * 1.7 + warp );
+	let a2 = sin( along * 0.13 + m * 4.1 + 1.3 - warp * 0.7 );
+	let alongV = a1 * 0.6 + a2 * 0.4;
+	return max( shoreP.amplitude * waveSet * ( 1.0 + rnd * shoreP.variation * 0.5 + alongV * shoreP.variation * 0.7 ), 0.02 );
+}
 
-		const r = this._boreFn( A, d ).toVar();
-		return { Hb: r.x, Wt: r.y, Xc: r.z, wBore: r.w };
+// ------------------------------------------------------------ cross-section shape
 
-	}
+fn shoreBreakParams( A: f32, d: f32 ) -> ShoreBreak {
+	var P: ShoreBreak;
+	// break depth for this wave (Green's law shoaling, H = gamma d)
+	P.db = pow( A * 3.556 / shoreP.gamma, 0.8 );
+	P.b = ( P.db - d ) / ( P.db * shoreP.breakSpan ); // <0 shoaling, 0..1 plunging, >1 bore
+	let shoal = pow( 10.0 / clamp( d, 0.35, 10.0 ), 0.25 );
+	P.Ash = A * shoal;
+	P.p = mix( 1.0, 3.0, smoothstep( -2.5, 0.0, P.b ) );
+	P.meanP = 1.0 / sqrt( ( P.p + 0.25 ) * PI );
+	P.crestPeak = 1.0 + smoothstep( -1.0, 0.3, P.b ) * 0.22;
+	P.yc = P.Ash * 2.0 * ( 1.0 - P.meanP ) * P.crestPeak; // crest height
+	P.yt = P.Ash * -2.0 * P.meanP * P.crestPeak; // trough level
+	P.H = P.yc - P.yt;
+	P.wBore = smoothstep( 0.85, 1.35, P.b );
+	P.Xi = P.H * 0.8; // lip throw at impact
+	// bore height, limited by the depth and fading out in the last few decimetres
+	P.Hb = min( P.H * 0.6, max( d, 0.0 ) * 0.75 ) * ( smoothstep( 0.0, 0.3, d ) * 0.7 + 0.3 );
+	P.ycB = mix( P.yc, P.yt * 0.6 + P.Hb, P.wBore ); // crest / roller top
+	P.ytB = mix( P.yt, P.yt * 0.6, P.wBore ); // trough
+	// the collapsing crest moves to where the lip landed (no shift once the bore has run out of height)
+	P.Xc = mix( 0.0, P.Xi - P.Hb * 0.55, P.wBore ) * smoothstep( 0.03, 0.3, P.Hb );
+	// horizontal extent of the face: concave tube face while plunging, short convex roller front on the bore
+	P.Wt = mix( P.H * mix( 0.25, 0.55, smoothstep( 0.1, 0.9, P.b ) ), P.Hb * 0.6 + 0.08, P.wBore );
+	return P;
+}
 
-	// along-shore phase wobble (in periods): crests bend over the uneven bottom
-	wobble( along ) {
+// Whitewater made by the breaking wave at xi (m): the horizontal position relative to the crest's
+// rest position, positive shoreward (a parcel's own position, or a fixed world point: the shore
+// simulation deposits it where the water actually is, not where the parcel rests).
+//  * nothing at all while the lip is in the air: the face and the lip are clear, glassy water
+//  * the lip lands in the trough at the plunge point (b ~ 0.9, xi = Xi): whitewater appears there
+//    and spreads out from it while the tube collapses behind it
+//  * the collapsed tube becomes the roller: whitewater over the front and top of the bore,
+//    shedding foam behind it (carried on by ShoreSim)
+// whitewater over the face after the plunge: s = 0 at the crest .. 1 at the foot of the face
+fn shoreFaceFill( b: f32, s: f32 ) -> f32 {
+	// the foot turns white first (where the lip lands), the top of the face last: along a peeling
+	// crest the edge of the broken section slants down and forward instead of standing vertical
+	let k = ( 1.0 - s ) * 0.45;
+	return smoothstep( k + 0.9, k + 1.08, b );
+}
 
-		return sin( along.mul( 0.029 ).add( 0.7 ) ).mul( 0.07 ).add( sin( along.mul( 0.083 ).add( 2.1 ) ).mul( 0.035 ) );
+fn shoreWhitewater( xi: f32, lam: f32, P: ShoreBreak ) -> f32 {
+	let landed = smoothstep( 0.86, 0.99, P.b );
+	let spread = sat( ( P.b - 0.9 ) / 0.45 );
+	let reach = P.Xi * 0.25 + spread * ( P.Xi * 0.9 + 1.0 ); // radius around the plunge point
+	let impact = landed * smoothstep( reach, reach * 0.6, abs( xi - P.Xi ) ) * ( 1.0 - smoothstep( 1.4, 1.9, P.b ) );
+	let toe = P.Xc + P.Wt;
+	// the collapsing tube turns white from its foot (next to the plunge point) up to the crest
+	let faceFill = shoreFaceFill( P.b, sat( ( xi - P.Xc ) / max( P.Wt, 0.05 ) ) );
+	let ahead = exp( ( xi - toe ) * -3.0 ) * P.wBore;
+	let behind = exp( ( P.Xc - xi ) / lam * -16.0 ) * P.wBore;
+	let roller = select( select( max( faceFill, P.wBore ), behind, xi < P.Xc ), ahead, xi > toe );
+	return sat( max( impact, roller ) );
+}
 
-	}
+// the cross-section for break parameters P (see shoreBreakParams)
+// u: local phase in [-0.5, 0.5], crest at 0, u < 0 in front (shoreward) of the crest
+// Returns x: shoreward displacement, y: height above mean, b: breaking progress (+ foam, face, roller withFoam)
+fn shoreProfile( u: f32, lam: f32, P: ShoreBreak, withFoam: bool ) -> ShoreProfile {
+	// --- shoaling: peaked (cnoidal-like) crest, the front compressed by a phase skew
+	let skew = smoothstep( -3.0, 0.0, P.b ) * 0.55;
+	let phi = u - skew * ( 1.0 - cos( u * SHORE_TAU ) ) / SHORE_TAU;
+	let c = max( ( cos( phi * SHORE_TAU ) + 1.0 ) * 0.5, 0.0 ); // pow() of a rounding-negative base is NaN
+	let yPre = P.Ash * 2.0 * ( pow( c, P.p ) - P.meanP ) * P.crestPeak;
+	let Q = smoothstep( -3.0, 0.0, P.b ) * 0.25 + 0.1;
+	let xPre = sin( u * SHORE_TAU ) * P.Ash * Q;
 
-	// ------------------------------------------------------------ per-wave height
-
-	_waveAmpImpl( m, along ) {
-
-		// sets: groups of ~7 waves with larger ones in the middle, plus per-wave randomness
-		const set = sin( m.mul( Math.PI / 7 ) ).abs().mul( 0.6 ).add( 0.55 );
-		const rnd = hash1( m ).sub( 0.5 ).mul( 2 );
-		// along-shore variation so waves peel instead of closing out
-		// peaks ~40-50 m wide with lower shoulders between them, different for every wave (the warp keeps
-		// them from repeating along the beach); each peak breaks first and peels outward from it
-		const warp = sin( along.mul( 0.016 ).add( m.mul( 0.9 ) ) ).mul( 1.6 );
-		const a1 = sin( along.mul( 0.062 ).add( m.mul( 1.7 ) ).add( warp ) );
-		const a2 = sin( along.mul( 0.13 ).add( m.mul( 4.1 ) ).add( 1.3 ).sub( warp.mul( 0.7 ) ) );
-		const alongV = a1.mul( 0.6 ).add( a2.mul( 0.4 ) );
-		return this.amplitude.mul( set ).mul( float( 1 ).add( rnd.mul( this.variation ).mul( 0.5 ) ).add( alongV.mul( this.variation ).mul( 0.7 ) ) ).max( 0.02 );
-
-	}
-
-	// ------------------------------------------------------------ cross-section shape
-
-	_breakParams( A, d ) {
-
-		// break depth for this wave (Green's law shoaling, H = gamma d)
-		const db = pow( A.mul( 3.556 ).div( this.gamma ), 0.8 );
-		const b = db.sub( d ).div( db.mul( this.breakSpan ) ).toVar(); // <0 shoaling, 0..1 plunging, >1 bore
-		const shoal = pow( float( 10 ).div( clamp( d, 0.35, 10 ) ), 0.25 );
-		const Ash = A.mul( shoal ).toVar();
-		const p = mix( float( 1.0 ), float( 3.0 ), smoothstep( - 2.5, 0.0, b ) ).toVar();
-		const meanP = float( 1 ).div( sqrt( p.add( 0.25 ).mul( Math.PI ) ) ).toVar();
-		const crestPeak = float( 1 ).add( smoothstep( - 1.0, 0.3, b ).mul( 0.22 ) );
-		const yc = Ash.mul( 2 ).mul( float( 1 ).sub( meanP ) ).mul( crestPeak ).toVar(); // crest height
-		const yt = Ash.mul( - 2 ).mul( meanP ).mul( crestPeak ).toVar(); // trough level
-		const H = yc.sub( yt );
-		const wBore = smoothstep( 0.85, 1.35, b ).toVar();
-		const Xi = H.mul( 0.8 ); // lip throw at impact
-		// bore height, limited by the depth and fading out in the last few decimetres
-		const Hb = min( H.mul( 0.6 ), max( d, 0 ).mul( 0.75 ) ).mul( smoothstep( 0.0, 0.3, d ).mul( 0.7 ).add( 0.3 ) );
-		const ycB = mix( yc, yt.mul( 0.6 ).add( Hb ), wBore ); // crest / roller top
-		const ytB = mix( yt, yt.mul( 0.6 ), wBore ); // trough
-		// the collapsing crest moves to where the lip landed (no shift once the bore has run out of height)
-		const Xc = mix( float( 0 ), Xi.sub( Hb.mul( 0.55 ) ), wBore ).mul( smoothstep( 0.03, 0.3, Hb ) );
-		// horizontal extent of the face: concave tube face while plunging, short convex roller front on the bore
-		const Wt = mix( H.mul( mix( 0.25, 0.55, smoothstep( 0.1, 0.9, b ) ) ), Hb.mul( 0.6 ).add( 0.08 ), wBore );
-		return { db, b, Ash, p, meanP, crestPeak, yc, yt, H, wBore, Xi, Hb, ycB, ytB, Xc, Wt };
-
-	}
-
-	// u: local phase in [-0.5, 0.5], crest at 0, u < 0 in front (shoreward) of the crest
-	// Returns { x: shoreward displacement, y: height above mean, foam, b: breaking progress }
-	_shapeImpl( u, A, d, lam ) {
-
-		return this._profile( u, lam, this._breakParams( A, d ), true );
-
-	}
-
-	// the cross-section for break parameters P (see _breakParams)
-	_profile( u, lam, P, withFoam ) {
-
-		const { b, Ash, p, meanP, crestPeak, wBore, ycB, ytB, Xc, Wt, Xi } = P;
-
-		// --- shoaling: peaked (cnoidal-like) crest, the front compressed by a phase skew
-		const skew = smoothstep( - 3.0, 0.0, b ).mul( 0.55 );
-		const phi = u.sub( skew.mul( float( 1 ).sub( cos( u.mul( TAU ) ) ) ).div( TAU ) );
-		const c = max( cos( phi.mul( TAU ) ).add( 1 ).mul( 0.5 ), 0 ); // pow() of a rounding-negative base is NaN
-		const yPre = Ash.mul( 2 ).mul( pow( c, p ).sub( meanP ) ).mul( crestPeak );
-		const Q = smoothstep( - 3.0, 0.0, b ).mul( 0.25 ).add( 0.1 );
-		const xPre = sin( u.mul( TAU ) ).mul( Ash ).mul( Q );
-
-		// --- plunging / bore profile. Front: the upper uf of the phase is an elliptic arc from the
-		// crest down to the trough (concave tube face -> convex roller front), the rest of the
-		// front is trough, stretched to meet the next wave. Back: the shoaling back, decaying
-		// exponentially behind the bore.
-		const uf = 0.09;
-		const inFace = u.greaterThan( - uf );
-		const th = clamp( u.negate().div( uf ), 0, 1 ).mul( Math.PI / 2 );
-		const fx = mix( float( 1 ).sub( cos( th ) ), sin( th ), wBore );
-		const fy = mix( float( 1 ).sub( sin( th ) ), cos( th ), wBore );
-		const sTr = clamp( u.negate().sub( uf ).div( 0.5 - uf ), 0, 1 );
-		const ul = u.mul( lam );
-		const xFront = select( inFace, Xc.add( Wt.mul( fx ) ), mix( Xc.add( Wt ), lam.mul( 0.5 ), sTr ) ).add( ul );
-		const yFront = select( inFace, ytB.add( ycB.sub( ytB ).mul( fy ) ), ytB );
-		const cb = pow( max( cos( u.mul( TAU * 0.85 ) ).add( 1 ).mul( 0.5 ), 0 ), p );
-		const yBack = ytB.add( ycB.sub( ytB ).mul( mix( cb, exp( u.mul( - 7 ) ), wBore ) ) );
-		const xBack = Xc.mul( exp( u.mul( - 6 ) ) ).mul( smoothstep( 0.5, 0.35, u ) ).add( xPre.mul( float( 1 ).sub( wBore ) ) );
-		const front = u.lessThan( 0 );
-		const wC = smoothstep( - 0.35, 0.25, b ).mul( this.curl );
-		const x = mix( xPre, select( front, xFront, xBack ), wC );
-		const y = mix( yPre, select( front, yFront, yBack ), wC );
-		if ( ! withFoam ) return { x, y, b };
-
-		// --- whitewater (a function of where the parcel is now, see _whitewater) and, per parcel, the
+	// --- plunging / bore profile. Front: the upper uf of the phase is an elliptic arc from the
+	// crest down to the trough (concave tube face -> convex roller front), the rest of the
+	// front is trough, stretched to meet the next wave. Back: the shoaling back, decaying
+	// exponentially behind the bore.
+	let uf = 0.09;
+	let inFace = u > - uf;
+	let th = clamp( - u / uf, 0.0, 1.0 ) * ${ f( Math.PI / 2 ) };
+	let fx = mix( 1.0 - cos( th ), sin( th ), P.wBore );
+	let fy = mix( 1.0 - sin( th ), cos( th ), P.wBore );
+	let sTr = clamp( ( - u - uf ) / ( 0.5 - uf ), 0.0, 1.0 );
+	let ul = u * lam;
+	let xFront = select( mix( P.Xc + P.Wt, lam * 0.5, sTr ), P.Xc + P.Wt * fx, inFace ) + ul;
+	let yFront = select( P.ytB, P.ytB + ( P.ycB - P.ytB ) * fy, inFace );
+	let cb = pow( max( ( cos( u * ( SHORE_TAU * 0.85 ) ) + 1.0 ) * 0.5, 0.0 ), P.p );
+	let yBack = P.ytB + ( P.ycB - P.ytB ) * mix( cb, exp( u * -7.0 ), P.wBore );
+	let xBack = P.Xc * exp( u * -6.0 ) * smoothstep( 0.5, 0.35, u ) + xPre * ( 1.0 - P.wBore );
+	let front = u < 0.0;
+	let wC = smoothstep( -0.35, 0.25, P.b ) * shoreP.curl;
+	var r: ShoreProfile;
+	r.x = mix( xPre, select( xBack, xFront, front ), wC );
+	r.y = mix( yPre, select( yBack, yFront, front ), wC );
+	r.b = P.b;
+	if ( withFoam ) {
+		// --- whitewater (a function of where the parcel is now, see shoreWhitewater) and, per parcel, the
 		// clear face of the plunging wave and the relief of the roller
-		const foam = this._whitewater( x.sub( u.mul( lam ) ), lam, P );
-		const onFace = front.and( inFace );
-		const faceFill = this._faceFill( b, fx );
+		r.foam = shoreWhitewater( r.x - u * lam, lam, P );
+		let onFace = front && inFace;
+		let faceFill = shoreFaceFill( P.b, fx );
 		// the clear, concave face of a plunging wave (WaterSurface keeps the foam carried by the water off it)
-		const face = select( onFace, float( 1 ), float( 0 ) ).mul( smoothstep( - 0.4, 0.0, b ) ).mul( float( 1 ).sub( faceFill ) );
+		r.face = select( 0.0, 1.0, onFace ) * smoothstep( -0.4, 0.0, P.b ) * ( 1.0 - faceFill );
 		// turbulent relief of the whitewater roller (m): its front and the top it tumbles over
-		const rollerAmp = select( front, select( inFace, float( 1 ), float( 0 ) ), exp( u.mul( - 25 ) ) ).mul( wBore ).mul( P.Hb ).mul( wC );
-
-		return { x, y, foam, b, face, roller: rollerAmp };
-
+		r.roller = select( exp( u * -25.0 ), select( 0.0, 1.0, inFace ), front ) * P.wBore * P.Hb * wC;
 	}
+	return r;
+}
 
-	// Whitewater made by the breaking wave at xi (m): the horizontal position relative to the crest's
-	// rest position, positive shoreward (a parcel's own position, or a fixed world point: the shore
-	// simulation deposits it where the water actually is, not where the parcel rests).
-	//  * nothing at all while the lip is in the air: the face and the lip are clear, glassy water
-	//  * the lip lands in the trough at the plunge point (b ~ 0.9, xi = Xi): whitewater appears there
-	//    and spreads out from it while the tube collapses behind it
-	//  * the collapsed tube becomes the roller: whitewater over the front and top of the bore,
-	//    shedding foam behind it (carried on by ShoreSim)
-	// whitewater over the face after the plunge: s = 0 at the crest .. 1 at the foot of the face
-	_faceFill( b, s ) {
+// ( x, y, foam, b )
+fn shoreShape( u: f32, A: f32, d: f32, lam: f32 ) -> vec4f {
+	let s = shoreProfile( u, lam, shoreBreakParams( A, d ), true );
+	return vec4f( s.x, s.y, s.foam, s.b );
+}
 
-		// the foot turns white first (where the lip lands), the top of the face last: along a peeling
-		// crest the edge of the broken section slants down and forward instead of standing vertical
-		const k = float( 1 ).sub( s ).mul( 0.45 );
-		return smoothstep( k.add( 0.9 ), k.add( 1.08 ), b );
+// the cross-section at u and at u + du (for the surface normal) in one call:
+// ( x0, y0, foam, b ), ( x1, y1, face, roller )
+fn shoreShapePair( u: f32, du: f32, A: f32, d: f32, lam: f32 ) -> ShorePair {
+	let P = shoreBreakParams( A, d );
+	let s0 = shoreProfile( u, lam, P, true );
+	let s1 = shoreProfile( u + du, lam, P, false );
+	return ShorePair( vec4f( s0.x, s0.y, s0.foam, s0.b ), vec4f( s1.x, s1.y, s0.face, s0.roller ) );
+}
 
+// the surface at a fixed WORLD point (for the Eulerian shore simulation): whitewater there and
+// the water height there (the parcel shown at this point rests ~x up-wave: first-order inverse
+// of the horizontal displacement, which is large on a breaking wave)
+// ( foam, height, displacement of the parcel resting here, b )
+fn shoreWorld( u: f32, A: f32, d: f32, lam: f32, env: f32 ) -> vec4f {
+	let P = shoreBreakParams( A, d );
+	let s0 = shoreProfile( u, lam, P, false );
+	let s1 = shoreProfile( u + s0.x * env / lam, lam, P, false );
+	return vec4f( shoreWhitewater( - u * lam, lam, P ), s1.y, s0.x, P.b );
+}
+
+// the bore that follows the plunge: roller height Hb, horizontal extent of its front Wt, forward
+// shift of the crest Xc (to where the lip landed), bore weight (0 while plunging .. 1)
+fn shoreBore( A: f32, d: f32 ) -> vec4f {
+	let P = shoreBreakParams( A, d );
+	return vec4f( P.Hb, P.Wt, P.Xc, P.wBore );
+}
+
+// breaking progress b, wave height H, trough level (relative to mean) and how far the lip is thrown
+fn shoreCrest( A: f32, d: f32 ) -> vec4f {
+	let P = shoreBreakParams( A, d );
+	return vec4f( P.b, P.yc - P.yt, P.ytB, P.Xi );
+}
+
+// Depth that sets the breaking state of the wave a parcel belongs to: the depth under that wave's
+// crest, not under the parcel. Breaking is a property of the wave: a parcel ahead of the crest is
+// in shallower water and would otherwise "break" first (whitewater creeping up the foot of a still
+// glassy face). Near the troughs it hands over to the local depth, where the neighbouring wave
+// takes over (the profile stays continuous at u = +-0.5). u: local phase, lam: local wavelength.
+fn shoreBreakDepth( xz: vec2f, dir: vec2f, u: f32, lam: f32, d: f32 ) -> f32 {
+	let pc = xz + dir * ( u * lam );
+	let dc = frame.seaLevel - terrainHeightAt( pc );
+	return mix( dc, d, smoothstep( 0.3, 0.5, abs( u ) ) );
+}
+
+// ------------------------------------------------------------ cheap wave direction lookup
+
+// vec3( dir.x, dir.z, exposure ) from the direction texture (bilinear from 4 loads)
+fn shoreDirAt( xz: vec2f ) -> vec3f {
+	let res = f32( textureDimensions( shoreDirTex ).x );
+	let fp = ( xz - shoreP.dirMin ) / shoreP.dirSize * res - 0.5;
+	let fc = clamp( fp, vec2f( 0.0 ), vec2f( res - 1.001 ) );
+	let i = vec2i( floor( fc ) );
+	let t = fract( fc );
+	let a = textureLoad( shoreDirTex, i, 0 );
+	let b = textureLoad( shoreDirTex, i + vec2i( 1, 0 ), 0 );
+	let c = textureLoad( shoreDirTex, i + vec2i( 0, 1 ), 0 );
+	let d = textureLoad( shoreDirTex, i + vec2i( 1, 1 ), 0 );
+	return mix( mix( a, b, t.x ), mix( c, d, t.x ), t.y ).xyz;
+}
+
+// ------------------------------------------------------------ surf zone water
+
+// Optical properties of the water stirred up by breaking waves: suspended sand and fine bubbles
+// scatter light (milky, luminous), fine sediment and dissolved matter absorb blue. Returns the
+// extra { scatter, absorb } coefficients (1/m) that make the surf zone turquoise, not ocean-clear.
+fn shoreSurfMedium( xz: vec2f, depth: f32 ) -> ShoreMedium {
+	var k = 0.0;
+	if ( depth < 4.5 && depth > -0.2 ) {
+		var expo: f32;
+		if ( shoreP.dirOn > 0.5 ) { expo = shoreDirAt( xz ).z; } else { expo = sat( length( terrainShoreSample( xz ).yz ) * 1.4 ); }
+		k = smoothstep( 4.5, 1.2, depth ) * smoothstep( -0.2, 0.15, depth ) * expo * shoreP.turbidity * shoreP.enabled;
 	}
+	return ShoreMedium( vec3f( 0.9, 1.0, 0.85 ) * k, vec3f( 0.1, 0.2, 0.62 ) * k );
+}
 
-	_whitewater( xi, lam, P ) {
+// ------------------------------------------------------------ evaluation at a point
 
-		const { b, Xi, Xc, Wt, wBore } = P;
-		const landed = smoothstep( 0.86, 0.99, b );
-		const spread = saturate( b.sub( 0.9 ).div( 0.45 ) );
-		const reach = Xi.mul( 0.25 ).add( spread.mul( Xi.mul( 0.9 ).add( 1.0 ) ) ); // radius around the plunge point
-		const impact = landed.mul( smoothstep( reach, reach.mul( 0.6 ), xi.sub( Xi ).abs() ) ).mul( float( 1 ).sub( smoothstep( 1.4, 1.9, b ) ) );
-		const toe = Xc.add( Wt );
-		// the collapsing tube turns white from its foot (next to the plunge point) up to the crest
-		const faceFill = this._faceFill( b, saturate( xi.sub( Xc ).div( max( Wt, 0.05 ) ) ) );
-		const ahead = exp( xi.sub( toe ).mul( - 3 ) ).mul( wBore );
-		const behind = exp( Xc.sub( xi ).div( lam ).mul( - 16 ) ).mul( wBore );
-		const roller = select( xi.greaterThan( toe ), ahead, select( xi.lessThan( Xc ), behind, max( faceFill, wBore ) ) );
-		return saturate( max( impact, roller ) );
+// Local wave phase data at a (Lagrangian) point: shared by evaluate() and the crest finder.
+fn shorePhaseAt( xz: vec2f ) -> ShorePhase {
+	let sh = terrainShoreSample( xz );
+	let T = sh.x;
+	let dirE = vec2f( sh.y, sh.z );
+	let exposure = length( dirE );
+	let dir = dirE / max( exposure, 1e-4 );
+	let along = dot( xz, vec2f( - dir.y, dir.x ) );
+	let s = ( frame.time - T ) / shoreP.period + shoreWobble( along );
+	return ShorePhase( sh, T, dir, exposure, along, s );
+}
+
+// ------------------------------------------------------------ light through thin crests
+
+// Water path (m) along the refracted view ray Tv (unit, inside the water) from the surface point
+// with rest position lagXZ until the ray leaves through the other side of the wave, or 1e4 if
+// it doesn't within a few metres. The upper part of a steep wave is only a few metres thick
+// horizontally: the view ray crosses it and exits into the sky behind, which is what makes
+// breaking faces and crests glow turquoise. Marches the analytic cross-section (up to 3 steps).
+fn shoreCrestPath( p: vec2f, d: f32, T: vec3f ) -> f32 {
+	var out = 1e4;
+	let ph = shorePhaseAt( p );
+	let tXi = dot( T.xz, ph.dir ); // shoreward component of the ray
+	let env = smoothstep( 26.0, 13.0, d ) * sat( ph.exposure * 1.4 ) * shoreP.enabled;
+	// rays heading out through the back of the wave (a view from the beach side), near breakers
+	if ( env > 0.05 && tXi < -0.05 && d < 6.0 ) {
+		let lam = sqrt( clamp( d, 0.3, 25.0 ) * SHORE_GRAVITY ) * shoreP.period;
+		let m = floor( ph.s + 0.5 );
+		let u = ph.s - m;
+		let A = shoreWaveAmp( m, ph.along );
+		let P = shoreBreakParams( A, shoreBreakDepth( p, ph.dir, u, lam, d ) );
+		let s0 = shoreProfile( u, lam, P, false );
+		let y0 = s0.y * env;
+		// only the upper part of steep (nearly breaking) waves is thin enough to see through
+		if ( y0 > A * 0.2 && P.b > -1.5 ) {
+			let xi0 = - u * lam + s0.x * env;
+			let slope = T.y / - tXi; // ray rise per metre of horizontal travel
+			var prevGap = 0.0;
+			var prevDist = 0.0;
+			var off = 1.1;
+			for ( var k = 0; k < 3; k++ ) {
+				let uk = min( u + off / lam, 0.5 );
+				let sk = shoreProfile( uk, lam, P, false );
+				let dist = abs( xi0 - ( - uk * lam + sk.x * env ) );
+				// ray height above the surface there (> 0: the ray has left the water)
+				let gap = y0 + slope * dist - sk.y * env;
+				if ( gap > 0.0 ) {
+					let fr = - prevGap / max( gap - prevGap, 1e-4 );
+					out = mix( prevDist, dist, sat( fr ) ) / - tXi;
+					break;
+				}
+				prevGap = gap;
+				prevDist = dist;
+				off *= 2.6;
+			}
+		}
+	}
+	return out;
+}
+
+// ------------------------------------------------------------ swash
+
+// Run-up of the most recent wave at a point on the beach (distances in metres up the beach face).
+// The run-up is compared with the height of the sand (converted with the nominal beach slope), so
+// the front is exact at the waterline and follows the contours of the sand. sh: terrainShoreSample( xz ).
+fn shoreSwashRunup( sh: vec4f, along: f32, groundH: f32 ) -> ShoreRunup {
+	let Tp = shoreP.period;
+	let exposure = length( vec2f( sh.y, sh.z ) );
+	let Ts = sh.w;
+	let inland = max( groundH - frame.seaLevel, 0.0 ) / SHORE_BEACH_SLOPE;
+	let ss = ( frame.time - Ts ) / Tp + shoreWobble( along );
+	let ms = floor( ss );
+	let tau = ss - ms; // 0..1 time since that wave's bore reached the shoreline
+	let Am = shoreWaveAmp( ms, along );
+	// vertical run-up ~ H on this gentle beach, converted to a horizontal excursion
+	let RhMax = Am * 2.1 * shoreP.runup * sat( exposure * 1.4 ) / SHORE_BEACH_SLOPE;
+	// decelerating uprush, then a backwash that starts slowly and accelerates as the sheet drains
+	let su = sat( tau / SHORE_SWASH_UP );
+	let sb = sat( ( tau - SHORE_SWASH_UP ) / SHORE_SWASH_DOWN );
+	let isUp = tau < SHORE_SWASH_UP;
+	let Rh = select( 1.0 - pow( sb, 1.6 ), 1.0 - pow( 1.0 - su, 1.5 ), isUp ) * RhMax - 0.3;
+	// the front is lobed, not a straight line: each wave runs up a little differently along the beach
+	let lobes = sin( along * 0.61 + ms * 2.3 ) * 0.5 + sin( along * 1.73 + ms * 5.1 ) * 0.3 + sin( along * 4.3 + ms * 1.7 ) * 0.2;
+	// the backwash never quite exposes the lower beach face: a film of water always covers the
+	// first decimetres past the shoreline, so the sea never meets the sand along mesh triangles
+	let Rt = max( Rh + lobes * ( max( Rh, 0.0 ) * 0.07 + 0.35 ), 0.35 ) * shoreP.enabled;
+	return ShoreRunup( tau, Rt, inland, RhMax, su, sb, isUp );
+}
+
+// Water film thickness clipped at the leading edge of the swash sheet, for the water shader's
+// edge fade: min( thickness, distance to the front (m) * 0.08 ). Only evaluated where the film is
+// thin, so the sheet ends on the analytic front instead of the mesh triangles at ~no cost.
+fn shoreSwashClip( p: vec2f, t: f32 ) -> f32 {
+	var out = t;
+	if ( t < 0.2 ) {
+		let g = terrainHeightAt( p );
+		if ( g > frame.seaLevel ) {
+			let ph = shorePhaseAt( p );
+			let r = shoreSwashRunup( ph.sh, ph.along, g );
+			out = min( t, ( r.Rt - r.inland ) * 0.08 );
+		}
+	}
+	return out;
+}
+
+// ------------------------------------------------------------ evaluate()
+// Returns displacement relative to (xz, seaLevel), foam, breaking indicator and the
+// swash surface level (absolute height) for this point. shoreEvaluate (withNormal, the water mesh) also
+// gives face: 1 on the clear concave face of a plunging wave, roller: relief of the whitewater (m).
+// shoreEvaluateWorld: the shore simulation's view (a fixed world point instead of a water parcel): foam and
+// height are those of the water shown at xz, the displacement is not meaningful.
+${ evaluateCode( 'shoreEvaluate', 'normal' ) }
+${ evaluateCode( 'shoreEvaluateNoNormal', 'plain' ) }
+${ evaluateCode( 'shoreEvaluateWorld', 'world' ) }
+`;
 
 	}
 
 	// ------------------------------------------------------------ cheap wave direction lookup
 
-	// Low-resolution filtered texture of the wave direction and exposure over a region (one bilinear
-	// fetch instead of the 4 exact loads of the shore field) for per-pixel effects near the beach.
-	// region: { min: Vector2, size }. Returns vec3( dir.x, dir.z, exposure ) in TSL via dirAt().
+	// Low-resolution texture of the wave direction and exposure over a region (one bilinear
+	// fetch from 4 loads instead of the 4 exact loads of the shore field for each of 4 corners) for
+	// per-pixel effects near the beach. region: { min: Vector2, size }. WGSL: shoreDirAt( xz ) ->
+	// vec3f( dir.x, dir.z, exposure ).
 	buildDirTexture( { min, size, res = 128 } ) {
 
-		const tex = this.terrain.shoreTexture;
-		const data = tex.image.data, fres = tex.image.width;
-		const origin = this.terrain.origin, tsize = this.terrain.size;
+		// the shore field (T, dirX, dirZ, exposure / swash time) as float data on the CPU
+		const T = this.terrain;
+		const field = T.shoreField || null;
+		const data = field ? field.data : T.shoreData || T.shoreTexture?.image?.data || T.shoreTexture?.pendingData;
+		const fres = field ? field.res : T.shoreRes;
+		if ( ! data || ! fres ) {
+
+			console.warn( 'ShoreWaves.buildDirTexture: no shore field data on the terrain; using terrainShoreSample instead' );
+			return null;
+
+		}
+
+		const origin = T.origin, tsize = T.size;
 		const out = new Float32Array( res * res * 4 );
 		for ( let j = 0; j < res; j ++ ) for ( let i = 0; i < res; i ++ ) {
 
@@ -329,317 +631,13 @@ export class ShoreWaves {
 		}
 
 		// float data, read with exact loads: no sampler binding (fragment shaders are at their sampler limit)
-		const t = new THREE.DataTexture( out, res, res, THREE.RGBAFormat, THREE.FloatType );
-		t.magFilter = t.minFilter = THREE.NearestFilter;
-		t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-		t.generateMipmaps = false;
-		t.colorSpace = THREE.NoColorSpace;
-		t.name = 'shoreDir';
-		t.needsUpdate = true;
+		const t = new Texture( { label: 'shoreDir', width: res, height: res, format: 'rgba32float', data: out } );
 		this.dirTexture = t;
-		this.dirMin = uniform( min.clone() ).setName( 'swDirMin' );
-		this.dirSize = uniform( size ).setName( 'swDirSize' );
+		this.dirMin.value.copy( min );
+		this.dirSize.value = size;
+		this.uniforms.fields.dirOn.value = 1;
 		this.dirRes = res;
 		return t;
-
-	}
-
-	// vec3( dir.x, dir.z, exposure ) from the direction texture (bilinear from 4 loads)
-	dirAt( xz ) {
-
-		const res = this.dirRes;
-		const f = xz.sub( this.dirMin ).div( this.dirSize ).mul( res ).sub( 0.5 );
-		const fc = clamp( f, 0, res - 1.001 );
-		const i = ivec2( floor( fc ) );
-		const t = fract( fc );
-		const tex = this.dirTexture;
-		const a = textureLoad( tex, i ), b = textureLoad( tex, i.add( ivec2( 1, 0 ) ) );
-		const c = textureLoad( tex, i.add( ivec2( 0, 1 ) ) ), d = textureLoad( tex, i.add( ivec2( 1, 1 ) ) );
-		return mix( mix( a, b, t.x ), mix( c, d, t.x ), t.y ).xyz;
-
-	}
-
-	// ------------------------------------------------------------ surf zone water
-
-	// Optical properties of the water stirred up by breaking waves: suspended sand and fine bubbles
-	// scatter light (milky, luminous), fine sediment and dissolved matter absorb blue. Returns the
-	// extra { scatter, absorb } coefficients (1/m) that make the surf zone turquoise, not ocean-clear.
-	surfMedium( xz, depth ) {
-
-		const k = float( 0 ).toVar();
-		If( depth.lessThan( 4.5 ).and( depth.greaterThan( - 0.2 ) ), () => {
-
-			const expo = this.dirTexture ? this.dirAt( xz ).z : saturate( length( this.terrain.shoreSample( xz ).yz ).mul( 1.4 ) );
-			k.assign( smoothstep( 4.5, 1.2, depth ).mul( smoothstep( - 0.2, 0.15, depth ) ).mul( expo ).mul( this.turbidity ).mul( this.enabled ) );
-
-		} );
-		return { scatter: vec3( 0.9, 1.0, 0.85 ).mul( k ), absorb: vec3( 0.1, 0.2, 0.62 ).mul( k ) };
-
-	}
-
-	// ------------------------------------------------------------ light through thin crests
-
-	// Water path (m) along the refracted view ray Tv (unit, inside the water) from the surface point
-	// with rest position lagXZ until the ray leaves through the other side of the wave, or 1e4 if
-	// it doesn't within a few metres. The upper part of a steep wave is only a few metres thick
-	// horizontally: the view ray crosses it and exits into the sky behind, which is what makes
-	// breaking faces and crests glow turquoise. Marches the analytic cross-section (up to 3 steps).
-	crestPath( lagXZ, depth, Tv ) {
-
-		if ( ! this._crestPathFn ) {
-
-			this._crestPathFn = Fn( ( [ p, d, T ] ) => {
-
-				const out = float( 1e4 ).toVar();
-				const ph = this.phaseAt( p );
-				const tXi = dot( T.xz, ph.dir ).toVar(); // shoreward component of the ray
-				const env = smoothstep( 26, 13, d ).mul( saturate( ph.exposure.mul( 1.4 ) ) ).mul( this.enabled ).toVar();
-				// rays heading out through the back of the wave (a view from the beach side), near breakers
-				If( env.greaterThan( 0.05 ).and( tXi.lessThan( - 0.05 ) ).and( d.lessThan( 6 ) ), () => {
-
-					const lam = sqrt( clamp( d, 0.3, 25 ).mul( GRAVITY ) ).mul( this.period ).toVar();
-					const m = floor( ph.s.add( 0.5 ) );
-					const u = ph.s.sub( m ).toVar();
-					const A = this.waveAmp( m, ph.along ).toVar();
-					const P = this._breakParams( A, this.breakDepth( p, ph.dir, u, lam, d ) );
-					const s0 = this._profile( u, lam, P, false );
-					const y0 = s0.y.mul( env ).toVar();
-					// only the upper part of steep (nearly breaking) waves is thin enough to see through
-					If( y0.greaterThan( A.mul( 0.2 ) ).and( P.b.greaterThan( - 1.5 ) ), () => {
-
-						const xi0 = u.negate().mul( lam ).add( s0.x.mul( env ) ).toVar();
-						const slope = T.y.div( tXi.negate() ); // ray rise per metre of horizontal travel
-						const prevGap = float( 0 ).toVar();
-						const prevDist = float( 0 ).toVar();
-						const off = float( 1.1 ).toVar();
-						Loop( 3, () => {
-
-							const uk = min( u.add( off.div( lam ) ), 0.5 );
-							const sk = this._profile( uk, lam, P, false );
-							const dist = xi0.sub( uk.negate().mul( lam ).add( sk.x.mul( env ) ) ).abs();
-							// ray height above the surface there (> 0: the ray has left the water)
-							const gap = y0.add( slope.mul( dist ) ).sub( sk.y.mul( env ) ).toVar();
-							If( gap.greaterThan( 0 ), () => {
-
-								const f = prevGap.negate().div( max( gap.sub( prevGap ), 1e-4 ) );
-								out.assign( mix( prevDist, dist, saturate( f ) ).div( tXi.negate() ) );
-								Break();
-
-							} );
-							prevGap.assign( gap );
-							prevDist.assign( dist );
-							off.mulAssign( 2.6 );
-
-						} );
-
-					} );
-
-				} );
-				return out;
-
-			} ).setLayout( {
-				name: 'shoreCrestPath', type: 'float',
-				inputs: [ { name: 'p', type: 'vec2' }, { name: 'd', type: 'float' }, { name: 'T', type: 'vec3' } ],
-			} );
-
-		}
-
-		return this._crestPathFn( lagXZ, depth, Tv );
-
-	}
-
-	// ------------------------------------------------------------ swash
-
-	// Run-up of the most recent wave at a point on the beach (distances in metres up the beach face).
-	// The run-up is compared with the height of the sand (converted with the nominal beach slope), so
-	// the front is exact at the waterline and follows the contours of the sand. sh: shoreSample( xz ).
-	_swashRunup( sh, along, groundH ) {
-
-		const Tp = this.period;
-		const exposure = length( vec2( sh.y, sh.z ) );
-		const Ts = sh.w;
-		const inland = max( groundH.sub( G.seaLevel ), 0 ).div( BEACH_SLOPE ).toVar();
-		const ss = this.time.sub( Ts ).div( Tp ).add( this.wobble( along ) );
-		const ms = floor( ss );
-		const tau = ss.sub( ms ).toVar(); // 0..1 time since that wave's bore reached the shoreline
-		const Am = this.waveAmp( ms, along );
-		// vertical run-up ~ H on this gentle beach, converted to a horizontal excursion
-		const RhMax = Am.mul( 2.1 ).mul( this.runup ).mul( saturate( exposure.mul( 1.4 ) ) ).div( BEACH_SLOPE ).toVar();
-		// decelerating uprush, then a backwash that starts slowly and accelerates as the sheet drains
-		const su = saturate( tau.div( SWASH_UP ) ), sb = saturate( tau.sub( SWASH_UP ).div( SWASH_DOWN ) );
-		const isUp = tau.lessThan( SWASH_UP );
-		const Rh = select( isUp, float( 1 ).sub( pow( float( 1 ).sub( su ), 1.5 ) ), float( 1 ).sub( pow( sb, 1.6 ) ) ).mul( RhMax ).sub( 0.3 );
-		// the front is lobed, not a straight line: each wave runs up a little differently along the beach
-		const lobes = sin( along.mul( 0.61 ).add( ms.mul( 2.3 ) ) ).mul( 0.5 ).add( sin( along.mul( 1.73 ).add( ms.mul( 5.1 ) ) ).mul( 0.3 ) ).add( sin( along.mul( 4.3 ).add( ms.mul( 1.7 ) ) ).mul( 0.2 ) );
-		// the backwash never quite exposes the lower beach face: a film of water always covers the
-		// first decimetres past the shoreline, so the sea never meets the sand along mesh triangles
-		const Rt = max( Rh.add( lobes.mul( Rh.max( 0 ).mul( 0.07 ).add( 0.35 ) ) ), 0.35 ).mul( this.enabled ).toVar();
-		return { tau, Rt, inland, RhMax, su, sb, isUp };
-
-	}
-
-	// Water film thickness clipped at the leading edge of the swash sheet, for the water shader's
-	// edge fade: min( thickness, distance to the front (m) * 0.08 ). Only evaluated where the film is
-	// thin, so the sheet ends on the analytic front instead of the mesh triangles at ~no cost.
-	swashClip( xz, thickness ) {
-
-		if ( ! this._swashClipFn ) {
-
-			this._swashClipFn = Fn( ( [ p, t ] ) => {
-
-				const out = t.toVar();
-				If( t.lessThan( 0.2 ), () => {
-
-					const g = this.terrain.heightAt( p ).toVar();
-					If( g.greaterThan( G.seaLevel ), () => {
-
-						const ph = this.phaseAt( p );
-						const r = this._swashRunup( ph.sh, ph.along, g );
-						out.assign( min( t, r.Rt.sub( r.inland ).mul( 0.08 ) ) );
-
-					} );
-
-				} );
-				return out;
-
-			} ).setLayout( { name: 'shoreSwashClip', type: 'float', inputs: [ { name: 'p', type: 'vec2' }, { name: 't', type: 'float' } ] } );
-
-		}
-
-		return this._swashClipFn( xz, thickness );
-
-	}
-
-	// ------------------------------------------------------------ evaluation at a point
-
-	// Local wave phase data at a (Lagrangian) point: shared by evaluate() and the crest finder.
-	phaseAt( xz ) {
-
-		const sh = this.terrain.shoreSample( xz );
-		const T = sh.x;
-		const dirE = vec2( sh.y, sh.z );
-		const exposure = length( dirE );
-		const dir = dirE.div( max( exposure, 1e-4 ) );
-		const along = dot( xz, vec2( dir.y.negate(), dir.x ) );
-		const s = this.time.sub( T ).div( this.period ).add( this.wobble( along ) );
-		return { sh, T, dir, exposure, along, s };
-
-	}
-
-	// Returns displacement relative to (xz, seaLevel), foam, breaking indicator and the
-	// swash surface level (absolute height) for this point. With withNormal (the water mesh) also
-	// face: 1 on the clear concave face of a plunging wave, roller: relief of the whitewater (m).
-	// world: the shore simulation's view (a fixed world point instead of a water parcel): foam and
-	// height are those of the water shown at xz, the displacement is not meaningful.
-	evaluate( xz, depth, groundH, { withNormal = true, world = false } = {} ) {
-
-		const ph = this.phaseAt( xz );
-		const { sh, exposure, along } = ph;
-		const dir = ph.dir.toVar();
-		const Tp = this.period;
-
-		const d = depth;
-		const c = sqrt( clamp( d, 0.3, 25 ).mul( GRAVITY ) );
-		const lam = c.mul( Tp ).toVar();
-
-		const s = ph.s;
-		const m = floor( s.add( 0.5 ) );
-		const u = s.sub( m ).toVar();
-
-		// wave height with smooth hand-over between consecutive waves at the trough
-		const A0 = this.waveAmp( m, along );
-		const An = this.waveAmp( m.add( sign( u ) ), along );
-		const A = mix( A0, An, smoothstep( 0.32, 0.5, abs( u ) ).mul( 0.5 ) ).toVar();
-		// the breaking state of the whole wave comes from the depth under its crest
-		const dB = this.breakDepth( xz, dir, u, lam, d ).toVar();
-
-		// offshore fade-in (FFT covers deep water) and fade on land (the swash sheet takes over there)
-		const env = smoothstep( 26, 13, d ).mul( smoothstep( - 0.25, 0.05, d ) ).mul( saturate( exposure.mul( 1.4 ) ) ).mul( this.enabled ).toVar();
-
-		// finite difference along the propagation direction for the normal
-		const e = 0.15;
-		let sh0, sh1 = null;
-		let face = float( 0 ), roller = float( 0 );
-		if ( world ) {
-
-			const r = this._worldFn( u, A, dB, lam, env ).toVar();
-			sh0 = { x: r.z, y: r.y, foam: r.x, b: r.w };
-
-		} else if ( withNormal ) {
-
-			const pair = this._shapePairFn( u, float( - e ).div( lam ), A, dB, lam ).toVar();
-			const c0 = pair.element( 0 ), c1 = pair.element( 1 );
-			sh0 = { x: c0.x, y: c0.y, foam: c0.z, b: c0.w };
-			sh1 = { x: c1.x, y: c1.y };
-			face = c1.z.mul( env );
-			roller = c1.w.mul( env ).toVar();
-
-		} else sh0 = this.shape( u, A, dB, lam );
-
-		const disp = vec3( dir.x.mul( sh0.x ), sh0.y, dir.y.mul( sh0.x ) ).mul( env ).toVar();
-
-		let nShore = vec3( 0, 1, 0 );
-		if ( withNormal ) {
-
-			const dX = float( e ).add( sh1.x.sub( sh0.x ).mul( env ) );
-			const dY = sh1.y.sub( sh0.y ).mul( env );
-			const tAlong = vec3( dir.x.mul( dX ), dY, dir.y.mul( dX ) );
-			const tAcross = vec3( dir.y.negate(), 0, dir.x );
-			// epsilon: never a zero vector; never facing down (the mesh doesn't overhang, the lip sheet does)
-			const n = normalize( cross( tAcross, tAlong ).add( vec3( 0, 1e-4, 0 ) ) ).toVar();
-
-			// the whitewater roller is not a smooth tube: lumps of foam tumble along its front and over
-			// its top (relief of a few decimetres, with its slope in the normal)
-			const sx = u.mul( lam ); // rest position along the wave direction (m, seaward)
-			const t = this.time;
-			const a3 = along.mul( 0.61 ).add( t.mul( 0.9 ) );
-			const a1 = along.mul( 1.7 ).add( sx.mul( 1.1 ) ).sub( t.mul( 2.3 ) ).add( sin( a3 ).mul( 2 ) );
-			const a2 = along.mul( 4.3 ).sub( sx.mul( 2.7 ) ).add( t.mul( 3.7 ) );
-			const amp = roller.mul( 0.2 );
-			const lump = sin( a1 ).mul( 0.6 ).add( sin( a2 ).mul( 0.4 ) );
-			disp.y.addAssign( lump.mul( amp ) );
-			const c1a = cos( a1 ), c2a = cos( a2 );
-			const dAlong = c1a.mul( cos( a3 ).mul( 2 * 0.61 ).add( 1.7 ) ).mul( 0.6 ).add( c2a.mul( 4.3 * 0.4 ) );
-			const dShore = c1a.mul( - 1.1 * 0.6 ).add( c2a.mul( 2.7 * 0.4 ) ); // d/d(shoreward) = - d/dsx
-			const g = vec2( dir.y.negate(), dir.x ).mul( dAlong ).add( dir.mul( dShore ) ).mul( amp ).mul( n.y );
-			nShore = normalize( vec3( n.x.sub( g.x ), max( n.y, 0.04 ), n.z.sub( g.y ) ) );
-
-		}
-
-		// ---- swash: run-up of the most recent wave on the sand
-		const swr = this._swashRunup( sh, along, groundH );
-		const { tau, Rt, inland, RhMax, su, sb, isUp } = swr;
-		const up = SWASH_UP, dn = SWASH_DOWN, beachSlope = BEACH_SLOPE;
-		const front = Rt.sub( inland ).toVar(); // signed distance to the leading edge (m), > 0 under the sheet
-		const covered = front.greaterThan( 0 );
-		// leading edge velocity along the slope (m/s), positive = uphill
-		const dRdt = select( isUp, pow( float( 1 ).sub( su ), 0.5 ).mul( 1.5 / ( up ) ), pow( sb.max( 1e-3 ), 0.6 ).mul( - 1.6 / dn ) ).mul( RhMax ).div( Tp ).toVar();
-		// thin sheet (a few cm, thickening behind the leading edge). The mesh sheet overshoots the
-		// leading edge a little; the water shader cuts it exactly on the front (swashClip), so the edge
-		// doesn't follow the mesh triangles.
-		const fm = front.add( SWASH_OVERSHOOT );
-		const thick = clamp( min( fm.mul( 0.3 ), max( fm.sub( 0.1 ), 0 ).mul( beachSlope * 0.22 ).add( 0.03 ) ), - 0.1, 0.12 ).toVar();
-		const swashLevel = groundH.add( thick );
-		// bubbly foam line riding the leading edge all the way up (left behind as the swash mark)
-		const uprush = smoothstep( 0.46, 0.32, tau );
-		const edge = smoothstep( 0.8, 0.0, front ).mul( smoothstep( - 0.05, 0.05, front ) ).mul( uprush ).mul( smoothstep( 0.0, 1.0, Rt ) );
-		const swashFoam = edge.mul( 0.9 );
-
-		// ---- depth-averaged water velocity (along dir), for foam advection
-		// waves / bores: shallow-water particle velocity c * eta / h; swash sheet: the tip moves at
-		// dR/dt, slower toward the shoreline during uprush, faster there while it drains
-		const eta = disp.y;
-		const uWave = c.mul( eta ).div( max( d, 0 ).add( max( eta, d.mul( - 0.8 ) ) ).add( 0.15 ) ).clamp( - 2.5, 4.0 );
-		const rel = saturate( inland.div( max( Rt, 0.5 ) ) );
-		const uSwash = dRdt.mul( select( isUp, clamp( inland.add( 3 ).div( Rt.add( 3 ) ), 0.15, 1 ), rel.oneMinus().mul( 0.6 ).add( 0.9 ) ) );
-		const wSwash = smoothstep( 0.3, 0.05, d );
-		const uFlow = mix( uWave, uSwash, wSwash ).mul( select( covered.or( d.greaterThan( 0.02 ) ), float( 1 ), float( 0 ) ) );
-
-		return {
-			disp, nShore, env, foam: sh0.foam.mul( env ), breaking: sh0.b, u, dir, exposure,
-			swashLevel, swashCovered: covered, thick, swashFoam, runup: Rt, inland, dRdt, tau,
-			flow: dir.mul( uFlow ), flowSpeed: uFlow, face, roller,
-		};
 
 	}
 

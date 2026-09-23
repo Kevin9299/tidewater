@@ -88,6 +88,8 @@ export const GPU = {
 			linearClamp: s( { ...lin, addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' } ),
 			linearMirror: s( { ...lin, addressModeU: 'mirror-repeat', addressModeV: 'mirror-repeat', addressModeW: 'mirror-repeat' } ),
 			anisoRepeat: s( { ...lin, addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat', maxAnisotropy: 8 } ),
+			// 4x: the terrain detail texture (grazing views of the beach; 8x costs ~0.5 ms more at 1440p)
+			aniso4Repeat: s( { ...lin, addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat', maxAnisotropy: 4 } ),
 			anisoClamp: s( { ...lin, addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', maxAnisotropy: 8 } ),
 			nearestClamp: s( { magFilter: 'nearest', minFilter: 'nearest', mipmapFilter: 'nearest', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge' } ),
 			nearestRepeat: s( { magFilter: 'nearest', minFilter: 'nearest', mipmapFilter: 'nearest', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' } ),

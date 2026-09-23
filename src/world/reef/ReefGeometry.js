@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import * as THREE from '../../engine/index.js';
 
 // Procedural models of reef organisms, each at several levels of detail (0 = full detail).
 //

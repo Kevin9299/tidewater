@@ -228,7 +228,7 @@ export class UniformBlock {
 
 		if ( ! this.buffer ) {
 
-			this.buffer = GPU.device.createBuffer( { label: this.label, size: this.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST } );
+			this.buffer = GPU.device.createBuffer( { label: this.label, size: this.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST } ); // STORAGE: may be bound read-only when a stage runs out of uniform slots (Shader.js)
 			this._last = new Uint32Array( this.byteLength / 4 );
 			this._last.fill( 0xffffffff );
 

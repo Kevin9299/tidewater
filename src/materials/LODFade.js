@@ -1,4 +1,4 @@
-import { Fn, float, uvec2, screenCoordinate, frameId, Discard } from 'three/tsl';
+import { ShaderModule } from '../engine/gpu/Shader.js';
 
 // Screen-door cross-fade between levels of detail (and for anything that appears or disappears
 // with distance), so nothing switches over in one frame.
@@ -11,29 +11,34 @@ import { Fn, float, uvec2, screenCoordinate, frameId, Discard } from 'three/tsl'
 //
 // fade: 0..1, the share of this level that is visible (the same value for both levels of one
 // instance: ramp it with distance across the band on the CPU or in the vertex stage).
+//
+// WGSL (lodFadeModule):
+//   fn bayer4( pixel: vec2f ) -> f32                 threshold in (0, 1) for a fragment coordinate
+//   fn lodFadeVisible( pixel: vec2f, fade: f32, outgoing: bool ) -> bool
+// In a surface / shadow snippet: `if ( ! lodFadeVisible( in.pixel, fade, false ) ) { discard; }`
+// (Nothing is discarded at fade >= 1 (incoming) or fade <= 0 (outgoing).)
 
+export const lodFadeModule = new ShaderModule( {
+	name: 'lodFade',
+	code: /* wgsl */`
 // Bayer 4x4 threshold in (0, 1): bit-interleaved formula of
 //   0  8  2 10 / 12  4 14  6 / 3 11  1  9 / 15  7 13  5
-export const bayer4 = Fn( () => {
-
-	const f = frameId;
+fn bayer4( pixel: vec2f ) -> f32 {
+	let f = frame.frameIndex;
 	// shift the pattern by a different offset every frame (all 16 over 16 frames)
-	const p = uvec2( screenCoordinate.xy ).add( uvec2( f.mul( 3 ), f.shiftRight( 2 ).mul( 1 ) ) );
-	const x0 = p.x.bitAnd( 1 ), x1 = p.x.shiftRight( 1 ).bitAnd( 1 );
-	const y0 = p.y.bitAnd( 1 ), y1 = p.y.shiftRight( 1 ).bitAnd( 1 );
-	const v = x0.bitXor( y0 ).shiftLeft( 3 ).bitOr( y0.shiftLeft( 2 ) ).bitOr( x1.bitXor( y1 ).shiftLeft( 1 ) ).bitOr( y1 );
-	return float( v ).add( 0.5 ).div( 16 );
-
-} );
-
-// Call in the fragment stage (e.g. at the top of a colorNode / opacity Fn). Nothing is discarded
-// at fade >= 1 (incoming) or fade <= 0 (outgoing).
-export function lodFadeDiscard( fade, outgoing = false ) {
-
-	const t = bayer4();
-	Discard( outgoing ? t.lessThan( fade ) : t.greaterThanEqual( fade ) );
-
+	let p = vec2u( pixel ) + vec2u( f * 3u, ( f >> 2u ) * 1u );
+	let x0 = p.x & 1u; let x1 = ( p.x >> 1u ) & 1u;
+	let y0 = p.y & 1u; let y1 = ( p.y >> 1u ) & 1u;
+	let v = ( ( x0 ^ y0 ) << 3u ) | ( y0 << 2u ) | ( ( x1 ^ y1 ) << 1u ) | y1;
+	return ( f32( v ) + 0.5 ) / 16.0;
 }
+
+fn lodFadeVisible( pixel: vec2f, fade: f32, outgoing: bool ) -> bool {
+	let t = bayer4( pixel );
+	return select( ( t < fade ), ( t >= fade ), outgoing );
+}
+`,
+} );
 
 // Fade factor across a distance band [start, end] (0 before, 1 after), for the level that takes over
 // at `end`. Use on the CPU when bucketing instances.

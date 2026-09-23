@@ -1,4 +1,3 @@
-import * as THREE from 'three/webgpu';
 import { BirdBatch } from './BirdBatch.js';
 import { Birds } from './Birds.js';
 import { CritterBatch } from './CritterBatch.js';
@@ -70,6 +69,8 @@ class WaterHeights {
 // shadows under the small ones (one draw in the late pass). Everything is simulated on the CPU
 // near the viewer only; far away the crabs and shorebirds cost nothing and draw nothing.
 //
+// csm: the SunShadows instance (birds cast into its near cascade only).
+//
 // update( dt, camera, player ): player = null for the free camera (it only scares animals when
 // it is near the ground).
 export class Wildlife {
@@ -88,7 +89,7 @@ export class Wildlife {
 		this.blobs = new ShadowBlobs();
 		scene.add( this.blobs.mesh );
 		let probe = null;
-		if ( renderer && shore && terrainGPU ) {
+		if ( shore && terrainGPU ) {
 
 			try {
 

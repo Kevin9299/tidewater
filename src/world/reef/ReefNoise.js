@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Texture } from '../../engine/gpu/Texture.js';
 import { mulberry32 } from '../../util/Noise.js';
 
 // Tileable 3D gradient noise in a small RGBA8 volume: four independent noise channels with
@@ -77,16 +77,8 @@ export function createNoiseVolume( size = 64, cells = 8, seed = 90210 ) {
 
 	}
 
-	const tex = new THREE.Data3DTexture( data, size, size, size );
-	tex.format = THREE.RGBAFormat;
-	tex.type = THREE.UnsignedByteType;
-	tex.minFilter = THREE.LinearFilter;
-	tex.magFilter = THREE.LinearFilter;
-	tex.wrapS = tex.wrapT = tex.wrapR = THREE.RepeatWrapping;
-	tex.generateMipmaps = false;
-	tex.unpackAlignment = 1;
-	tex.name = 'reefNoise';
-	tex.needsUpdate = true;
+	// sampled trilinear with repeat wrapping (the shared `smpLinearRepeat` sampler), no mipmaps
+	const tex = new Texture( { label: 'reefNoise', width: size, height: size, depth: size, dimension: '3d', format: 'rgba8unorm', data, sampler: 'linearRepeat' } );
 	return tex;
 
 }

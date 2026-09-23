@@ -1,4 +1,4 @@
-import * as THREE from 'three/webgpu';
+import { Vector3, Matrix4 } from '../../engine/index.js';
 import { Part, mat4, fixWinding, slabPart, CAP_U } from '../village/GeoBuilder.js';
 import { WOOD, HARD, C, lin, mulc, buoy } from '../Props.js';
 
@@ -17,9 +17,9 @@ export const KIND = { STONE: 0, COCONUT: 1, WEED: 2, SHELL: 3, CORAL: 4, FROND: 
 export const nat = ( seed, kind, p0 = 0, size = 0.1 ) => [ seed, kind, p0, size ];
 
 const TAU = Math.PI * 2;
-const _v = new THREE.Vector3();
-const _n = new THREE.Vector3();
-const IDENT = new THREE.Matrix4();
+const _v = new Vector3();
+const _n = new Vector3();
+const IDENT = new Matrix4();
 
 // ---------------------------------------------------------------------------
 // noise helpers
@@ -174,7 +174,7 @@ function capPart( ring, center, normal, capU = CAP_U, jag = 0, seed = 0 ) {
 	const p = [ center[ 0 ], center[ 1 ], center[ 2 ] ], n = [ ...normal ], uv = [ capU, 0 ], idx = [];
 	// in-plane basis
 	const nn = _n.set( normal[ 0 ], normal[ 1 ], normal[ 2 ] ).normalize();
-	const a = Math.abs( nn.y ) < 0.9 ? new THREE.Vector3( 0, 1, 0 ) : new THREE.Vector3( 1, 0, 0 );
+	const a = Math.abs( nn.y ) < 0.9 ? new Vector3( 0, 1, 0 ) : new Vector3( 1, 0, 0 );
 	const e1 = a.sub( nn.clone().multiplyScalar( a.dot( nn ) ) ).normalize();
 	const e2 = nn.clone().cross( e1 );
 	for ( let i = 0; i < ring.length; i ++ ) {
@@ -210,11 +210,11 @@ export function taperTube( pts, radii, radial = 6, rFn = null, uScale = 1 ) {
 	for ( let k = 0; k < m; k ++ ) {
 
 		const a = pts[ Math.max( 0, k - 1 ) ], b = pts[ Math.min( m - 1, k + 1 ) ];
-		T.push( new THREE.Vector3( b[ 0 ] - a[ 0 ], b[ 1 ] - a[ 1 ], b[ 2 ] - a[ 2 ] ).normalize() );
+		T.push( new Vector3( b[ 0 ] - a[ 0 ], b[ 1 ] - a[ 1 ], b[ 2 ] - a[ 2 ] ).normalize() );
 
 	}
 
-	let n0 = Math.abs( T[ 0 ].y ) < 0.9 ? new THREE.Vector3( 0, 1, 0 ) : new THREE.Vector3( 1, 0, 0 );
+	let n0 = Math.abs( T[ 0 ].y ) < 0.9 ? new Vector3( 0, 1, 0 ) : new Vector3( 1, 0, 0 );
 	n0.sub( T[ 0 ].clone().multiplyScalar( n0.dot( T[ 0 ] ) ) ).normalize();
 	Nf.push( n0 );
 	Bf.push( T[ 0 ].clone().cross( n0 ) );
@@ -1082,9 +1082,9 @@ export function flipFlop( B, ground, x, z, rand ) {
 	const yaw = rand() * TAU, s = 0.9 + rand() * 0.2;
 	const pts = [ [ 0, - 0.12 ], [ 0.04, - 0.1 ], [ 0.045, 0.0 ], [ 0.05, 0.08 ], [ 0.03, 0.13 ], [ - 0.02, 0.135 ], [ - 0.045, 0.08 ], [ - 0.04, - 0.02 ], [ - 0.035, - 0.1 ] ];
 	B.pushAt( x, g + 0.012, z, yaw, ( rand() - 0.5 ) * 0.1, ( rand() - 0.5 ) * 0.1 );
-	const V = pts.map( ( [ a, b ] ) => new THREE.Vector3( a * s, 0, b * s ) );
-	B.add( 'hard', slabPart( V, 0.014, new THREE.Vector3( 0, 0, 1 ), new THREE.Vector3( 0, 1, 0 ) ), IDENT, mulc( tint, 0.8 ), HARD( rand(), 0, 0, 0.85 ) );
-	const strap = [ new THREE.Vector3( - 0.038 * s, 0, 0.0 ), new THREE.Vector3( - 0.02 * s, 0.03, 0.06 * s ), new THREE.Vector3( 0, 0.012, 0.1 * s ), new THREE.Vector3( 0.02 * s, 0.03, 0.06 * s ), new THREE.Vector3( 0.04 * s, 0, 0.0 ) ];
+	const V = pts.map( ( [ a, b ] ) => new Vector3( a * s, 0, b * s ) );
+	B.add( 'hard', slabPart( V, 0.014, new Vector3( 0, 0, 1 ), new Vector3( 0, 1, 0 ) ), IDENT, mulc( tint, 0.8 ), HARD( rand(), 0, 0, 0.85 ) );
+	const strap = [ new Vector3( - 0.038 * s, 0, 0.0 ), new Vector3( - 0.02 * s, 0.03, 0.06 * s ), new Vector3( 0, 0.012, 0.1 * s ), new Vector3( 0.02 * s, 0.03, 0.06 * s ), new Vector3( 0.04 * s, 0, 0.0 ) ];
 	B.tube( 'hard', strap, 0.0055, { radial: 4, tint: mulc( tint, 0.9 ), data: HARD( rand(), 0, 0, 0.7 ) } );
 	B.pop();
 
@@ -1111,7 +1111,7 @@ export function ropeScrap( B, ground, x, z, rand, o = {} ) {
 				const a = m / 12 * TAU * ( 0.8 + rand() * 0.1 );
 				const lx = Math.cos( a ) * R * ( 0.7 + rand() * 0.4 ), ly = Math.sin( a ) * R * 0.6 * Math.sin( tilt ), lz = Math.sin( a ) * R * Math.cos( tilt );
 				const wx = x + lx * Math.cos( ax ) - lz * Math.sin( ax ), wz = z + lx * Math.sin( ax ) + lz * Math.cos( ax );
-				pts.push( new THREE.Vector3( wx, Math.max( g + ly + R * 0.45, ground( wx, wz ) + r ), wz ) );
+				pts.push( new Vector3( wx, Math.max( g + ly + R * 0.45, ground( wx, wz ) + r ), wz ) );
 
 			}
 
@@ -1129,7 +1129,7 @@ export function ropeScrap( B, ground, x, z, rand, o = {} ) {
 	const pts = [];
 	for ( let m = 0; m <= n; m ++ ) {
 
-		pts.push( new THREE.Vector3( px, ground( px, pz ) + r * 0.8, pz ) );
+		pts.push( new Vector3( px, ground( px, pz ) + r * 0.8, pz ) );
 		a += ( rand() - 0.5 ) * 0.9;
 		px += Math.cos( a ) * L / n;
 		pz += Math.sin( a ) * L / n;

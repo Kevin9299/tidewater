@@ -1,9 +1,4 @@
-import * as THREE from 'three/webgpu';
-import {
-	float, vec2, vec3, vec4, smoothstep, saturate, mix, max, dot, normalize, positionWorld, dFdx, dFdy, cross, abs, sign,
-	pow, If, clamp, fract, floor, sin, texture, sqrt, length,
-} from 'three/tsl';
-import { G } from '../core/Globals.js';
+import { Texture, ShaderModule, commonModule } from '../engine/webgpu.js';
 
 // Surf-zone foam: the lace texture shared by the shore simulation, and the foam look used by the
 // water shader (hooks called from WaterSurface.fragment and WaterMaterial.shade).
@@ -11,6 +6,15 @@ import { G } from '../core/Globals.js';
 // Whitewater is a volume of bubbles: a dense mat that is bright from every side, with a lumpy,
 // bubbly surface (darker in its own dips), tearing into patches and then into lace (thin bubble
 // strands around clear holes) as it decays. Thin foam is translucent over the water colour.
+//
+// WGSL (this.module, prefix surfFoam; deps: shoreSim.module, shore.module):
+//   struct SurfFoamArgs { coverage, foam, footprint, depth, bubbles: f32, lagXZ: vec2f, normal: vec3f,
+//                         baseNormal: vec3f, fresh, sim: f32, simState: vec4f, roller: f32, P: vec3f }
+//     (P: world position of the fragment — the pattern lives in world space; set it!)
+//   struct SurfFoamInfo { foam, density, height, surf, ww, relief, selfShadow, cavity: f32 }
+//   fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo
+//   fn surfFoamLight( info: SurfFoamInfo, N: vec3f, L: vec3f, V: vec3f, sun: vec3f, P: vec3f ) -> vec3f
+//   fn surfFoamFlowLace( q: vec2f, flow: vec2f, salt: f32 ) -> vec4f
 
 export const LACE_TILE = 3.5; // metres per tile of the lace texture
 
@@ -48,27 +52,15 @@ export function makeLaceTexture( size = 512 ) {
 
 	}
 
-	const tex = new THREE.DataTexture( data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType );
-	tex.mipmaps = mips;
-	tex.generateMipmaps = false;
-	tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-	tex.magFilter = THREE.LinearFilter;
-	tex.minFilter = THREE.LinearMipmapLinearFilter;
-	tex.anisotropy = 4;
-	tex.colorSpace = THREE.NoColorSpace;
-	tex.name = 'surfLace';
-	tex.needsUpdate = true;
-	tex.userData.ms = performance.now() - t0;
-	// the same pattern for shaders with no sampler to spare: nearest filtering means no sampler
-	// binding (read with loads, filtered by hand, see ShoreSim.laceLoad)
-	const near = new THREE.DataTexture( data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType );
-	near.magFilter = near.minFilter = THREE.NearestFilter;
-	near.generateMipmaps = false;
-	near.colorSpace = THREE.NoColorSpace;
-	near.name = 'surfLaceNearest';
-	near.needsUpdate = true;
+	// sampled with smpAnisoRepeat (linear, mipmapped, repeat)
+	const tex = new Texture( { label: 'surfLace', width: size, height: size, format: 'rgba8unorm', mips: mips.length, usage: [ 'sample', 'copyDst' ] } );
+	for ( let m = 0; m < mips.length; m ++ ) tex.upload( mips[ m ].data, { mip: m } );
+	tex.userData = { ms: performance.now() - t0, size };
+	// the same pattern for shaders with no sampler to spare: nearest, read with loads, filtered by
+	// hand (see shoreSimLaceLoad)
+	const near = new Texture( { label: 'surfLaceNearest', width: size, height: size, format: 'rgba8unorm', data, usage: [ 'sample', 'copyDst' ] } );
 	tex.userData.nearest = near;
-	tex.userData.size = size;
+	tex.userData.mips = mips;
 	cachedLace = tex;
 	return tex;
 
@@ -224,19 +216,9 @@ function laceData( size ) {
 
 }
 
-// Henyey-Greenstein phase (1/sr)
-const phaseHG = ( cosT, g ) => {
-
-	const g2 = g * g;
-	return float( ( 1 - g2 ) / ( 4 * Math.PI ) ).div( max( float( 1 + g2 ).sub( cosT.mul( 2 * g ) ), 1e-4 ).pow( 1.5 ) );
-
-};
-
-const hash11 = ( x ) => fract( sin( x.mul( 91.7 ).add( 17.3 ) ).mul( 43758.5453 ) );
-
 // Foam look hooks for the water shader.
-//   surface.foamShading = ( args ) => surfFoam.shading( args )   (WaterSurface.fragment)
-//   foamInfo.light( { N, L, V, sun } )                           (WaterMaterial.shade)
+//   surface.foamShading = surfFoam   (WaterSurface.fragment calls surfFoamShading)
+//   surfFoamLight( info, N, L, V, sun, P )   (WaterMaterial.shade)
 //
 // The pattern lives in world space, never in the coordinates of the displaced surface (those are
 // squeezed and stretched by the big horizontal motion of the shore waves and would draw the foam
@@ -252,197 +234,249 @@ export class SurfFoam {
 		this.bump = 0.7; // relief of the whitewater and of thick foam (normal perturbation strength)
 		this.period = 1.2; // s, flow map cycle
 		this.maxFlow = 2.5; // m/s, the pattern lags behind faster flow (bounds the distortion per cycle)
-
-	}
-
-	// Lace distance (0 on a bubble strand .. 1 in a hole) at pattern coordinates q (m), carried by
-	// `flow` (m/s in the same coordinates) with the dual-phase flow map. `salt` decorrelates layers.
-	flowLace( q, flow, salt = 0 ) {
-
-		const lace = this.sim.lace;
-		const t = G.time.div( this.period );
-		const v = clamp( flow, vec2( - this.maxFlow ), vec2( this.maxFlow ) ).mul( this.period );
-		const out = vec4( 0 ).toVar();
-		for ( let k = 0; k < 2; k ++ ) {
-
-			const tk = t.add( k * 0.5 + salt * 0.37 );
-			const ph = fract( tk );
-			const cycle = floor( tk ).add( k * 13.1 + salt * 5.7 );
-			const jitter = vec2( hash11( cycle ), hash11( cycle.add( 0.5 ) ) ).mul( 7.0 );
-			const p = q.sub( v.mul( ph.sub( 0.5 ) ) ).div( LACE_TILE ).add( jitter );
-			const w = float( 1 ).sub( ph.mul( 2 ).sub( 1 ).abs() );
-			out.addAssign( texture( lace, p ).mul( w ) );
-
-		}
-
-		return out; // the two weights always add up to 1
-
-	}
-
-	// coverage: total foam amount (0..1, all sources); foam: the default (offshore whitecap) foam;
-	// footprint: pixel size on the surface (m); depth: sea depth; bubbles: fine bubble detail;
-	// normal: surface normal; fresh: whitewater made by the breaking wave right here (roller,
-	// plunge point, swash front); sim: foam carried by the water (ShoreSim, already kept off the
-	// clear face of plunging waves); simState: ShoreSim.sample() at this pixel; roller: relief of
-	// the whitewater roller (m)
-	shading( { coverage, foam, footprint, depth, bubbles, normal, baseNormal = null, fresh = float( 0 ), sim = float( 0 ), simState = null, roller = float( 0 ) } ) {
-
-		const simS = this.sim;
-		const xz = positionWorld.xz;
-		const opacity = float( foam ).toVar();
-		const density = saturate( coverage ).toVar();
-		const height = float( 0 ).toVar();
-		const wwOut = float( 0 ).toVar(); // how much of it is whitewater (deeper crevices)
-		const wwRelief = float( 0 ).toVar(); // relief of the whitewater (m)
-		const wwShadow = float( 1 ).toVar(); // sun visibility inside the churn
-		const wwCav = float( 1 ).toVar(); // sky visibility in its crevices
-		// surf look near the beach, the default whitecap look offshore
-		const surf = smoothstep( 7.0, 3.0, depth ).mul( simS.inside( simS.uvOf( xz ) ) ).toVar();
-		If( surf.greaterThan( 0 ).and( coverage.greaterThan( 0.04 ) ), () => {
-
-			// flow of the water here, from the shore simulation (along the local wave direction)
-			const dir = simS.shore.dirAt( xz ).xy.toVar();
-			const speed = simState ? simState.w : float( 0 );
-			const flow = dir.mul( speed );
-
-			// --- pattern: world-space lace carried by the flow; on steep faces a vertical projection
-			// (along the crest x height) rolling down the face with the roller
-			// (from the normal of the wave itself: steep ripple facets must not switch the projection,
-			// that drew combs of vertical streaks into the foam on flat water and on the swash)
-			const steep = smoothstep( 0.82, 0.5, ( baseNormal || normal ).y ).toVar();
-			const ww = saturate( fresh.mul( 1.4 ) ).toVar();
-			const flat = this.flowLace( xz, flow, 0 ).toVar();
-			const lace = flat.toVar();
-			// lumps of tumbling whitewater (~0.6 m), only where there is whitewater
-			const lumps = float( 0.5 ).toVar();
-			const tangent = vec2( dir.y.negate(), dir.x );
-			// (compressed vertically: a front only a metre or two high must not show single lumps as columns)
-			// (the along-crest coordinate warped by low-frequency noise: the 3.5 m lace tile must not repeat as a
-			// row of identical lumps and spikes along the break)
-			const al = dot( xz, tangent );
-			const qv = vec2( al.add( sin( al.mul( 0.19 ).add( 0.8 ) ).mul( 2.1 ) ).add( sin( al.mul( 0.47 ).add( 2.9 ) ).mul( 0.6 ) ), positionWorld.y.mul( 2.4 ) );
-			If( steep.greaterThan( 0.01 ), () => {
-
-				const vert = this.flowLace( qv, vec2( 0, - 1.8 ), 1 );
-				lace.assign( mix( flat, vert, steep ) );
-
-			} );
-			// Churning whitewater is a pile of foam lumps at several scales (tumbling masses ~1.3 m,
-			// clumps ~0.5 m, bubble clusters ~0.2 m): a relief (m) for the normals, sunlit caps and
-			// self-shadowed crevices (a short march toward the sun through the lump field)
-			If( ww.greaterThan( 0.02 ), () => {
-
-				const L = G.sunDir;
-				const pq = mix( xz, qv, steep ).toVar();
-				const pflow = mix( flow, vec2( 0, - 1.8 ), steep ).toVar();
-				const bigAt = ( qq ) => sqrt( this.flowLace( qq.div( 6.0 ), pflow.div( 6.0 ), 2 ).x );
-				const big = bigAt( pq ).toVar();
-				const mid = sqrt( this.flowLace( pq.div( 2.2 ), pflow.div( 2.2 ), 3 ).x );
-				lumps.assign( big.mul( 0.6 ).add( mid.mul( 0.4 ) ) );
-				const A = 0.22; // relief of the lumps (m)
-				wwRelief.assign( big.mul( A ).add( mid.mul( A * 0.45 ) ).add( float( 1 ).sub( lace.x ).mul( A * 0.12 ) ).mul( ww ) );
-				// the sun direction in the pattern's coordinates, and its elevation above the local surface
-				const tangent2 = vec2( dir.y.negate(), dir.x );
-				const Lp = mix( L.xz, vec2( dot( L.xz, tangent2 ), L.y.mul( 2.4 ) ), steep );
-				const Ld = Lp.div( max( length( Lp ), 1e-3 ) );
-				const NdL = dot( normal, L );
-				const tanE = NdL.div( max( length( L.sub( normal.mul( NdL ) ) ), 0.05 ) );
-				const occ = float( 0 ).toVar();
-				for ( const d of [ 0.14, 0.34, 0.7 ] ) {
-
-					const hk = bigAt( pq.add( Ld.mul( d ) ) );
-					occ.assign( max( occ, smoothstep( 0.0, 0.05, hk.sub( big ).mul( A ).sub( tanE.mul( d ) ) ) ) );
-
-				}
-
-				wwShadow.assign( float( 1 ).sub( occ.mul( mix( float( 0.85 ), float( 0.7 ), steep ) ) ) );
-				// crevices between the lumps: occluded from the sky too
-				wwCav.assign( mix( float( 0.5 ), float( 1.0 ), smoothstep( 0.05, 0.75, lumps ) ) );
-
-			} );
-
-			// --- whitewater: the aerated mass of a roller / plunge / swash front. Dense and opaque, its
-			// surface boiling: lumps with shaded crevices between them, bubble clusters on each; it only
-			// tears (and shows water through) at its edges.
-			const boil = lace.x.mul( 0.7 ).add( lace.z.mul( 0.3 ) );
-			// (the edge of the churn is torn by its lumps: ragged fingers, not a clean boundary)
-			const wwEdge = smoothstep( 0.25, 0.75, ww.mul( 1.35 ).sub( boil.mul( 0.3 ) ).sub( lumps.oneMinus().mul( 0.5 ) ) );
-			const whitewater = ww.mul( 0.25 ).add( wwEdge.mul( 0.75 ) ).mul( boil.oneMinus().mul( 0.12 ).add( 0.88 ) );
-
-			// --- foam carried by the water: a lacy web of bubble strands and clusters around holes. With
-			// more foam the strands widen into a mat; as it spreads and thins it tears into filaments.
-			// (w: strand half-width; the pattern covers 6% of the area at w = 0.1, 34% at 0.3, 82% at 0.6)
-			const c = saturate( sim.add( coverage.sub( sim ).sub( fresh ).max( 0 ).mul( 0.5 ) ).sub( 0.05 ).div( 0.95 ) ).toVar();
-			// hole edges are ragged (bubble clusters), hole sizes vary between patches
-			const w = pow( c, 1.4 ).mul( 0.9 ).mul( lace.z.mul( 0.5 ).add( 0.75 ) ).add( lace.y.sub( 0.5 ).mul( 0.06 ) ).max( 0 ).toVar();
-			const soft = float( 0.05 ).add( footprint.mul( 4.5 ) );
-			const mat = float( 1 ).sub( smoothstep( w.sub( soft ), w.add( soft ), lace.x ) ).mul( smoothstep( 0.0, 0.05, c ) );
-			// scattered bubbles in the holes next to the strands
-			const bub = lace.y.mul( smoothstep( w.add( 0.25 ), w, lace.x ) ).mul( smoothstep( 0.02, 0.2, c ) ).mul( 0.5 );
-			// thin foam is translucent and uneven, thick foam is opaque
-			const inner = saturate( w.sub( lace.x ).div( 0.25 ) ).toVar();
-			const laceFoam = max( mat.mul( saturate( inner.mul( 0.35 ).add( 0.45 ).add( lace.z.mul( 0.3 ) ) ) ), bub );
-
-			// once a lace cell (~0.2 m) covers a few pixels, use the average of the pattern
-			const far = smoothstep( 0.03, 0.12, footprint );
-			const average = max( saturate( pow( w, 1.45 ).mul( 1.9 ) ).mul( 0.8 ), ww.mul( 0.95 ) );
-			const near = max( laceFoam, whitewater );
-			opacity.assign( mix( foam, mix( near, average, far ), surf ) );
-
-			// optical thickness (thin foam is translucent, thick foam scatters like snow) and a relief
-			// height for the lighting: lumpy boiling whitewater, thick foam higher than its thin edges
-			density.assign( max( saturate( c.mul( 1.3 ) ).mul( inner.mul( 0.5 ).add( 0.5 ) ), ww ) );
-			const relief = inner.mul( saturate( c.mul( 1.5 ) ) ).mul( float( 1 ).sub( ww ) );
-			wwOut.assign( ww.mul( float( 1 ).sub( far.mul( 0.6 ) ) ) );
-			// far away the lumps average out: a mean shadowing of the churn instead
-			wwShadow.assign( mix( wwShadow, float( 0.82 ), far ) );
-			wwCav.assign( mix( wwCav, float( 0.8 ), far ) );
-			wwRelief.mulAssign( float( 1 ).sub( far ) );
-			height.assign( relief.add( bubbles.mul( 0.15 ) ).mul( surf ).mul( float( 1 ).sub( far ) ) );
-
+		this.module = new ShaderModule( {
+			name: 'surfFoam',
+			deps: [ commonModule, shoreSim.module, shoreSim.shore.module ],
+			bindings: { surfFoamLaceTex: { texture: shoreSim.lace } },
+			code: this._code(),
 		} );
 
-		return {
-			foam: opacity,
-			density,
-			light: ( args ) => this.light( { ...args, density, height, surf, ww: wwOut, relief: wwRelief, selfShadow: wwShadow, cavity: wwCav } ),
+	}
+
+	_code() {
+
+		const f = ( x ) => {
+
+			const s = String( x );
+			return s.includes( '.' ) || s.includes( 'e' ) ? s : s + '.0';
+
 		};
 
+		return /* wgsl */`
+struct SurfFoamArgs {
+	coverage: f32,
+	foam: f32,
+	footprint: f32,
+	depth: f32,
+	bubbles: f32,
+	lagXZ: vec2f,
+	normal: vec3f,
+	baseNormal: vec3f,
+	fresh: f32,
+	sim: f32,
+	simState: vec4f,
+	roller: f32,
+	P: vec3f,
+};
+
+struct SurfFoamInfo {
+	foam: f32,
+	density: f32,
+	height: f32,
+	surf: f32,
+	ww: f32,
+	relief: f32,
+	selfShadow: f32,
+	cavity: f32,
+};
+
+// Henyey-Greenstein phase (1/sr)
+fn surfFoamPhaseHG( cosT: f32, g: f32 ) -> f32 {
+	let g2 = g * g;
+	return ( ( 1.0 - g2 ) / ( 4.0 * PI ) ) / pow( max( 1.0 + g2 - cosT * 2.0 * g, 1e-4 ), 1.5 );
+}
+
+fn surfFoamHash11( x: f32 ) -> f32 { return fract( sin( x * 91.7 + 17.3 ) * 43758.5453 ); }
+
+// Lace distance (0 on a bubble strand .. 1 in a hole) at pattern coordinates q (m), carried by
+// flow (m/s in the same coordinates) with the dual-phase flow map. salt decorrelates layers.
+fn surfFoamFlowLace( q: vec2f, flow: vec2f, salt: f32 ) -> vec4f {
+	let t = frame.time / ${ f( this.period ) };
+	let v = clamp( flow, vec2f( - ${ f( this.maxFlow ) } ), vec2f( ${ f( this.maxFlow ) } ) ) * ${ f( this.period ) };
+	var out = vec4f( 0.0 );
+	for ( var k = 0; k < 2; k++ ) {
+		let tk = t + ( f32( k ) * 0.5 + salt * 0.37 );
+		let ph = fract( tk );
+		let cycle = floor( tk ) + ( f32( k ) * 13.1 + salt * 5.7 );
+		let jitter = vec2f( surfFoamHash11( cycle ), surfFoamHash11( cycle + 0.5 ) ) * 7.0;
+		let p = ( q - v * ( ph - 0.5 ) ) / ${ f( LACE_TILE ) } + jitter;
+		let w = 1.0 - abs( ph * 2.0 - 1.0 );
+		out += textureSample( surfFoamLaceTex, smpAnisoRepeat, p ) * w;
+	}
+	return out; // the two weights always add up to 1
+}
+
+fn surfFoamBigAt( qq: vec2f, pflow: vec2f ) -> f32 {
+	return sqrt( surfFoamFlowLace( qq / 6.0, pflow / 6.0, 2.0 ).x );
+}
+
+// coverage: total foam amount (0..1, all sources); foam: the default (offshore whitecap) foam;
+// footprint: pixel size on the surface (m); depth: sea depth; bubbles: fine bubble detail;
+// normal: surface normal; fresh: whitewater made by the breaking wave right here (roller,
+// plunge point, swash front); sim: foam carried by the water (ShoreSim, already kept off the
+// clear face of plunging waves); simState: shoreSimSample() at this pixel; roller: relief of
+// the whitewater roller (m)
+fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
+	// world position of the fragment (the pattern is in world space); a caller that left P unset
+	// (zero) gets the rest position instead: close, but the lace then rides the horizontal wave motion
+	let P = select( a.P, vec3f( a.lagXZ.x, frame.seaLevel, a.lagXZ.y ), all( a.P == vec3f( 0.0 ) ) );
+	let xz = P.xz;
+	let coverage = a.coverage;
+	var opacity = a.foam;
+	var density = sat( coverage );
+	var height = 0.0;
+	var wwOut = 0.0; // how much of it is whitewater (deeper crevices)
+	var wwRelief = 0.0; // relief of the whitewater (m)
+	var wwShadow = 1.0; // sun visibility inside the churn
+	var wwCav = 1.0; // sky visibility in its crevices
+	// surf look near the beach, the default whitecap look offshore
+	let surf = smoothstep( 7.0, 3.0, a.depth ) * shoreSimInside( shoreSimUvOf( xz ) );
+	if ( surf > 0.0 && coverage > 0.04 ) {
+
+		// flow of the water here, from the shore simulation (along the local wave direction)
+		let dir = shoreDirAt( xz ).xy;
+		let speed = a.simState.w;
+		let flow = dir * speed;
+
+		// --- pattern: world-space lace carried by the flow; on steep faces a vertical projection
+		// (along the crest x height) rolling down the face with the roller
+		// (from the normal of the wave itself: steep ripple facets must not switch the projection,
+		// that drew combs of vertical streaks into the foam on flat water and on the swash)
+		let steep = smoothstep( 0.82, 0.5, a.baseNormal.y );
+		let ww = sat( a.fresh * 1.4 );
+		let flat = surfFoamFlowLace( xz, flow, 0.0 );
+		var lace = flat;
+		// lumps of tumbling whitewater (~0.6 m), only where there is whitewater
+		var lumps = 0.5;
+		let tangent = vec2f( - dir.y, dir.x );
+		// (compressed vertically: a front only a metre or two high must not show single lumps as columns)
+		// (the along-crest coordinate warped by low-frequency noise: the 3.5 m lace tile must not repeat as a
+		// row of identical lumps and spikes along the break)
+		let al = dot( xz, tangent );
+		let qv = vec2f( al + sin( al * 0.19 + 0.8 ) * 2.1 + sin( al * 0.47 + 2.9 ) * 0.6, P.y * 2.4 );
+		if ( steep > 0.01 ) {
+			let vert = surfFoamFlowLace( qv, vec2f( 0.0, -1.8 ), 1.0 );
+			lace = mix( flat, vert, steep );
+		}
+		// Churning whitewater is a pile of foam lumps at several scales (tumbling masses ~1.3 m,
+		// clumps ~0.5 m, bubble clusters ~0.2 m): a relief (m) for the normals, sunlit caps and
+		// self-shadowed crevices (a short march toward the sun through the lump field)
+		if ( ww > 0.02 ) {
+			let L = frame.sunDir;
+			let pq = mix( xz, qv, steep );
+			let pflow = mix( flow, vec2f( 0.0, -1.8 ), steep );
+			let big = surfFoamBigAt( pq, pflow );
+			let mid = sqrt( surfFoamFlowLace( pq / 2.2, pflow / 2.2, 3.0 ).x );
+			lumps = big * 0.6 + mid * 0.4;
+			let A = 0.22; // relief of the lumps (m)
+			wwRelief = ( big * A + mid * ( A * 0.45 ) + ( 1.0 - lace.x ) * ( A * 0.12 ) ) * ww;
+			// the sun direction in the pattern's coordinates, and its elevation above the local surface
+			let Lp = mix( L.xz, vec2f( dot( L.xz, tangent ), L.y * 2.4 ), steep );
+			let Ld = Lp / max( length( Lp ), 1e-3 );
+			let NdL = dot( a.normal, L );
+			let tanE = NdL / max( length( L - a.normal * NdL ), 0.05 );
+			var occ = 0.0;
+			let steps = array<f32, 3>( 0.14, 0.34, 0.7 );
+			for ( var i = 0; i < 3; i++ ) {
+				let d = steps[ i ];
+				let hk = surfFoamBigAt( pq + Ld * d, pflow );
+				occ = max( occ, smoothstep( 0.0, 0.05, ( hk - big ) * A - tanE * d ) );
+			}
+			wwShadow = 1.0 - occ * mix( 0.85, 0.7, steep );
+			// crevices between the lumps: occluded from the sky too
+			wwCav = mix( 0.5, 1.0, smoothstep( 0.05, 0.75, lumps ) );
+		}
+
+		// --- whitewater: the aerated mass of a roller / plunge / swash front. Dense and opaque, its
+		// surface boiling: lumps with shaded crevices between them, bubble clusters on each; it only
+		// tears (and shows water through) at its edges.
+		let boil = lace.x * 0.7 + lace.z * 0.3;
+		// (the edge of the churn is torn by its lumps: ragged fingers, not a clean boundary)
+		let wwEdge = smoothstep( 0.25, 0.75, ww * 1.35 - boil * 0.3 - ( 1.0 - lumps ) * 0.5 );
+		let whitewater = ( ww * 0.25 + wwEdge * 0.75 ) * ( ( 1.0 - boil ) * 0.12 + 0.88 );
+
+		// --- foam carried by the water: a lacy web of bubble strands and clusters around holes. With
+		// more foam the strands widen into a mat; as it spreads and thins it tears into filaments.
+		// (w: strand half-width; the pattern covers 6% of the area at w = 0.1, 34% at 0.3, 82% at 0.6)
+		let c = sat( ( a.sim + max( coverage - a.sim - a.fresh, 0.0 ) * 0.5 - 0.05 ) / 0.95 );
+		// hole edges are ragged (bubble clusters), hole sizes vary between patches
+		let w = max( pow( c, 1.4 ) * 0.9 * ( lace.z * 0.5 + 0.75 ) + ( lace.y - 0.5 ) * 0.06, 0.0 );
+		let soft = 0.05 + a.footprint * 4.5;
+		let mat = ( 1.0 - smoothstep( w - soft, w + soft, lace.x ) ) * smoothstep( 0.0, 0.05, c );
+		// scattered bubbles in the holes next to the strands
+		let bub = lace.y * smoothstep( w + 0.25, w, lace.x ) * smoothstep( 0.02, 0.2, c ) * 0.5;
+		// thin foam is translucent and uneven, thick foam is opaque
+		let inner = sat( ( w - lace.x ) / 0.25 );
+		let laceFoam = max( mat * sat( inner * 0.35 + 0.45 + lace.z * 0.3 ), bub );
+
+		// once a lace cell (~0.2 m) covers a few pixels, use the average of the pattern
+		let far = smoothstep( 0.03, 0.12, a.footprint );
+		let average = max( sat( pow( w, 1.45 ) * 1.9 ) * 0.8, ww * 0.95 );
+		let near = max( laceFoam, whitewater );
+		opacity = mix( a.foam, mix( near, average, far ), surf );
+
+		// optical thickness (thin foam is translucent, thick foam scatters like snow) and a relief
+		// height for the lighting: lumpy boiling whitewater, thick foam higher than its thin edges
+		density = max( sat( c * 1.3 ) * ( inner * 0.5 + 0.5 ), ww );
+		let relief = inner * sat( c * 1.5 ) * ( 1.0 - ww );
+		wwOut = ww * ( 1.0 - far * 0.6 );
+		// far away the lumps average out: a mean shadowing of the churn instead
+		wwShadow = mix( wwShadow, 0.82, far );
+		wwCav = mix( wwCav, 0.8, far );
+		wwRelief *= 1.0 - far;
+		height = ( relief + a.bubbles * 0.15 ) * surf * ( 1.0 - far );
 	}
 
-	// Foam radiance: a dense scatterer, wrapped diffuse sun (light diffuses through the bubbles),
-	// sky ambient, darker in the dips of the bubbly relief, glowing at thin edges when backlit.
-	light( { N, L, V, sun, density, height, surf, ww = float( 0 ), relief = float( 0 ), selfShadow = float( 1 ), cavity = float( 1 ) } ) {
+	return SurfFoamInfo( opacity, density, height, surf, wwOut, wwRelief, wwShadow, wwCav );
+}
 
-		// relief normal from the screen-space gradient of the height (Mikkelsen surface gradient): the
-		// thin-foam relief (in units of ~3 cm) plus the whitewater lumps (m)
-		const p = positionWorld;
-		const hN = height.mul( this.bump * 0.04 ).add( relief );
-		const dpdx = dFdx( p ), dpdy = dFdy( p );
-		const dhdx = dFdx( hN ), dhdy = dFdy( hN );
-		const r1 = cross( dpdy, N ), r2 = cross( N, dpdx );
-		const det = dot( dpdx, r1 );
-		const grad = r1.mul( dhdx ).add( r2.mul( dhdy ) ).mul( sign( det ) );
-		const Nf = normalize( N.mul( abs( det ) ).sub( grad ).add( N.mul( 1e-6 ) ) );
-		const NdL = dot( Nf, L );
-		// foam lets light diffuse into it (wrapped lighting); churning whitewater much less so: its sides
-		// facing away from the sun are shaded grey-blue by the sky, its caps sunlit, its crevices in the
-		// shadow of the lumps around them
-		const wrap = mix( float( 0.45 ), float( 0.12 ), ww );
-		const diff = saturate( NdL.mul( float( 1 ).sub( wrap ) ).add( wrap ) ).mul( mix( float( 1 ), selfShadow, ww ) );
-		// dips between the lumps are shaded by the lumps around them (sky occlusion)
-		const ao = mix( mix( float( 1 ), height.mul( 0.3 ).add( 0.76 ), surf ), cavity, ww );
-		// light through thin aerated water (torn edges, thin foam, spray-soaked lips): green-white,
-		// strongly forward scattered
-		const thin = float( 1 ).sub( density ).mul( 0.8 ).add( ww.mul( float( 1 ).sub( cavity ) ).mul( 0.3 ) );
-		const trans = phaseHG( dot( V.negate(), L ), 0.55 ).mul( thin ).mul( 1.3 );
-		const transCol = mix( vec3( 1 ), vec3( 0.6, 0.92, 0.82 ), ww.mul( 0.7 ).add( 0.3 ) );
-		// light bounced around inside the churn (from its sunlit lumps) keeps the shaded foam from going
-		// as dark and as blue as the open sky alone would make it
-		const sky = G.skyIrradiance;
-		const skyGrey = vec3( dot( sky, vec3( 0.2126, 0.7152, 0.0722 ) ) );
-		const amb = mix( sky, skyGrey, ww.mul( 0.35 ) ).mul( ao ).add( sun.mul( ww.mul( 0.05 ) ).mul( ao ) );
-		return sun.mul( diff.mul( mix( float( 1 ), cavity.sqrt(), ww ) ).div( Math.PI ).add( transCol.mul( trans ) ) ).add( amb ).mul( 0.86 );
+// Foam radiance: a dense scatterer, wrapped diffuse sun (light diffuses through the bubbles),
+// sky ambient, darker in the dips of the bubbly relief, glowing at thin edges when backlit.
+fn surfFoamLight( info: SurfFoamInfo, N: vec3f, L: vec3f, V: vec3f, sun: vec3f, P: vec3f ) -> vec3f {
+	let ww = info.ww;
+	let cavity = info.cavity;
+	// relief normal from the screen-space gradient of the height (Mikkelsen surface gradient): the
+	// thin-foam relief (in units of ~3 cm) plus the whitewater lumps (m)
+	let hN = info.height * ${ f( this.bump * 0.04 ) } + info.relief;
+	let dpx = dpdx( P );
+	let dpy = dpdy( P );
+	let dhdx = dpdx( hN );
+	let dhdy = dpdy( hN );
+	let r1 = cross( dpy, N );
+	let r2 = cross( N, dpx );
+	let det = dot( dpx, r1 );
+	let grad = ( r1 * dhdx + r2 * dhdy ) * sign( det );
+	let Nf = normalize( N * abs( det ) - grad + N * 1e-6 );
+	let NdL = dot( Nf, L );
+	// foam lets light diffuse into it (wrapped lighting); churning whitewater much less so: its sides
+	// facing away from the sun are shaded grey-blue by the sky, its caps sunlit, its crevices in the
+	// shadow of the lumps around them
+	let wrap = mix( 0.45, 0.12, ww );
+	let diff = sat( NdL * ( 1.0 - wrap ) + wrap ) * mix( 1.0, info.selfShadow, ww );
+	// dips between the lumps are shaded by the lumps around them (sky occlusion)
+	let ao = mix( mix( 1.0, info.height * 0.3 + 0.76, info.surf ), cavity, ww );
+	// light through thin aerated water (torn edges, thin foam, spray-soaked lips): green-white,
+	// strongly forward scattered
+	let thin = ( 1.0 - info.density ) * 0.8 + ww * ( 1.0 - cavity ) * 0.3;
+	let trans = surfFoamPhaseHG( dot( - V, L ), 0.55 ) * thin * 1.3;
+	let transCol = mix( vec3f( 1.0 ), vec3f( 0.6, 0.92, 0.82 ), ww * 0.7 + 0.3 );
+	// light bounced around inside the churn (from its sunlit lumps) keeps the shaded foam from going
+	// as dark and as blue as the open sky alone would make it
+	let sky = frame.skyIrradiance;
+	let skyGrey = vec3f( dot( sky, vec3f( 0.2126, 0.7152, 0.0722 ) ) );
+	let amb = mix( sky, skyGrey, ww * 0.35 ) * ao + sun * ( ww * 0.05 ) * ao;
+	return ( sun * ( diff * mix( 1.0, sqrt( cavity ), ww ) / PI + transCol * trans ) + amb ) * 0.86;
+}
+`;
 
 	}
+
+	// The former TSL hook ( surface.foamShading = ( args ) => surfFoam.shading( args ) ) is now the WGSL
+	// surfFoamShading( SurfFoamArgs ) / surfFoamLight(); this returns the module that defines them.
+	shading() {
+
+		return this.module;
+
+	}
+
 }

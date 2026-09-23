@@ -1,7 +1,7 @@
-import * as THREE from 'three/webgpu';
-import { vec2, float, max, smoothstep } from 'three/tsl';
-import { CSMShadowNode } from 'three/addons/csm/CSMShadowNode.js';
-import { shadowSplits, configureCascades, SoftCSMShadowNode } from './materials/SunShadowFilter.js';
+import { Vector3, Euler, Color, MathUtils, Mesh } from './engine/index.js';
+import { GPU } from './engine/gpu/GPU.js';
+import { SunShadows } from './engine/render/Shadows.js';
+import { FrameUniforms } from './engine/render/Frame.js';
 
 import { Engine } from './core/Engine.js';
 import { Input } from './core/Input.js';
@@ -61,7 +61,7 @@ import { Vegetation } from './world/Vegetation.js';
 import { SoundScape } from './audio/SoundScape.js';
 import { updateCameraVelocity, useStaticVelocity } from './post/CameraVelocity.js';
 
-const _up = new THREE.Vector3( 0, 1, 0 );
+const _up = new Vector3( 0, 1, 0 );
 
 export class App {
 
@@ -84,7 +84,9 @@ export class App {
 		progress( 0.05, 'Starting WebGPU…' );
 		const engine = this.engine = new Engine( document.getElementById( 'app' ) );
 		await engine.init();
-		const { renderer, scene, camera } = engine;
+		// systems take `renderer` first as in the three.js version: it is the Engine now (GPU access is global)
+		const renderer = engine;
+		const { scene, camera } = engine;
 		// the near clip plane is the lens: it slices the water surface at the waterline (see Underwater)
 		camera.near = 0.1;
 		camera.updateProjectionMatrix();
@@ -92,9 +94,9 @@ export class App {
 		this.scene = scene;
 		this.camera = camera;
 
-		this.input = new Input( renderer.domElement );
-		this.fly = new FlyCamera( camera, renderer.domElement, this.input );
-		this.fly.setPose( new THREE.Vector3( 20, 6, - 20 ), Math.PI * 0.9, - 0.12 );
+		this.input = new Input( engine.domElement );
+		this.fly = new FlyCamera( camera, engine.domElement, this.input );
+		this.fly.setPose( new Vector3( 20, 6, - 20 ), Math.PI * 0.9, - 0.12 );
 
 		// ---------------------------------------------------------------- sky
 		progress( 0.1, 'Building atmosphere…' );
@@ -107,28 +109,12 @@ export class App {
 
 		}
 
-		scene.backgroundNode = this.sky.backgroundNode();
-
-		this.sun = new THREE.DirectionalLight( 0xffffff, 1 );
-		this.sun.castShadow = true;
-		this.sun.shadow.mapSize.set( 2048, 2048 );
-		// depth range of each cascade's shadow camera: light margin (200) + cascade extent. A tight
-		// range keeps the depth bias small in metres (the old 2 km range turned -0.0004 into ~0.8 m:
-		// shadows detached from their casters and read weak)
-		this.sun.shadow.camera.near = 1;
-		this.sun.shadow.camera.far = 1400;
-		this.sun.shadow.bias = - 0.00002;
-		this.sun.shadow.normalBias = 0.04;
-		// shadows from the opaque and the late (transparent-pass) layers; the cascades copy this
-		this.sun.shadow.camera.layers.enable( LAYERS.TRANSPARENT );
 		// 3 cascades: 0-10 m (~1 cm texels, fine contact detail), 10-60 m, 60-400 m (rough far shadows);
-		// contact-hardening filter sized by the sun's disc (SunShadowFilter)
-		this.csm = new SoftCSMShadowNode( this.sun, { cascades: 3, maxFar: 400, mode: 'custom', customSplitsCallback: shadowSplits, lightMargin: 200 } );
-		configureCascades( this.csm );
-		this.csm.fade = true;
-		this.sun.shadow.shadowNode = this.csm;
-		this.sun.layers.enableAll();
-		scene.add( this.sun, this.sun.target );
+		// contact-hardening filter sized by the sun's disc on the near cascade. Each cascade's depth range
+		// is its light margin (200 m) + its extent, which keeps the depth bias small in metres.
+		// Shadows come from the opaque and the late (transparent-pass) layers.
+		this.csm = this.shadows = new SunShadows( { size: 2048, splits: [ 10, 60, 400 ], lightMargin: 200, normalBias: [ 0.015, 0.06, 0.3 ], bias: 0.00002 } );
+		this.shadows.layerMask = ( 1 << LAYERS.OPAQUE ) | ( 1 << LAYERS.TRANSPARENT );
 
 		this.environment = new Environment( renderer, scene, this.sky );
 
@@ -187,15 +173,18 @@ export class App {
 
 			this.shoreSim = new ShoreSim( renderer, { terrainGPU: this.terrainGPU, shore: this.shore } );
 			this.surface.shoreSim = this.shoreSim;
-			this.terrain.wetness = ( xz, h ) => {
-
-				const s = this.shoreSim.sample( xz );
-				const inside = this.shoreSim.inside( this.shoreSim.uvOf( xz ) );
-				// outside the simulated region fall back to a static damp band
-				const band = smoothstep( 0.45, 0.0, h );
-				// foam left on the sand: the lace the water carried, stranded and popping (ShoreSim.sandFoam)
-				return vec2( max( s.y, band.mul( float( 1 ).sub( inside ) ) ), this.shoreSim.sandFoam( xz, s, h ) );
-
+			// WGSL: fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f (x = wetness, y = sand foam)
+			this.terrain.wetness = {
+				modules: [ this.shoreSim.module ],
+				code: /* wgsl */`
+fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
+	let s = shoreSimSample( xz );
+	let inside = shoreSimInside( shoreSimUvOf( xz ) );
+	// outside the simulated region fall back to a static damp band
+	let band = smoothstep( 0.45, 0.0, h );
+	// foam left on the sand: the lace the water carried, stranded and popping (ShoreSim.sandFoam)
+	return vec2f( max( s.y, band * ( 1.0 - inside ) ), shoreSimSandFoam( xz, s, h ) );
+}`,
 			};
 			this.terrain.finalizeMaterial();
 			// surf-zone foam look (whitewater, lace) used by the water shader
@@ -221,7 +210,8 @@ export class App {
 
 		// sunlight bounced off the ground (one diffuse bounce, re-baked with the terrain sun shadow)
 		installGroundBounce( { terrain: this.terrainGPU, clouds: this.clouds } );
-		this.sceneRenderer = new SceneRenderer( renderer, scene, camera );
+		this.sceneRenderer = new SceneRenderer( engine.meshRenderer, scene, camera );
+		if ( this.sky.background ) this.sceneRenderer.background = this.sky.background;
 		// screen-space contact shadows for the sun from last frame's opaque depth (foliage only casts)
 		installContactShadows( { depthTexture: this.sceneRenderer.opaqueCopy.depthTexture, skip: [ this.vegetation && this.vegetation.group, this.boat.group ] } );
 		// lanterns, lamp posts, path lights, lit windows, the boat's cabin / navigation lights and the
@@ -243,7 +233,7 @@ export class App {
 			hullMask: this.sceneRenderer.hullMaskRT.texture, hullMaskActive: this.sceneRenderer.hullMaskActive,
 		} );
 		this.waterMaterial.clouds = this.clouds;
-		this.ocean = new THREE.Mesh( this.oceanLOD.geometry, this.waterMaterial );
+		this.ocean = new Mesh( this.oceanLOD.geometry, this.waterMaterial );
 		this.ocean.frustumCulled = false;
 		this.ocean.receiveShadow = true;
 		this.ocean.layers.set( LAYERS.WATER );
@@ -281,7 +271,7 @@ export class App {
 		} );
 		scene.add( this.breakers.mesh );
 		// dust, pollen, salt aerosol, seed fluff and gnats drifting around the camera
-		this.airMotes = new AirMotes( { terrain: this.terrainGPU, clouds: this.clouds, csm: this.csm, reversedDepth: renderer.reversedDepthBuffer === true } );
+		this.airMotes = new AirMotes( { terrain: this.terrainGPU, clouds: this.clouds, csm: this.csm, reversedDepth: true } );
 		scene.add( this.airMotes.mesh );
 		this.boatCtl = new BoatController( { model: this.boat, query: this.query, terrain: this.terrainData, colliders: this.colliders } );
 		this.boatSpray = new BoatSpray( { boat: this.boatCtl, spray: this.spray } );
@@ -328,14 +318,14 @@ export class App {
 			sky: this.sky, clouds: this.clouds, terrain: this.terrainGPU, csm: this.csm,
 		} );
 		this.post = new PostFX( renderer, { sceneRenderer: this.sceneRenderer, camera, underwater: this.underwater, clouds: this.clouds, sunDir: this.atmosphere.sunDir, haze: this.haze } );
-		renderer.toneMappingExposure = this.settings.exposure;
+		G.exposure.value = this.settings.exposure;
 
 		// ---------------------------------------------------------------- audio
 		// recorded field recordings (public/audio, credits in public/audio/CREDITS.md); ?noAudio turns it off
 		this.audio = qs.has( 'noAudio' ) ? null : new SoundScape();
 		this.player.audio = this.audio;
 		this.boatCtl.onSlam = ( s ) => this.audio && this.audio.hullSlap( s );
-		renderer.domElement.addEventListener( 'click', () => {
+		engine.domElement.addEventListener( 'click', () => {
 
 			if ( window.__ui && window.__ui.isPointerOverUI ) return;
 			this.input.requestLock();
@@ -351,8 +341,6 @@ export class App {
 		this.updateSun();
 		installDebugViews( this );
 		window.__app = this;
-		window.__THREE = THREE;
-		window.__TSL = await import( 'three/tsl' );
 
 		// ---- compile pipelines asynchronously (keeps the page responsive), then prime a few
 		// frames behind the loading screen so any remaining first-use stalls happen there
@@ -362,33 +350,22 @@ export class App {
 		for ( let i = 0; i < 2; i ++ ) {
 
 			this.frame( 1 / 60 );
-			await renderer.backend.device.queue.onSubmittedWorkDone();
+			await GPU.queue.onSubmittedWorkDone();
 
 		}
 
 	}
 
+	// Build every pipeline up front by rendering a frame with the normally hidden effects shown, then
+	// wait for the GPU (keeps first-use pipeline stalls behind the loading screen).
 	async precompile() {
 
-		const { renderer, scene, camera } = this;
-		const target = this.sceneRenderer.sceneRT;
-		renderer.getDrawingBufferSize( this.sceneRenderer._size );
-		this.sceneRenderer.setSize( this.sceneRenderer._size.x, this.sceneRenderer._size.y );
-		const mask = camera.layers.mask;
-		const prev = renderer.getRenderTarget();
-		// compile things that start hidden too (no hitch the first time they appear)
-		const hidden = [ this.marineSnow.mesh, this.airMotes.mesh ].filter( ( m ) => ! m.visible );
+		const hidden = [ this.marineSnow.mesh, this.airMotes.mesh ].filter( ( m ) => m && ! m.visible );
 		for ( const m of hidden ) m.visible = true;
-		renderer.setRenderTarget( target );
-		renderer.setMRT( this.sceneRenderer.mrt );
 		try {
 
-			camera.layers.set( LAYERS.OPAQUE );
-			await renderer.compileAsync( scene, camera );
-			camera.layers.set( LAYERS.WATER );
-			camera.layers.enable( LAYERS.TRANSPARENT );
-			renderer.setMRT( this.sceneRenderer.mrtLate );
-			await renderer.compileAsync( scene, camera );
+			this.frame( 1 / 60 );
+			await GPU.queue.onSubmittedWorkDone();
 
 		} catch ( e ) {
 
@@ -396,55 +373,29 @@ export class App {
 
 		}
 
-		camera.layers.mask = mask;
 		for ( const m of hidden ) m.visible = false;
-		renderer.setMRT( null );
-		renderer.setRenderTarget( prev );
 
 	}
 
 	// ---------------------------------------------------------------- sun / sky
 
-	// Near cascade every frame, the middle one every 2nd and the far one every 4th frame. A cascade's
-	// matrix only changes when its map is rendered, so skipped cascades stay consistent.
-	updateShadowCascades() {
-
-		const lights = this.csm.lights;
-		if ( ! lights || lights.length === 0 ) return;
-		const f = this._shadowFrame = ( this._shadowFrame || 0 ) + 1;
-		const sunMoved = this._lastSunDir ? this._lastSunDir.angleTo( G.sunDir.value ) > 1e-4 : true;
-		( this._lastSunDir || ( this._lastSunDir = new THREE.Vector3() ) ).copy( G.sunDir.value );
-		for ( let i = 0; i < lights.length; i ++ ) {
-
-			const period = i === 0 ? 1 : i === 1 ? 2 : 4;
-			const sh = lights[ i ].shadow;
-			sh.autoUpdate = false;
-			if ( sunMoved || ( f + i ) % period === 0 ) sh.needsUpdate = true;
-
-		}
-
-	}
-
 	updateSun() {
 
 		const s = this.settings;
-		const dir = sunDirectionFromTime( s.timeOfDay ).applyAxisAngle( _up, THREE.MathUtils.degToRad( s.sunAzimuth || 0 ) );
+		const dir = sunDirectionFromTime( s.timeOfDay ).applyAxisAngle( _up, MathUtils.degToRad( s.sunAzimuth || 0 ) );
 		// the sky is always scattered sunlight, even with the sun below the horizon (twilight)
 		this.atmosphere.sunDir.value.copy( dir );
 		// below the horizon the moon takes over as the key light
-		const night = THREE.MathUtils.smoothstep( - dir.y, 0.02, 0.18 );
+		const night = MathUtils.smoothstep( - dir.y, 0.02, 0.18 );
 		G.night.value = night;
 		this.sky.starIntensity.value = night;
-		const moon = new THREE.Vector3( - dir.x, Math.abs( dir.y ) * 0.8 + 0.25, - dir.z ).normalize();
+		const moon = new Vector3( - dir.x, Math.abs( dir.y ) * 0.8 + 0.25, - dir.z ).normalize();
 		this.sky.moonDir.value.copy( moon );
 
 		// key light: the sun until it is well below the horizon (it gives no direct light in
 		// twilight anyway), then the moon
 		const light = dir.y > - 0.07 ? dir : moon;
 		G.sunDir.value.copy( light );
-		// keep the shadow frustum centred on the camera
-		this.sun.target.position.copy( this.camera.position );
-		this.sun.position.copy( this.camera.position ).addScaledVector( light, 400 );
 
 	}
 
@@ -455,13 +406,11 @@ export class App {
 		const sunTrue = a.sunDir.value;
 		const sunUp = sunTrue.y > - 0.07; // same switch as updateSun()
 		const T = a.sunTransmittance;
-		const horizonFade = THREE.MathUtils.smoothstep( sunTrue.y, - 0.03, 0.02 );
+		const horizonFade = MathUtils.smoothstep( sunTrue.y, - 0.03, 0.02 );
 		let c;
-		if ( sunUp ) c = new THREE.Color( T[ 0 ], T[ 1 ], T[ 2 ] ).multiplyScalar( SUN_ILLUMINANCE * horizonFade );
-		else c = new THREE.Color( 0.6, 0.7, 1.0 ).multiplyScalar( 0.12 * G.night.value );
+		if ( sunUp ) c = new Color( T[ 0 ], T[ 1 ], T[ 2 ] ).multiplyScalar( SUN_ILLUMINANCE * horizonFade );
+		else c = new Color( 0.6, 0.7, 1.0 ).multiplyScalar( 0.12 * G.night.value );
 		G.sunColor.value.copy( c );
-		this.sun.color.copy( c );
-		this.sun.intensity = 1;
 		const irr = a.skyIrradiance;
 		const nightAmb = 0.012 * G.night.value;
 		G.skyIrradiance.value.setRGB( irr[ 0 ] + nightAmb * 0.6, irr[ 1 ] + nightAmb * 0.7, irr[ 2 ] + nightAmb );
@@ -501,7 +450,7 @@ export class App {
 		this.freeCam = on;
 		if ( on ) {
 
-			const e = new THREE.Euler().setFromQuaternion( this.camera.quaternion, 'YXZ' );
+			const e = new Euler().setFromQuaternion( this.camera.quaternion, 'YXZ' );
 			this.fly.setPose( this.camera.position.clone(), e.y, e.x );
 			this.fly.velocity.set( 0, 0, 0 );
 
@@ -518,9 +467,9 @@ export class App {
 	dropPlayerAtCamera() {
 
 		const p = this.player, c = this.camera.position;
-		const e = new THREE.Euler().setFromQuaternion( this.camera.quaternion, 'YXZ' );
+		const e = new Euler().setFromQuaternion( this.camera.quaternion, 'YXZ' );
 		p.yaw = e.y;
-		p.pitch = THREE.MathUtils.clamp( e.x, - 1.5, 1.5 );
+		p.pitch = MathUtils.clamp( e.x, - 1.5, 1.5 );
 		p.velocity.set( 0, 0, 0 );
 		const ground = Math.max( this.terrainData.heightAt( c.x, c.z ), this.colliders.groundHeightAt( c.x, c.z, c.y ) );
 		const water = this.cameraWaterHeight ?? 0;
@@ -590,6 +539,8 @@ export class App {
 
 	_frame( dt ) {
 
+		GPU.beginFrame();
+		FrameUniforms.fields.frameIndex.value = GPU.frame;
 		const s = this.settings;
 		this.updateFPS( dt );
 		G.dt.value = dt;
@@ -618,7 +569,6 @@ export class App {
 		if ( this.freeCam ) this.fly.update( dt );
 		else this.player.update( dt );
 		this.updateSun();
-		this.updateShadowCascades();
 
 		this.atmosphere.update( dt, this.camera.position.y );
 		this.applyAtmosphereReadback();
@@ -663,7 +613,7 @@ export class App {
 		this.localLights.update( this.camera, dt );
 
 		// ---- render
-		this.renderer.toneMappingExposure = s.exposure;
+		G.exposure.value = s.exposure;
 		updateCameraVelocity( this.camera );
 		this.post.lens.update( dt, this.camera.position.y < ( this.cameraWaterHeight ?? 0 ) );
 		if ( this.post.flare ) {
@@ -673,12 +623,16 @@ export class App {
 
 		}
 
+		// the post chain sets the TAAU jitter + internal size and writes the camera into the frame
+		// uniforms (setFrameCamera); shadows then render with this frame's sun and camera
 		this.post.beginFrame();
 		this.underwater.updateCamera( this.camera );
+		this.shadows.render( this.scene, this.engine.meshRenderer, this.shadows.update( this.camera, G.sunDir.value ) );
 		this.sceneRenderer.render();
-		if ( this.post.flare ) this.renderer.compute( this.post.flare.kernel );
+		if ( this.post.flare ) this.post.flare.kernel.dispatch( 1 );
 		this.post.render();
 		this.post.endFrame();
+		GPU.submit();
 		this.profiler.update( dt );
 
 		this.updateAudio( dt );
@@ -701,7 +655,7 @@ export class App {
 		let s = this.post.scale;
 		if ( d.ema > target * 1.1 ) s -= 0.05;
 		else if ( d.ema < target * 0.78 ) s += 0.05;
-		s = THREE.MathUtils.clamp( Math.round( s * 20 ) / 20, 0.6, 1 );
+		s = MathUtils.clamp( Math.round( s * 20 ) / 20, 0.6, 1 );
 		if ( s !== this.post.scale ) {
 
 			this.post.setScale( s );
@@ -717,7 +671,7 @@ export class App {
 		if ( ! this.audio || ! this.audio.enabled ) return;
 		const cam = this.camera;
 		const p = cam.position;
-		const f = this._af || ( this._af = { fwd: new THREE.Vector3(), up: new THREE.Vector3() } );
+		const f = this._af || ( this._af = { fwd: new Vector3(), up: new Vector3() } );
 		cam.getWorldDirection( f.fwd );
 		f.up.set( 0, 1, 0 ).applyQuaternion( cam.quaternion );
 		const h = this.cameraWaterHeight ?? 0;

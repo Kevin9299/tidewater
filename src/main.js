@@ -1,4 +1,3 @@
-import './core/TSLPatches.js';
 import { App } from './App.js';
 import { UI } from './ui/UI.js';
 import { AppUI } from './ui/AppUI.js';

@@ -1,14 +1,6 @@
-import * as THREE from 'three/webgpu';
-import {
-	Fn, uniform, float, int, uint, vec2, vec3, vec4, storage, instanceIndex, attribute, If, Loop, max, clamp,
-	saturate, mix, smoothstep, length, normalize, dot, pow, sqrt, abs, select, sin, cos, floor, positionWorld,
-	cameraPosition, varyingProperty, frontFacing, reflect, texture, mrt, fwidth, dFdx, dFdy, cross, sign,
-} from 'three/tsl';
-import { G, GRAVITY } from '../core/Globals.js';
-import { LAYERS } from '../core/SceneRenderer.js';
-import { fresnelDielectric } from './WaterMaterial.js';
-import { staticVelocity } from '../post/CameraVelocity.js';
-import { SPRAY } from '../fx/Spray.js';
+import { Vector3, Sphere, Mesh, BufferGeometry, BufferAttribute } from '../engine/index.js';
+import { StorageBuffer, UniformBlock, ShaderModule, ComputeKernel, Material, commonModule, LAYERS } from '../engine/webgpu.js';
+import { GRAVITY } from '../engine/render/Frame.js';
 import { makeLaceTexture, LACE_TILE } from './SurfFoam.js';
 
 // Plunging breakers along the main beach.
@@ -35,7 +27,36 @@ import { makeLaceTexture, LACE_TILE } from './SurfFoam.js';
 // that grow toward the tip) and blended over the water with premultiplied alpha. Its root lies
 // on the crest of the water surface and fades in there, so there is no visible seam.
 
+//
+// WGSL: this.sprayShadowModule (installed as spray.waveShadow) defines
+//   fn breakersSprayShadow( p: vec3f, tag: f32 ) -> f32
+// Consumes: shore.module (shorePhaseAt, shoreWaveAmp, shoreCrest, shoreShape, shoreBore), the terrain
+// module (terrainHeightAt), fft.module (oceanDisplacement), spray.module (sprayReserve, spraySlot,
+// sprayWrite, sprayRand), sky.module (skyReflectionRadiance), clouds.module (cloudsShadow).
+
 const NV = 20; // profile vertices across the lip (2 on the back of the crest + 18 along the curtain)
+
+const f = ( x ) => {
+
+	const s = String( x );
+	return s.includes( '.' ) || s.includes( 'e' ) ? s : s + '.0';
+
+};
+
+// exact unpolarized dielectric Fresnel (the same as WaterMaterial's fresnelDielectric), cosI > 0, eta = n2/n1
+const fresnelModule = new ShaderModule( {
+	name: 'breakersFresnel',
+	code: /* wgsl */`
+fn breakersFresnel( cosI: f32, eta: f32 ) -> f32 {
+	let c = clamp( cosI, 0.0, 1.0 );
+	let g2 = eta * eta - 1.0 + c * c;
+	let g = sqrt( max( g2, 0.0 ) );
+	let a = ( g - c ) / ( g + c );
+	let b = ( c * ( g + c ) - 1.0 ) / ( c * ( g - c ) + 1.0 );
+	return select( 0.5 * a * a * ( b * b + 1.0 ), 1.0, g2 < 0.0 );
+}
+`,
+} );
 
 export class Breakers {
 
@@ -48,44 +69,97 @@ export class Breakers {
 		this.spray = spray;
 		this.clouds = clouds;
 
-		this.params = {
-			spray: uniform( 1 ).setName( 'brkSpray' ), // emission multiplier
-			sheet: uniform( 1 ).setName( 'brkSheet' ), // lip opacity multiplier
-			emitRange: uniform( 240 ).setName( 'brkEmitRange' ), // no emission beyond this camera distance
-		};
-		this.cameraPos = uniform( new THREE.Vector3() ).setName( 'brkCam' );
+		this.uniforms = new UniformBlock( 'BreakersParams', {
+			cameraPos: [ 'vec3f', new Vector3() ],
+			spray: [ 'f32', 1 ], // emission multiplier
+			sheet: [ 'f32', 1 ], // lip opacity multiplier
+			emitRange: [ 'f32', 240 ], // no emission beyond this camera distance
+			amplitude: [ 'f32', 1 ], // WaterSurface.amplitude (FFT displacement scale), copied each update
+		} );
+		const F = this.uniforms.fields;
+		this.params = { spray: F.spray, sheet: F.sheet, emitRange: F.emitRange };
+		this.cameraPos = F.cameraPos;
 
 		const t0 = performance.now();
 		const st = buildStations( terrainData );
 		this.NS = st.count;
 		this.spacing = st.spacing;
 		this.stationData = st.data;
-		this.stations = storage( new THREE.StorageBufferAttribute( st.data, 4 ), 'vec4', this.NS ).toReadOnly().setName( 'brkStations' );
+		this.stations = new StorageBuffer( { label: 'brkStations', count: Math.max( 1, this.NS ), type: 'vec4f', data: st.data.length ? st.data : new Float32Array( 4 ) } );
 		// per station and slot (wave parity): 3 x vec4
 		//   (root.xyz, b) (back.xyz, H) (dir.xz, trough y, wave id 1..1024 or 0 = none)
-		this.crestAttr = new THREE.StorageBufferAttribute( new Float32Array( this.NS * 2 * 3 * 4 ), 4 );
-		this.crest = storage( this.crestAttr, 'vec4', this.NS * 6 ).setName( 'brkCrest' );
-		this.crestRead = storage( this.crestAttr, 'vec4', this.NS * 6 ).toReadOnly().setName( 'brkCrestR' );
+		this.crest = new StorageBuffer( { label: 'brkCrest', count: Math.max( 1, this.NS * 6 ), type: 'vec4f' } );
+		this.crestRead = { storage: this.crest, access: 'read' };
 		this.setupMs = performance.now() - t0;
+
+		// Sun visibility (0..1) for a spray particle made by one of the crests: in front of the wave with
+		// the sun behind it (a beach view into the sun) the particles below the crest line are in the
+		// shadow of the wave (and of the overhanging lip while it plunges). seedTag: the particle's tag.
+		this.sprayShadowModule = new ShaderModule( {
+			name: 'breakersSprayShadow',
+			deps: [ commonModule ],
+			bindings: { breakersCrest: this.crestRead },
+			code: /* wgsl */`
+fn breakersSprayShadow( p: vec3f, seedTag: f32 ) -> f32 {
+	var out = 1.0;
+	let idx = floor( seedTag ) - 1.0;
+	if ( idx >= 0.0 && idx < ${ f( this.NS * 2 ) } ) {
+		let k = u32( idx ) * 3u;
+		let c0 = breakersCrest[ k ];
+		let c1 = breakersCrest[ k + 1u ];
+		let c2 = breakersCrest[ k + 2u ];
+		let L = frame.sunDir;
+		let d2 = c2.xy;
+		let Ld = dot( L.xz, d2 ); // < 0: the sun is on the sea side of the wave
+		if ( c2.w > 0.5 && Ld < -0.02 ) {
+			let root = c0.xyz;
+			let b = c0.w;
+			let H = c1.w;
+			let q = clamp( b / 0.9, 0.0, 1.0 ) * ( 1.0 - smoothstep( 1.0, 1.3, b ) );
+			// vertical plane through the crest (moved forward under the overhanging lip)
+			let plane = root.xz + d2 * ( H * 0.8 * q * 0.6 );
+			let s = dot( p.xz - plane, d2 ); // > 0: in front of it
+			let tau = s / - Ld;
+			let yRay = p.y + L.y * tau; // height of the ray toward the sun where it crosses the plane
+			let top = root.y + 0.05;
+			let shade = smoothstep( top, top - 0.4, yRay ) * smoothstep( -0.1, 0.1, s ) * smoothstep( 14.0, 6.0, s );
+			out = 1.0 - shade * 0.55;
+		}
+	}
+	return out;
+}
+`,
+		} );
 
 		if ( spray ) {
 
 			// the spray shader asks the crests for the wave's shadow on the particles they made, and the
 			// drops falling back into the water leave foam in the shore simulation
-			spray.waveShadow = ( p, tag ) => this.sprayShadow( p, tag );
+			spray.waveShadow = this.sprayShadowModule;
 			if ( ! spray.shoreSim && surface.shoreSim ) spray.shoreSim = surface.shoreSim;
 
 		}
 
-		this._buildKernel();
-		this._buildMesh();
+		if ( this.NS > 1 ) {
+
+			this._buildKernel();
+			this._buildMesh();
+
+		} else {
+
+			console.warn( 'Breakers: no beach stations found' );
+			this.mesh = new Mesh( new BufferGeometry(), new Material( { name: 'BreakerLip', visible: false } ) );
+			this.mesh.visible = false;
+
+		}
 
 	}
 
 	update( camera ) {
 
 		this.cameraPos.value.copy( camera.position );
-		this.renderer.compute( this.kernel );
+		if ( this.surface && this.surface.amplitude ) this.uniforms.fields.amplitude.value = this.surface.amplitude.value;
+		if ( this.kernel ) this.kernel.dispatch( Math.ceil( this.NS / 64 ) );
 
 	}
 
@@ -93,127 +167,128 @@ export class Breakers {
 
 	_buildKernel() {
 
-		const shore = this.shore;
 		const S = this.surface;
 		const NS = this.NS;
 		const STEP = 2.0, K = 64; // transects: 128 m seaward from the shoreline
 		const fft = S.fft;
-
-		// FFT displacement at a Lagrangian point (the short cascades that survive in the surf zone)
-		const fftDisp = ( p, depth ) => {
-
-			const d = vec3( 0 ).toVar();
-			for ( let c = 1; c < fft.cascades; c ++ ) {
-
-				const L = fft.sizes[ c ];
-				const texel = L / 256;
-				const level = Math.max( Math.log2( 0.35 / texel ) + 0.7, 0 );
-				d.addAssign( texture( fft.displacementTexture, p.div( L ) ).depth( c ).level( level ).xyz.mul( S.cascadeAttenuation( c, depth ) ) );
-
-			}
-
-			return d.mul( S.amplitude );
-
-		};
-
-		this.kernel = Fn( () => {
-
-			const i = instanceIndex;
-			If( i.lessThan( uint( NS ) ), () => {
-
-				const st = this.stations.element( i );
-				const o = st.xy;
-				const n = st.zw; // toward the sea
-				const base = i.mul( 6 );
-				// clear both slots
-				this.crest.element( base.add( 2 ) ).assign( vec4( 0 ) );
-				this.crest.element( base.add( 5 ) ).assign( vec4( 0 ) );
-
-				const sPrev = float( 0 ).toVar();
-				Loop( { start: int( 0 ), end: int( K ), type: 'int', condition: '<' }, ( { i: k } ) => {
-
-					const dist = float( k ).mul( STEP );
-					const s = shore.phaseAt( o.add( n.mul( dist ) ) ).s.toVar();
-					// s grows seaward: a crest (integer phase) lies between this sample and the previous one
-					If( k.greaterThan( int( 0 ) ).and( floor( s ).greaterThan( floor( sPrev ) ) ), () => {
-
-						const m = floor( s ).toVar();
-						// secant refinement on the exact phase
-						const lo = dist.sub( STEP ).toVar(), hi = dist.toVar();
-						const sLo = sPrev.toVar(), sHi = s.toVar();
-						const x = lo.add( m.sub( sLo ).div( max( sHi.sub( sLo ), 1e-5 ) ).mul( STEP ) ).toVar();
-						for ( let it = 0; it < 2; it ++ ) {
-
-							const sx = shore.phaseAt( o.add( n.mul( x ) ) ).s;
-							If( sx.lessThan( m ), () => {
-
-								lo.assign( x );
-								sLo.assign( sx );
-
-							} ).Else( () => {
-
-								hi.assign( x );
-								sHi.assign( sx );
-
-							} );
-							x.assign( lo.add( m.sub( sLo ).div( max( sHi.sub( sLo ), 1e-5 ) ).mul( hi.sub( lo ) ) ) );
-
-						}
-
-						const pc = o.add( n.mul( x ) ).toVar();
-						this._processCrest( i, pc, m, fftDisp );
-
-					} );
-					sPrev.assign( s );
-
-				} );
-
-			} );
-
-		} )().compute( NS, [ 64 ] ).setName( 'Surf Crests' );
-
-	}
-
-	// One crest of wave m at Lagrangian point pc (station i): store the lip frame and emit spray.
-	_processCrest( i, pc, m, fftDisp ) {
-
-		const shore = this.shore;
-		const S = this.surface;
 		const spray = this.spray;
-		const ph = shore.phaseAt( pc );
-		const dir = ph.dir.toVar();
-		const along = ph.along;
-		const ground = S.terrain.heightAt( pc );
-		const depth = G.seaLevel.sub( ground ).toVar();
-		const A = shore.waveAmp( m, along ).toVar();
-		const cr = shore.crestParams( A, depth );
-		const b = cr.b.toVar();
-		const env = smoothstep( 26, 13, depth ).mul( saturate( ph.exposure.mul( 1.4 ) ) ).mul( shore.enabled ).toVar();
 
-		// followed from before it breaks until the bore reaches the shore (the lip sheet only uses b < 1.25)
-		If( b.greaterThan( - 0.6 ).and( env.greaterThan( 0.3 ) ).and( depth.greaterThan( 0.12 ) ), () => {
+		// FFT displacement at a Lagrangian point (the short cascades that survive in the surf zone),
+		// with WaterSurface.cascadeAttenuation (inlined: the long cascades vanish in shallow water)
+		let fftCode = '';
+		for ( let c = 1; c < fft.cascades; c ++ ) {
 
-			const c = sqrt( clamp( depth, 0.3, 25 ).mul( GRAVITY ) );
-			const lam = c.mul( shore.period );
-			const s0 = shore.shape( float( 0 ), A, depth, lam );
-			const ub = float( 0.4 ).div( lam );
-			const s1 = shore.shape( ub, A, depth, lam );
-			const fd = fftDisp( pc, depth ).toVar();
-			const d3 = vec3( dir.x, 0, dir.y );
-			const root = vec3( pc.x, G.seaLevel, pc.y ).add( d3.mul( s0.x.mul( env ) ) ).add( vec3( 0, s0.y.mul( env ), 0 ) ).add( fd ).toVar();
-			const back = vec3( pc.x, G.seaLevel, pc.y ).add( d3.mul( s1.x.mul( env ).sub( 0.4 ) ) ).add( vec3( 0, s1.y.mul( env ), 0 ) ).add( fd );
-			const H = cr.H.mul( env ).toVar();
-			const trough = G.seaLevel.add( cr.trough.mul( env ) ).add( fd.y ).toVar();
-			// slot by wave parity (neighbouring stations agree on it), id = wave index mod 1024, + 1 (0 = none)
-			const slot = uint( m.sub( floor( m.mul( 0.5 ) ).mul( 2 ) ) );
-			const id = m.sub( floor( m.div( 1024 ) ).mul( 1024 ) ).add( 1 );
-			const k = i.mul( 6 ).add( slot.mul( 3 ) );
-			this.crest.element( k ).assign( vec4( root, b ) );
-			this.crest.element( k.add( 1 ) ).assign( vec4( back, H ) );
-			this.crest.element( k.add( 2 ) ).assign( vec4( dir, trough, id ) );
+			const L = fft.sizes[ c ];
+			const texel = L / 256;
+			const level = Math.max( Math.log2( 0.35 / texel ) + 0.7, 0 );
+			const d0 = Math.min( 40, L * 0.08 );
+			const floorAmt = [ 0.0, 0.05, 0.25, 0.5 ][ c ] ?? 0.5;
+			fftCode += `	d += textureSampleLevel( oceanDisplacement, smpLinearRepeat, p / ${ f( L ) }, ${ c }, ${ f( level ) } ).xyz * mix( ${ f( floorAmt ) } * smoothstep( 0.0, 0.6, depth ), 1.0, smoothstep( 0.0, ${ f( d0 ) }, depth ) );\n`;
 
-			if ( spray ) this._emit( i, slot, root, dir, b, H, trough, c, m, depth, shore.boreParams( A, depth ) );
+		}
 
+		const emitCode = spray ? this._emitCode() : '';
+
+		const code = /* wgsl */`
+const BRK_GRAVITY: f32 = ${ f( GRAVITY ) };
+
+fn breakersFftDisp( p: vec2f, depth: f32 ) -> vec3f {
+	var d = vec3f( 0.0 );
+${ fftCode }	return d * breakersP.amplitude;
+}
+
+${ emitCode }
+
+// One crest of wave m at Lagrangian point pc (station i): store the lip frame and emit spray.
+fn breakersProcessCrest( i: u32, pc: vec2f, m: f32 ) {
+	let ph = shorePhaseAt( pc );
+	let dir = ph.dir;
+	let along = ph.along;
+	let ground = terrainHeightAt( pc );
+	let depth = frame.seaLevel - ground;
+	let A = shoreWaveAmp( m, along );
+	let cr = shoreCrest( A, depth ); // ( b, H, trough, lipThrow )
+	let b = cr.x;
+	let env = smoothstep( 26.0, 13.0, depth ) * sat( ph.exposure * 1.4 ) * shoreP.enabled;
+
+	// followed from before it breaks until the bore reaches the shore (the lip sheet only uses b < 1.25)
+	if ( b > -0.6 && env > 0.3 && depth > 0.12 ) {
+		let c = sqrt( clamp( depth, 0.3, 25.0 ) * BRK_GRAVITY );
+		let lam = c * shoreP.period;
+		let s0 = shoreShape( 0.0, A, depth, lam );
+		let ub = 0.4 / lam;
+		let s1 = shoreShape( ub, A, depth, lam );
+		let fd = breakersFftDisp( pc, depth );
+		let d3 = vec3f( dir.x, 0.0, dir.y );
+		let root = vec3f( pc.x, frame.seaLevel, pc.y ) + d3 * ( s0.x * env ) + vec3f( 0.0, s0.y * env, 0.0 ) + fd;
+		let back = vec3f( pc.x, frame.seaLevel, pc.y ) + d3 * ( s1.x * env - 0.4 ) + vec3f( 0.0, s1.y * env, 0.0 ) + fd;
+		let H = cr.y * env;
+		let trough = frame.seaLevel + cr.z * env + fd.y;
+		// slot by wave parity (neighbouring stations agree on it), id = wave index mod 1024, + 1 (0 = none)
+		let slot = u32( m - floor( m * 0.5 ) * 2.0 );
+		let id = m - floor( m / 1024.0 ) * 1024.0 + 1.0;
+		let k = i * 6u + slot * 3u;
+		breakersCrestW[ k ] = vec4f( root, b );
+		breakersCrestW[ k + 1u ] = vec4f( back, H );
+		breakersCrestW[ k + 2u ] = vec4f( dir, trough, id );
+${ spray ? '		breakersEmit( i, slot, root, dir, b, H, trough, c, m, depth, shoreBore( A, depth ) );' : '' }
+	}
+}
+
+@compute @workgroup_size( WG_X, WG_Y, WG_Z )
+fn main( @builtin( global_invocation_id ) gid: vec3u ) {
+	let i = gid.x;
+	if ( i >= ${ NS }u ) { return; }
+	let st = breakersStations[ i ];
+	let o = st.xy;
+	let n = st.zw; // toward the sea
+	let base = i * 6u;
+	// clear both slots
+	breakersCrestW[ base + 2u ] = vec4f( 0.0 );
+	breakersCrestW[ base + 5u ] = vec4f( 0.0 );
+
+	var sPrev = 0.0;
+	for ( var k = 0; k < ${ K }; k++ ) {
+		let dist = f32( k ) * ${ f( STEP ) };
+		let s = shorePhaseAt( o + n * dist ).s;
+		// s grows seaward: a crest (integer phase) lies between this sample and the previous one
+		if ( k > 0 && floor( s ) > floor( sPrev ) ) {
+			let m = floor( s );
+			// secant refinement on the exact phase
+			var lo = dist - ${ f( STEP ) };
+			var hi = dist;
+			var sLo = sPrev;
+			var sHi = s;
+			var x = lo + ( m - sLo ) / max( sHi - sLo, 1e-5 ) * ${ f( STEP ) };
+			for ( var it = 0; it < 2; it++ ) {
+				let sx = shorePhaseAt( o + n * x ).s;
+				if ( sx < m ) {
+					lo = x;
+					sLo = sx;
+				} else {
+					hi = x;
+					sHi = sx;
+				}
+				x = lo + ( m - sLo ) / max( sHi - sLo, 1e-5 ) * ( hi - lo );
+			}
+			let pc = o + n * x;
+			breakersProcessCrest( i, pc, m );
+		}
+		sPrev = s;
+	}
+}
+`;
+
+		this.kernel = new ComputeKernel( {
+			label: 'Surf Crests',
+			modules: [ commonModule, this.shore.module, S.terrain && S.terrain.module, fft.module, spray && spray.module ].filter( Boolean ),
+			bindings: {
+				breakersP: { uniform: this.uniforms },
+				breakersStations: { storage: this.stations, access: 'read' },
+				breakersCrestW: { storage: this.crest, access: 'read_write' },
+			},
+			workgroupSize: [ 64, 1, 1 ],
+			code,
 		} );
 
 	}
@@ -221,196 +296,210 @@ export class Breakers {
 	// Spray from one crest (station i, crest slot `slot`), per frame. Positions and velocities come from
 	// the analytic wave state; rates are per station (0.6 m of crest) and scale with the energy the
 	// breaker releases (~ H^2.5 for the plunge, ~ Hb^2.5 for the roller).
-	_emit( i, slot, root, dir, b, H, trough, c, m, depth, bore ) {
+	_emitCode() {
 
-		const spray = this.spray;
-		const P = this.params;
-		const camFade = smoothstep( P.emitRange, P.emitRange.mul( 0.35 ), length( root.sub( this.cameraPos ) ) );
-		const gain = P.spray.mul( camFade ).mul( G.dt ).toVar();
-		const d3 = vec3( dir.x, 0, dir.y );
-		const tg = vec3( dir.y.negate(), 0, dir.x );
-		const up = vec3( 0, 1, 0 );
-		const Hc = H.clamp( 0.15, 3.0 ).toVar();
-		const E = pow( Hc, 2.5 ).toVar();
-		const Hb = bore.Hb.max( 0 ).toVar();
-		const Eb = pow( Hb.min( 2 ).div( 0.6 ), 2.5 ).toVar();
-		const Wt = bore.Wt;
-		const q = clamp( b.div( 0.9 ), 0, 1 );
-		const Xi = H.mul( 0.8 );
-		const Yi = max( root.y.sub( trough ), 0.05 ).toVar();
-		const seed = i.mul( 7919 ).add( uint( m.sub( floor( m.div( 64 ) ).mul( 64 ) ) ).mul( 31 ) );
-		// integer part: which crest made the particle (its wave shadow, see sprayShadow); fraction: random
-		const tag = float( i.mul( 2 ).add( slot ).add( 1 ) );
-		const offshore = max( dot( G.windDir, dir ).negate(), 0 ).mul( G.windSpeed );
+		return /* wgsl */`
+struct BrkCtx {
+	root: vec3f,
+	d3: vec3f,
+	tg: vec3f,
+	Yi: f32,
+	Wt: f32,
+	wB: f32,
+	trough: f32,
+	xr: f32,
+	Xi: f32,
+	q: f32,
+};
 
-		// ---- stages of the breaker (weights 0..1)
-		const lipShed = smoothstep( 0.5, 0.75, b ).mul( float( 1 ).sub( smoothstep( 0.86, 0.93, b ) ) );
-		// the splash-up is a fast burst (~0.15-0.2 s) as the lip hits the trough; its mist lingers
-		const impact = smoothstep( 0.87, 0.92, b ).mul( float( 1 ).sub( smoothstep( 1.0, 1.14, b ) ) );
-		const haze = smoothstep( 0.9, 1.0, b ).mul( float( 1 ).sub( smoothstep( 1.2, 1.5, b ) ) );
-		const spit = smoothstep( 0.98, 1.08, b ).mul( float( 1 ).sub( smoothstep( 1.15, 1.3, b ) ) );
-		const roller = smoothstep( 1.05, 1.3, b ).mul( smoothstep( 0.06, 0.25, Hb ) );
-		const clash = roller.mul( smoothstep( 0.1, 0.2, depth ) ).mul( smoothstep( 0.7, 0.35, depth ) );
-		const drift = smoothstep( 9, 15, offshore ).mul( smoothstep( - 0.4, 0.1, b ) ).mul( float( 1 ).sub( smoothstep( 0.75, 0.9, b ) ) );
+struct BrkPN { p: vec3f, n: vec3f };
 
-		const count = ( rate, salt ) => uint( floor( rate.mul( gain ).add( spray.rand( seed, salt ) ) ) );
-		const along = ( r ) => tg.mul( r.sub( 0.5 ).mul( this.spacing * 1.15 ) );
-		// the leading edge of the falling lip
-		const tipAt = ( r ) => root.add( d3.mul( Xi.mul( q ).mul( r.mul( 0.12 ).add( 0.88 ) ) ) ).sub( up.mul( Yi.mul( q ).mul( q ) ) );
-		// A point on the front of the wave, on the water surface (the same curve as ShoreWaves' profile:
-		// concave tube face while plunging, convex roller front of the bore), and its outward normal.
-		// s: 0 = crest top .. 1 = foot. Everything the breaker throws starts just outside it.
-		const wB = bore.wBore;
-		const facePoint = ( sp ) => {
+// A point on the front of the wave, on the water surface (the same curve as ShoreWaves' profile:
+// concave tube face while plunging, convex roller front of the bore), and its outward normal.
+// s: 0 = crest top .. 1 = foot. Everything the breaker throws starts just outside it.
+fn breakersFacePoint( C: BrkCtx, sp: f32 ) -> BrkPN {
+	let up = vec3f( 0.0, 1.0, 0.0 );
+	let th = sp * ${ f( Math.PI / 2 ) };
+	let ct = cos( th );
+	let st = sin( th );
+	let fx = mix( 1.0 - ct, st, C.wB );
+	let fy = mix( 1.0 - st, ct, C.wB );
+	let n = normalize( C.d3 * ( C.Yi * mix( ct, st, C.wB ) ) + up * ( C.Wt * mix( st, ct, C.wB ) + 0.02 ) );
+	let p = C.root + C.d3 * ( C.Wt * fx );
+	return BrkPN( vec3f( p.x, C.trough + C.Yi * fy, p.z ), n );
+}
 
-			const th = sp.mul( Math.PI / 2 );
-			const ct = cos( th ), st = sin( th );
-			const fx = mix( float( 1 ).sub( ct ), st, wB ), fy = mix( float( 1 ).sub( st ), ct, wB );
-			const n = normalize( d3.mul( Yi.mul( mix( ct, st, wB ) ) ).add( up.mul( Wt.mul( mix( st, ct, wB ) ).add( 0.02 ) ) ) );
-			return { p: root.add( d3.mul( Wt.mul( fx ) ) ).setY( trough.add( Yi.mul( fy ) ) ), n };
+// the plunge point: in the trough ahead of the face while the tube is open; once the bore front
+// has formed over it, on the lower part of that front
+fn breakersPlunge( C: BrkCtx, r: f32, r2: f32 ) -> BrkPN {
+	let f = breakersFacePoint( C, r2 * 0.45 + 0.55 );
+	let t = C.root + C.d3 * ( C.xr + ( r - 0.5 ) * 0.5 );
+	let inTrough = vec3f( t.x, C.trough + 0.03, t.z );
+	let open = C.xr > C.Wt + 0.1;
+	return BrkPN( select( f.p + f.n * 0.04, inTrough, open ), select( f.n, vec3f( 0.0, 1.0, 0.0 ), open ) );
+}
 
-		};
+// the leading edge of the falling lip
+fn breakersTipAt( C: BrkCtx, r: f32 ) -> vec3f {
+	return C.root + C.d3 * ( C.Xi * C.q * ( r * 0.12 + 0.88 ) ) - vec3f( 0.0, 1.0, 0.0 ) * ( C.Yi * C.q * C.q );
+}
 
-		// the plunge point: in the trough ahead of the face while the tube is open; once the bore front
-		// has formed over it, on the lower part of that front
-		const xr = Xi.sub( bore.Xc ).toVar(); // horizontal distance from the crest top
-		const plunge = ( r, r2 ) => {
+fn breakersAlong( C: BrkCtx, r: f32 ) -> vec3f {
+	return C.tg * ( ( r - 0.5 ) * ${ f( this.spacing * 1.15 ) } );
+}
 
-			const f = facePoint( r2.mul( 0.45 ).add( 0.55 ) );
-			const inTrough = root.add( d3.mul( xr.add( r.sub( 0.5 ).mul( 0.5 ) ) ) ).setY( trough.add( 0.03 ) );
-			const open = xr.greaterThan( Wt.add( 0.1 ) );
-			return { p: select( open, inTrough, f.p.add( f.n.mul( 0.04 ) ) ), n: select( open, up, f.n ) };
+fn breakersCount( rate: f32, gain: f32, seed: u32, salt: u32 ) -> u32 {
+	return u32( floor( rate * gain + sprayRand( seed, salt ) ) );
+}
 
-		};
+fn breakersEmit( i: u32, slot: u32, root: vec3f, dir: vec2f, b: f32, H: f32, trough: f32, c: f32, m: f32, depth: f32, bore: vec4f ) {
+	let camFade = smoothstep( breakersP.emitRange, breakersP.emitRange * 0.35, length( root - breakersP.cameraPos ) );
+	let gain = breakersP.spray * camFade * frame.dt;
+	let d3 = vec3f( dir.x, 0.0, dir.y );
+	let tg = vec3f( - dir.y, 0.0, dir.x );
+	let up = vec3f( 0.0, 1.0, 0.0 );
+	let Hc = clamp( H, 0.15, 3.0 );
+	let E = pow( Hc, 2.5 );
+	let Hb = max( bore.x, 0.0 );
+	let Eb = pow( min( Hb, 2.0 ) / 0.6, 2.5 );
+	let Wt = bore.y;
+	let q = clamp( b / 0.9, 0.0, 1.0 );
+	let Xi = H * 0.8;
+	let Yi = max( root.y - trough, 0.05 );
+	let seed = i * 7919u + u32( m - floor( m / 64.0 ) * 64.0 ) * 31u;
+	// integer part: which crest made the particle (its wave shadow, see sprayShadow); fraction: random
+	let tag = f32( i * 2u + slot + 1u );
+	let offshore = max( - dot( frame.windDir, dir ), 0.0 ) * frame.windSpeed;
+	let wB = bore.w;
+	let xr = Xi - bore.z; // horizontal distance from the crest top
+	let C = BrkCtx( root, d3, tg, Yi, Wt, wB, trough, xr, Xi, q );
 
-		// ---- drops and ligaments (ballistic)
-		const n0 = count( lipShed.mul( 14 ).mul( E ), 1 ).toVar(); // drops off the lip
-		const n1 = n0.add( count( lipShed.mul( 5 ).mul( E ), 2 ) ).toVar(); // ligaments off the lip
-		const n2 = n1.add( count( impact.mul( 520 ).mul( E ), 3 ) ).toVar(); // splash-up drops
-		const n3 = n2.add( count( impact.mul( 90 ).mul( E ), 4 ) ).toVar(); // splash-up ligaments (torn strands)
-		const n4 = n3.add( count( roller.mul( 90 ).mul( Eb ), 5 ) ).toVar(); // roller front (breaks up its silhouette)
-		const n5 = n4.add( count( clash.mul( 40 ).mul( Eb ), 6 ) ).toVar(); // bore / backwash collision
-		const n6 = n5.add( count( drift.mul( 24 ).mul( Hc ), 7 ) ).toVar(); // spindrift
-		spray.emitNode( n6, ( j, ring ) => {
+	// ---- stages of the breaker (weights 0..1)
+	let lipShed = smoothstep( 0.5, 0.75, b ) * ( 1.0 - smoothstep( 0.86, 0.93, b ) );
+	// the splash-up is a fast burst (~0.15-0.2 s) as the lip hits the trough; its mist lingers
+	let impact = smoothstep( 0.87, 0.92, b ) * ( 1.0 - smoothstep( 1.0, 1.14, b ) );
+	let haze = smoothstep( 0.9, 1.0, b ) * ( 1.0 - smoothstep( 1.2, 1.5, b ) );
+	let spit = smoothstep( 0.98, 1.08, b ) * ( 1.0 - smoothstep( 1.15, 1.3, b ) );
+	let roller = smoothstep( 1.05, 1.3, b ) * smoothstep( 0.06, 0.25, Hb );
+	let clash = roller * smoothstep( 0.1, 0.2, depth ) * smoothstep( 0.7, 0.35, depth );
+	let drift = smoothstep( 9.0, 15.0, offshore ) * smoothstep( -0.4, 0.1, b ) * ( 1.0 - smoothstep( 0.75, 0.9, b ) );
 
-			const h = seed.add( j.mul( 13 ) );
-			const r0 = spray.rand( h, 11 ), r1 = spray.rand( h, 12 ), r2 = spray.rand( h, 13 ), r3 = spray.rand( h, 14 ), r4 = spray.rand( h, 15 );
-			const isLip = j.lessThan( n1 ), isImp = j.lessThan( n3 ), isRol = j.lessThan( n4 ), isCl = j.lessThan( n5 );
-			const lig = j.greaterThanEqual( n0 ).and( j.lessThan( n1 ) ).or( j.greaterThanEqual( n2 ).and( j.lessThan( n3 ) ) );
+	// ---- drops and ligaments (ballistic)
+	let n0 = breakersCount( lipShed * 14.0 * E, gain, seed, 1u ); // drops off the lip
+	let n1 = n0 + breakersCount( lipShed * 5.0 * E, gain, seed, 2u ); // ligaments off the lip
+	let n2 = n1 + breakersCount( impact * 520.0 * E, gain, seed, 3u ); // splash-up drops
+	let n3 = n2 + breakersCount( impact * 90.0 * E, gain, seed, 4u ); // splash-up ligaments (torn strands)
+	let n4 = n3 + breakersCount( roller * 90.0 * Eb, gain, seed, 5u ); // roller front (breaks up its silhouette)
+	let n5 = n4 + breakersCount( clash * 40.0 * Eb, gain, seed, 6u ); // bore / backwash collision
+	let n6 = n5 + breakersCount( drift * 24.0 * Hc, gain, seed, 7u ); // spindrift
+	if ( n6 > 0u ) {
+		let base = sprayReserve( n6 );
+		for ( var j = 0u; j < n6; j++ ) {
+			let ring = spraySlot( base, j );
+			let h = seed + j * 13u;
+			let r0 = sprayRand( h, 11u );
+			let r1 = sprayRand( h, 12u );
+			let r2 = sprayRand( h, 13u );
+			let r3 = sprayRand( h, 14u );
+			let r4 = sprayRand( h, 15u );
+			let isLip = j < n1;
+			let isImp = j < n3;
+			let isRol = j < n4;
+			let isCl = j < n5;
+			let lig = ( j >= n0 && j < n1 ) || ( j >= n2 && j < n3 );
 			// lip: moving with the jet (thrown forward a little faster than the wave, falling)
-			const vLip = d3.mul( c.mul( r2.mul( 0.2 ).add( 1.05 ) ) ).sub( up.mul( q.mul( sqrt( Yi.mul( 2 * GRAVITY ) ) ).mul( r3.mul( 0.3 ).add( 0.7 ) ) ) ).add( tg.mul( r4.sub( 0.5 ).mul( 0.6 ) ) );
+			let vLip = d3 * ( c * ( r2 * 0.2 + 1.05 ) ) - up * ( q * sqrt( Yi * ${ f( 2 * GRAVITY ) } ) * ( r3 * 0.3 + 0.7 ) ) + tg * ( ( r4 - 0.5 ) * 0.6 );
 			// splash-up: most drops stay low, some reach ~1.3 H; thrown up and forward, out of the surface
-			const pl = plunge( r1, r2 );
-			const vUp = sqrt( Hc.mul( r3.mul( r3 ).mul( 1.0 ).add( 0.3 ) ).mul( 2 * GRAVITY ) );
-			const vImp = up.mul( vUp ).add( pl.n.mul( r4.mul( 1.5 ) ) ).add( d3.mul( c.mul( r2.mul( 0.6 ).add( 0.15 ) ).sub( 0.3 ) ) ).add( tg.mul( r4.sub( 0.5 ).mul( 2.0 ) ) );
+			let pl = breakersPlunge( C, r1, r2 );
+			let vUp = sqrt( Hc * ( r3 * r3 * 1.0 + 0.3 ) * ${ f( 2 * GRAVITY ) } );
+			let vImp = up * vUp + pl.n * ( r4 * 1.5 ) + d3 * ( c * ( r2 * 0.6 + 0.15 ) - 0.3 ) + tg * ( ( r4 - 0.5 ) * 2.0 );
 			// roller: tossed forward and up by the tumbling front (from its upper part)
-			const fr = facePoint( r1.mul( r1 ).mul( 0.7 ) ); // mostly from the tumbling top
-			const vRol = d3.mul( c.mul( r2.mul( 0.3 ).add( 0.95 ) ) ).add( up.mul( r3.mul( 1.6 ).add( 0.6 ).mul( sqrt( Hb.div( 0.5 ) ) ) ) ).add( fr.n.mul( 0.5 ) ).add( tg.mul( r4.sub( 0.5 ).mul( 1.2 ) ) );
+			let fr = breakersFacePoint( C, r1 * r1 * 0.7 ); // mostly from the tumbling top
+			let vRol = d3 * ( c * ( r2 * 0.3 + 0.95 ) ) + up * ( ( r3 * 1.6 + 0.6 ) * sqrt( Hb / 0.5 ) ) + fr.n * 0.5 + tg * ( ( r4 - 0.5 ) * 1.2 );
 			// bore running into the backwash: thrown straight up from its front
-			const fc = facePoint( r1.mul( 0.5 ).add( 0.3 ) );
-			const vCl = up.mul( r3.mul( 1.6 ).add( 0.8 ).mul( sqrt( Hb.div( 0.4 ) ) ) ).add( d3.mul( r2.mul( 2 ).sub( 0.6 ) ) ).add( tg.mul( r4.sub( 0.5 ).mul( 1.5 ) ) );
+			let fc = breakersFacePoint( C, r1 * 0.5 + 0.3 );
+			let vCl = up * ( ( r3 * 1.6 + 0.8 ) * sqrt( Hb / 0.4 ) ) + d3 * ( r2 * 2.0 - 0.6 ) + tg * ( ( r4 - 0.5 ) * 1.5 );
 			// spindrift: fine drops blown back over the crest
-			const vDr = d3.mul( offshore.mul( r2.mul( 0.3 ).add( 0.35 ) ).negate() ).add( up.mul( r3.mul( 1.5 ).add( 0.8 ) ) ).add( tg.mul( r4.sub( 0.5 ).mul( 0.5 ) ) );
-			const p = select( isLip, tipAt( r1 ), select( isImp, pl.p, select( isRol, fr.p.add( fr.n.mul( 0.03 ) ), select( isCl, fc.p.add( fc.n.mul( 0.03 ) ), root.add( up.mul( 0.04 ) ) ) ) ) ).add( along( r0 ) );
-			const v = select( isLip, vLip, select( isImp, vImp, select( isRol, vRol, select( isCl, vCl, vDr ) ) ) );
+			let vDr = d3 * ( - ( offshore * ( r2 * 0.3 + 0.35 ) ) ) + up * ( r3 * 1.5 + 0.8 ) + tg * ( ( r4 - 0.5 ) * 0.5 );
+			let p = select( select( select( select( root + up * 0.04, fc.p + fc.n * 0.03, isCl ), fr.p + fr.n * 0.03, isRol ), pl.p, isImp ), breakersTipAt( C, r1 ), isLip ) + breakersAlong( C, r0 );
+			let v = select( select( select( select( vDr, vCl, isCl ), vRol, isRol ), vImp, isImp ), vLip, isLip );
 			// radius (m): drops of a few mm (smaller off the roller, finest in the spindrift), ligaments ~1-2 cm
 			// heavy-tailed drop sizes (many fine drops, a few big ones): r = r0 (1 - u)^-0.7
-			const tail = pow( float( 1 ).sub( r4.mul( 0.98 ) ), - 0.7 );
-			const rDrop = select( isImp.or( isCl ), float( 0.001 ), select( isRol, float( 0.0008 ), select( isLip, float( 0.001 ), float( 0.0005 ) ) ) ).mul( tail ).min( 0.012 );
-			const rLig = float( 0.005 ).add( r4.mul( r4 ).mul( select( isImp, float( 0.016 ), float( 0.008 ) ) ) );
-			const kind = select( lig, float( SPRAY.LIGAMENT ), float( SPRAY.DROPLET ) );
-			spray.writeNode( ring, p, v, select( lig, rLig, rDrop ), kind, float( 2.5 ), tag.add( r0.mul( 0.999 ) ) );
-
-		} );
-
-		// ---- dense spray (clouds of drops: the white of the splash-up), a puff out of the barrel
-		const c0 = count( impact.mul( 110 ).mul( E ), 21 ).toVar();
-		const c1 = c0.add( count( spit.mul( 10 ).mul( E ), 22 ) ).toVar();
-		const c2 = c1.add( count( roller.mul( 0.6 ).mul( Eb ), 23 ) ).toVar(); // (rare: a row of them reads as cotton puffs)
-		const c3 = c2.add( count( clash.mul( 2 ).mul( Eb ), 24 ) ).toVar();
-		spray.emitNode( c3, ( j, ring ) => {
-
-			const h = seed.add( j.mul( 29 ) );
-			const r0 = spray.rand( h, 41 ), r1 = spray.rand( h, 42 ), r2 = spray.rand( h, 43 ), r3 = spray.rand( h, 44 );
-			const isImp = j.lessThan( c0 ), isSpit = j.lessThan( c1 ), isRol = j.lessThan( c2 );
-			// torn sheets of the splash-up (half-width): many small ones, a few big
-			const sz = select( isImp, sqrt( Hc ).mul( r2.mul( r2 ).mul( 0.14 ).add( 0.08 ) ), select( isSpit, sqrt( Hc ).mul( 0.14 ), select( isRol, sqrt( Hb.div( 0.5 ) ).mul( r2.mul( 0.04 ).add( 0.05 ) ), float( 0.08 ) ) ) ).toVar();
-			// splash-up: sheets thrown up and forward out of the plunge line, rising up to ~1.3 H and
-			// falling back as curtains
-			const pl = plunge( r1, r3 );
-			const pImp = pl.p.add( pl.n.mul( sz.mul( 0.4 ) ) ).add( up.mul( r2.mul( Hc ).mul( 0.1 ) ) );
-			const vImp = up.mul( sqrt( Hc.mul( r3.mul( r3 ).mul( 0.95 ).add( 0.35 ) ).mul( 2 * GRAVITY ) ) ).add( pl.n.mul( 0.8 ) ).add( d3.mul( c.mul( r2.mul( 0.5 ).add( 0.2 ) ) ) ).add( tg.mul( r1.sub( 0.5 ).mul( 1.2 ) ) );
-			// the puff blown out of the collapsing barrel: out of the middle of the front, along the crest
-			const fs = facePoint( r1.mul( 0.3 ).add( 0.35 ) );
-			const pSpit = fs.p.add( fs.n.mul( sz.mul( 0.5 ) ) );
-			const vSpit = d3.mul( c.mul( 0.7 ) ).add( fs.n.mul( 1.2 ) ).add( tg.mul( r1.sub( 0.5 ).mul( 4 ) ) );
-			// the tumbling top of the roller
-			const fr = facePoint( r1.mul( 0.4 ) );
-			const pRol = fr.p.add( fr.n.mul( sz.mul( 0.4 ) ) );
-			const vRol = d3.mul( c.mul( 0.85 ) ).add( up.mul( r3.mul( 0.5 ).add( 0.3 ) ) );
-			const fc = facePoint( r1.mul( 0.5 ).add( 0.3 ) );
-			const pCl = fc.p.add( fc.n.mul( sz.mul( 0.5 ) ) );
-			const vCl = up.mul( r3.mul( 1.2 ).add( 0.8 ).mul( sqrt( Hb.div( 0.4 ) ) ) ).add( d3.mul( r2.sub( 0.3 ) ) );
-			const p = select( isImp, pImp, select( isSpit, pSpit, select( isRol, pRol, pCl ) ) ).add( along( r0 ) );
-			const v = select( isImp, vImp, select( isSpit, vSpit, select( isRol, vRol, vCl ) ) );
-			const life = select( isImp, r3.mul( 0.5 ).add( 1.0 ), select( isSpit, float( 0.9 ), r3.mul( 0.3 ).add( 0.5 ) ) );
-			spray.writeNode( ring, p, v, sz, SPRAY.SPRAY, life, tag.add( r0.mul( 0.999 ) ) );
-
-		} );
-
-		// ---- mist: the fine spray that drifts off with the wind (and the air pushed by the wave)
-		// (few, large, faint sprites: mist is the biggest overdraw of the spray)
-		const m0 = count( haze.mul( 5 ).mul( E ).add( spit.mul( 3 ).mul( E ) ), 31 ).toVar();
-		const m1 = m0.add( count( roller.mul( 2.5 ).mul( Eb ), 32 ) ).toVar();
-		spray.emitNode( m1, ( j, ring ) => {
-
-			const h = seed.add( j.mul( 17 ) );
-			const r0 = spray.rand( h, 51 ), r1 = spray.rand( h, 52 ), r2 = spray.rand( h, 53 ), r3 = spray.rand( h, 54 );
-			const isImp = j.lessThan( m0 );
-			const pl = plunge( r1, r3 );
-			const ft = facePoint( r1.mul( 0.3 ) );
-			const p = select( isImp, pl.p.add( pl.n.mul( 0.2 ) ).add( up.mul( r2.mul( Hc ).mul( 0.4 ) ) ), ft.p.add( ft.n.mul( 0.15 ) ) ).add( along( r0 ) );
-			const v = select( isImp, d3.mul( c.mul( r1.mul( 0.3 ).add( 0.4 ) ) ).add( up.mul( r3.mul( 0.9 ).add( 0.4 ) ) ), d3.mul( c.mul( 0.8 ) ).add( up.mul( 0.2 ) ) );
-			const size = select( isImp, sqrt( Hc ).mul( r3.mul( 0.3 ).add( 0.45 ) ), r3.mul( 0.15 ).add( 0.3 ) );
-			const life = select( isImp, r3.mul( 1.5 ).add( 2.5 ), r3.mul( 1.0 ).add( 1.5 ) );
-			spray.writeNode( ring, p, v, size, SPRAY.MIST, life, tag.add( r0.mul( 0.999 ) ) );
-
-		} );
-
+			let tail = pow( 1.0 - r4 * 0.98, -0.7 );
+			let rDrop = min( select( select( select( 0.0005, 0.001, isLip ), 0.0008, isRol ), 0.001, isImp || isCl ) * tail, 0.012 );
+			let rLig = 0.005 + r4 * r4 * select( 0.008, 0.016, isImp );
+			let kind = select( SPRAY_DROPLET, SPRAY_LIGAMENT, lig );
+			sprayWrite( ring, p, v, select( rDrop, rLig, lig ), kind, 2.5, tag + r0 * 0.999 );
+		}
 	}
 
-	// Sun visibility (0..1) for a spray particle made by one of the crests: in front of the wave with
-	// the sun behind it (a beach view into the sun) the particles below the crest line are in the
-	// shadow of the wave (and of the overhanging lip while it plunges). seedTag: the particle's tag.
-	sprayShadow( p, seedTag ) {
+	// ---- dense spray (clouds of drops: the white of the splash-up), a puff out of the barrel
+	let c0 = breakersCount( impact * 110.0 * E, gain, seed, 21u );
+	let c1 = c0 + breakersCount( spit * 10.0 * E, gain, seed, 22u );
+	let c2 = c1 + breakersCount( roller * 0.6 * Eb, gain, seed, 23u ); // (rare: a row of them reads as cotton puffs)
+	let c3 = c2 + breakersCount( clash * 2.0 * Eb, gain, seed, 24u );
+	if ( c3 > 0u ) {
+		let base = sprayReserve( c3 );
+		for ( var j = 0u; j < c3; j++ ) {
+			let ring = spraySlot( base, j );
+			let h = seed + j * 29u;
+			let r0 = sprayRand( h, 41u );
+			let r1 = sprayRand( h, 42u );
+			let r2 = sprayRand( h, 43u );
+			let r3 = sprayRand( h, 44u );
+			let isImp = j < c0;
+			let isSpit = j < c1;
+			let isRol = j < c2;
+			// torn sheets of the splash-up (half-width): many small ones, a few big
+			let sz = select( select( select( 0.08, sqrt( Hb / 0.5 ) * ( r2 * 0.04 + 0.05 ), isRol ), sqrt( Hc ) * 0.14, isSpit ), sqrt( Hc ) * ( r2 * r2 * 0.14 + 0.08 ), isImp );
+			// splash-up: sheets thrown up and forward out of the plunge line, rising up to ~1.3 H and
+			// falling back as curtains
+			let pl = breakersPlunge( C, r1, r3 );
+			let pImp = pl.p + pl.n * ( sz * 0.4 ) + up * ( r2 * Hc * 0.1 );
+			let vImp = up * sqrt( Hc * ( r3 * r3 * 0.95 + 0.35 ) * ${ f( 2 * GRAVITY ) } ) + pl.n * 0.8 + d3 * ( c * ( r2 * 0.5 + 0.2 ) ) + tg * ( ( r1 - 0.5 ) * 1.2 );
+			// the puff blown out of the collapsing barrel: out of the middle of the front, along the crest
+			let fs = breakersFacePoint( C, r1 * 0.3 + 0.35 );
+			let pSpit = fs.p + fs.n * ( sz * 0.5 );
+			let vSpit = d3 * ( c * 0.7 ) + fs.n * 1.2 + tg * ( ( r1 - 0.5 ) * 4.0 );
+			// the tumbling top of the roller
+			let fr = breakersFacePoint( C, r1 * 0.4 );
+			let pRol = fr.p + fr.n * ( sz * 0.4 );
+			let vRol = d3 * ( c * 0.85 ) + up * ( r3 * 0.5 + 0.3 );
+			let fc = breakersFacePoint( C, r1 * 0.5 + 0.3 );
+			let pCl = fc.p + fc.n * ( sz * 0.5 );
+			let vCl = up * ( ( r3 * 1.2 + 0.8 ) * sqrt( Hb / 0.4 ) ) + d3 * ( r2 - 0.3 );
+			let p = select( select( select( pCl, pRol, isRol ), pSpit, isSpit ), pImp, isImp ) + breakersAlong( C, r0 );
+			let v = select( select( select( vCl, vRol, isRol ), vSpit, isSpit ), vImp, isImp );
+			let life = select( select( r3 * 0.3 + 0.5, 0.9, isSpit ), r3 * 0.5 + 1.0, isImp );
+			sprayWrite( ring, p, v, sz, SPRAY_SPRAY, life, tag + r0 * 0.999 );
+		}
+	}
 
-		const C = this.crestRead;
-		const out = float( 1 ).toVar();
-		const idx = floor( seedTag ).sub( 1 );
-		If( idx.greaterThanEqual( 0 ).and( idx.lessThan( this.NS * 2 ) ), () => {
-
-			const k = uint( idx ).mul( 3 );
-			const c0 = C.element( k ), c1 = C.element( k.add( 1 ) ), c2 = C.element( k.add( 2 ) );
-			const L = G.sunDir;
-			const d2 = c2.xy;
-			const Ld = dot( L.xz, d2 ); // < 0: the sun is on the sea side of the wave
-			If( c2.w.greaterThan( 0.5 ).and( Ld.lessThan( - 0.02 ) ), () => {
-
-				const root = c0.xyz, b = c0.w, H = c1.w;
-				const q = clamp( b.div( 0.9 ), 0, 1 ).mul( float( 1 ).sub( smoothstep( 1.0, 1.3, b ) ) );
-				// vertical plane through the crest (moved forward under the overhanging lip)
-				const plane = root.xz.add( d2.mul( H.mul( 0.8 ).mul( q ).mul( 0.6 ) ) );
-				const s = dot( p.xz.sub( plane ), d2 ); // > 0: in front of it
-				const tau = s.div( Ld.negate() );
-				const yRay = p.y.add( L.y.mul( tau ) ); // height of the ray toward the sun where it crosses the plane
-				const top = root.y.add( 0.05 );
-				const shade = smoothstep( top, top.sub( 0.4 ), yRay ).mul( smoothstep( - 0.1, 0.1, s ) ).mul( smoothstep( 14, 6, s ) );
-				out.assign( float( 1 ).sub( shade.mul( 0.55 ) ) );
-
-			} );
-
-		} );
-		return out;
+	// ---- mist: the fine spray that drifts off with the wind (and the air pushed by the wave)
+	// (few, large, faint sprites: mist is the biggest overdraw of the spray)
+	let m0 = breakersCount( haze * 5.0 * E + spit * 3.0 * E, gain, seed, 31u );
+	let m1 = m0 + breakersCount( roller * 2.5 * Eb, gain, seed, 32u );
+	if ( m1 > 0u ) {
+		let base = sprayReserve( m1 );
+		for ( var j = 0u; j < m1; j++ ) {
+			let ring = spraySlot( base, j );
+			let h = seed + j * 17u;
+			let r0 = sprayRand( h, 51u );
+			let r1 = sprayRand( h, 52u );
+			let r2 = sprayRand( h, 53u );
+			let r3 = sprayRand( h, 54u );
+			let isImp = j < m0;
+			let pl = breakersPlunge( C, r1, r3 );
+			let ft = breakersFacePoint( C, r1 * 0.3 );
+			let p = select( ft.p + ft.n * 0.15, pl.p + pl.n * 0.2 + up * ( r2 * Hc * 0.4 ), isImp ) + breakersAlong( C, r0 );
+			let v = select( d3 * ( c * 0.8 ) + up * 0.2, d3 * ( c * ( r1 * 0.3 + 0.4 ) ) + up * ( r3 * 0.9 + 0.4 ), isImp );
+			let size = select( r3 * 0.15 + 0.3, sqrt( Hc ) * ( r3 * 0.3 + 0.45 ), isImp );
+			let life = select( r3 * 1.0 + 1.5, r3 * 1.5 + 2.5, isImp );
+			sprayWrite( ring, p, v, size, SPRAY_MIST, life, tag + r0 * 0.999 );
+		}
+	}
+}
+`;
 
 	}
 
@@ -445,179 +534,195 @@ export class Breakers {
 
 		}
 
-		const geo = new THREE.BufferGeometry();
-		geo.setAttribute( 'position', new THREE.BufferAttribute( pos, 3 ) );
-		geo.setAttribute( 'sheetId', new THREE.BufferAttribute( ids, 4 ) );
-		geo.setIndex( new THREE.BufferAttribute( index, 1 ) );
-		geo.boundingSphere = new THREE.Sphere( new THREE.Vector3(), 1e7 );
+		const geo = new BufferGeometry();
+		geo.setAttribute( 'position', new BufferAttribute( pos, 3 ) );
+		geo.setAttribute( 'sheetId', new BufferAttribute( ids, 4 ) );
+		geo.setIndex( new BufferAttribute( index, 1 ) );
+		geo.boundingSphere = new Sphere( new Vector3(), 1e7 );
 
-		const mat = new THREE.NodeMaterial();
-		mat.name = 'BreakerLip';
-		mat.transparent = true;
-		mat.depthWrite = false;
-		mat.depthTest = true;
-		mat.side = THREE.DoubleSide;
-		mat.forceSinglePass = true;
-		mat.blending = THREE.CustomBlending;
-		mat.blendEquation = THREE.AddEquation;
-		mat.blendSrc = THREE.OneFactor;
-		mat.blendDst = THREE.OneMinusSrcAlphaFactor;
-		mat.blendSrcAlpha = THREE.OneFactor;
-		mat.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
-		mat.lights = false;
-		mat.fog = false;
-
-		const vN = varyingProperty( 'vec3', 'vLipN' );
-		const vLip = varyingProperty( 'vec4', 'vLip' ); // v, b, along, curtain length
-		const vFade = varyingProperty( 'float', 'vLipFade' );
-		const C = this.crestRead;
 		const spacing = this.spacing;
-
-		mat.positionNode = Fn( () => {
-
-			const id = attribute( 'sheetId', 'vec4' );
-			const seg = uint( id.x ), slot = uint( id.y ), side = uint( id.z );
-			const k = id.w;
-			const st = seg.add( side );
-			const ot = seg.add( uint( 1 ).sub( side ) );
-			const e = st.mul( 6 ).add( slot.mul( 3 ) );
-			const eo = ot.mul( 6 ).add( slot.mul( 3 ) );
-			const c0 = C.element( e ), c1 = C.element( e.add( 1 ) ), c2 = C.element( e.add( 2 ) );
-			const mOther = C.element( eo.add( 2 ) ).w;
-			// (the crests are followed until the bore reaches the shore; the sheet is gone after the plunge)
-			const valid = c2.w.greaterThan( 0.5 ).and( abs( mOther.sub( c2.w ) ).lessThan( 0.5 ) ).and( c0.w.lessThan( 1.25 ) );
-
-			const root = c0.xyz, b = c0.w, back = c1.xyz, H = c1.w;
-			const d3 = vec3( c2.x, 0, c2.y );
-			const trough = c2.z;
-			const q = clamp( b.div( 0.9 ), 0, 1.35 );
-			const Xi = max( H.mul( 0.8 ), 0.05 );
-			const Yi = max( root.y.sub( trough ), 0.05 );
-			// profile parameter: k = 0, 1 on the back of the crest (-1, -0.45), then 0..1 along the curtain
-			const v = select( k.lessThan( 0.5 ), float( - 1 ), select( k.lessThan( 1.5 ), float( - 0.45 ), k.sub( 2 ).div( NV - 3 ) ) );
-			const xl = Xi.mul( q ).mul( max( v, 0 ) );
-			const f = xl.div( Xi );
-			const yl = Yi.negate().mul( f.mul( f ) ); // ballistic: the jet leaves the crest horizontally
-			const onLip = root.add( d3.mul( xl ) ).add( vec3( 0, yl, 0 ) );
-			const onCap = mix( root, back, v.negate().max( 0 ) ).add( vec3( 0, 0.012, 0 ) );
-			const P = select( v.lessThan( 0 ), onCap, onLip );
-			// outward normal of the curtain (upper surface of the lip)
-			const slope = Yi.mul( 2 ).mul( xl ).div( Xi.mul( Xi ) );
-			vN.assign( normalize( vec3( 0, 1, 0 ).add( d3.mul( slope ) ) ) );
-			vLip.assign( vec4( v, b, float( st ).mul( spacing ), Xi.mul( q ).add( Yi.mul( q ).mul( q ) ) ) ); // w: curtain length (m)
-			// the cap fades in over the crest; the whole lip fades out once it has become whitewater
-			const capA = smoothstep( - 1, - 0.1, v );
-			// once the jet has re-entered the water the curtain is gone (the splash and the roller take over)
-			vFade.assign( capA.mul( smoothstep( 0.02, 0.12, q ) ).mul( float( 1 ).sub( smoothstep( 1.0, 1.2, b ) ) ) );
-			return select( valid, P, vec3( 0, - 1e5, 0 ) );
-
-		} )();
-
-		const sky = this.sky;
 		const lace = makeLaceTexture();
-		const fragment = Fn( () => {
+		const lipModule = new ShaderModule( {
+			name: 'breakersLip',
+			deps: [ commonModule, fresnelModule, this.sky && this.sky.module, this.clouds && this.clouds.module ],
+			code: /* wgsl */`
+const BRK_LACE_TILE: f32 = ${ f( LACE_TILE ) };
+const BRK_NV: f32 = ${ f( NV ) };
+`,
+		} );
 
-			const v = vLip.x, b = vLip.y, a = vLip.z, len = vLip.w;
-			const pos = positionWorld;
-			const V = normalize( cameraPosition.sub( pos ) ).toVar();
-			const Nw = normalize( vN );
-			const N0 = select( frontFacing, Nw, Nw.negate() ).toVar();
-			// The water of the jet is stretched along the flow: streaks and ripples running down the
-			// curtain (the lace pattern stretched ~8x along the jet and moving with it) in its surface
-			// (normal, from the screen-space gradient of a small relief) and in its thickness
-			const flowS = v.mul( len ).sub( G.time.mul( 1.1 ) );
-			// along-crest coordinate warped by low-frequency noise (three incommensurate scales, slope kept
-			// below 1 so it never folds): the streak spacing drifts along the crest, no fixed period, and the
-			// tiles of every pattern below never line up into a comb
-			const aw = a.add( sin( a.mul( 0.23 ).add( 1.7 ) ).mul( 1.6 ) ).add( sin( a.mul( 0.61 ).add( 4.2 ) ).mul( 0.4 ) ).add( sin( a.mul( 1.37 ).add( 0.4 ) ).mul( 0.12 ) ).toVar();
-			const sv = texture( lace, vec2( aw.div( 0.83 ), flowS.div( 3.0 ) ) ).toVar();
-			// and broad bands (sections of the lip thicker or thinner than others), visible from afar
-			const sbv = texture( lace, vec2( aw.div( 2.9 ), flowS.div( 9.0 ) ).add( vec2( 0.37, 0.61 ) ) ).toVar();
-			const sb = sbv.z;
-			const hS = sv.x.mul( 0.02 ).add( sv.z.mul( 0.012 ) );
-			const dpdx = dFdx( pos ), dpdy = dFdy( pos );
-			const r1 = cross( dpdy, N0 ), r2 = cross( N0, dpdx );
-			const det = dot( dpdx, r1 );
-			const grad = r1.mul( dFdx( hS ) ).add( r2.mul( dFdy( hS ) ) ).mul( sign( det ) );
-			const N = normalize( N0.mul( abs( det ) ).sub( grad ).add( N0.mul( 1e-9 ) ) ).toVar();
-			const NdV = max( dot( N, V ), 1e-3 );
-			const F = fresnelDielectric( NdV, 1.333 ).toVar();
-			const L = G.sunDir;
-			const sunVis = this.clouds ? this.clouds.shadow( pos.xz ) : float( 1 );
-			const sun = G.sunColor.mul( sunVis ).toVar();
+		// premultiplied alpha over the water; velocity weighted by coverage (MeshShader late pass)
+		const mat = new Material( {
+			name: 'BreakerLip',
+			lit: false,
+			transparent: true,
+			depthWrite: false,
+			depthTest: true,
+			side: 'double',
+			blending: 'premultiplied',
+			modules: [ lipModule ],
+			uniforms: { sheet: [ 'f32', 1 ] },
+			textures: { brkLace: lace },
+			storage: { breakersCrest: this.crest },
+			attributes: { sheetId: 'vec4f' },
+			varyings: { vLipN: 'vec3f', vLip: 'vec4f', vLipFade: 'f32' }, // vLip: v, b, along, curtain length
+			vertex: /* wgsl */`
+	let id = v.sheetId;
+	let seg = u32( id.x );
+	let slot = u32( id.y );
+	let side = u32( id.z );
+	let k = id.w;
+	let st = seg + side;
+	let ot = seg + ( 1u - side );
+	let e = st * 6u + slot * 3u;
+	let eo = ot * 6u + slot * 3u;
+	let c0 = breakersCrest[ e ];
+	let c1 = breakersCrest[ e + 1u ];
+	let c2 = breakersCrest[ e + 2u ];
+	let mOther = breakersCrest[ eo + 2u ].w;
+	let bOther = breakersCrest[ eo ].w;
+	// (the crests are followed until the bore reaches the shore; the sheet is gone after the plunge)
+	// (port: both ends of a segment must pass the b test, else a vertex pair collapses to one side only
+	// and the quad between them draws as a long sliver down to y = -1e5 where b jumps between stations)
+	let valid = c2.w > 0.5 && abs( mOther - c2.w ) < 0.5 && c0.w < 1.25 && bOther < 1.25;
 
-			// reflection: sky + sun glint
-			const Rr = reflect( V.negate(), N );
-			const R = normalize( vec3( Rr.x, max( Rr.y, 0.004 ), Rr.z ) );
-			const refl = sky.reflectionRadiance( R );
-			const Hh = normalize( L.add( V ) );
-			const spec = sun.mul( pow( max( dot( N, Hh ), 0 ), 180 ).mul( 12 ) ).mul( F );
+	let root = c0.xyz;
+	let b = c0.w;
+	let back = c1.xyz;
+	let H = c1.w;
+	let d3 = vec3f( c2.x, 0.0, c2.y );
+	let trough = c2.z;
+	let q = clamp( b / 0.9, 0.0, 1.35 );
+	let Xi = max( H * 0.8, 0.05 );
+	let Yi = max( root.y - trough, 0.05 );
+	// profile parameter: k = 0, 1 on the back of the crest (-1, -0.45), then 0..1 along the curtain
+	let pv = select( select( ( k - 2.0 ) / ( BRK_NV - 3.0 ), -0.45, k < 1.5 ), -1.0, k < 0.5 );
+	let xl = Xi * q * max( pv, 0.0 );
+	let fl = xl / Xi;
+	let yl = - Yi * ( fl * fl ); // ballistic: the jet leaves the crest horizontally
+	let onLip = root + d3 * xl + vec3f( 0.0, yl, 0.0 );
+	let onCap = mix( root, back, max( - pv, 0.0 ) ) + vec3f( 0.0, 0.012, 0.0 );
+	let P = select( onLip, onCap, pv < 0.0 );
+	// outward normal of the curtain (upper surface of the lip)
+	let slope = Yi * 2.0 * xl / ( Xi * Xi );
+	o.vLipN = normalize( vec3f( 0.0, 1.0, 0.0 ) + d3 * slope );
+	o.vLip = vec4f( pv, b, f32( st ) * ${ f( spacing ) }, Xi * q + Yi * q * q ); // w: curtain length (m)
+	// the cap fades in over the crest; the whole lip fades out once it has become whitewater
+	let capA = smoothstep( -1.0, -0.1, pv );
+	// once the jet has re-entered the water the curtain is gone (the splash and the roller take over)
+	o.vLipFade = capA * smoothstep( 0.02, 0.12, q ) * ( 1.0 - smoothstep( 1.0, 1.2, b ) );
+	v.useWorld = true;
+	v.worldPos = select( vec3f( 0.0, -1e5, 0.0 ), P, valid );
+	v.worldNormal = o.vLipN;
+`,
+			output: /* wgsl */`
+	let v = in.vs.vLip.x;
+	let b = in.vs.vLip.y;
+	let a = in.vs.vLip.z;
+	let len = in.vs.vLip.w;
+	let pos = in.P;
+	let V = normalize( frame.cameraPos - pos );
+	let Nw = normalize( in.vs.vLipN );
+	let N0 = select( - Nw, Nw, in.front );
+	let t = frame.time;
+	// The water of the jet is stretched along the flow: streaks and ripples running down the
+	// curtain (the lace pattern stretched ~8x along the jet and moving with it) in its surface
+	// (normal, from the screen-space gradient of a small relief) and in its thickness
+	let flowS = v * len - t * 1.1;
+	// along-crest coordinate warped by low-frequency noise (three incommensurate scales, slope kept
+	// below 1 so it never folds): the streak spacing drifts along the crest, no fixed period, and the
+	// tiles of every pattern below never line up into a comb
+	let aw = a + sin( a * 0.23 + 1.7 ) * 1.6 + sin( a * 0.61 + 4.2 ) * 0.4 + sin( a * 1.37 + 0.4 ) * 0.12;
+	let sv = textureSample( brkLace, smpAnisoRepeat, vec2f( aw / 0.83, flowS / 3.0 ) );
+	// and broad bands (sections of the lip thicker or thinner than others), visible from afar
+	let sbv = textureSample( brkLace, smpAnisoRepeat, vec2f( aw / 2.9, flowS / 9.0 ) + vec2f( 0.37, 0.61 ) );
+	let sb = sbv.z;
+	let hS = sv.x * 0.02 + sv.z * 0.012;
+	let dpx = dpdx( pos );
+	let dpy = dpdy( pos );
+	let r1 = cross( dpy, N0 );
+	let r2 = cross( N0, dpx );
+	let det = dot( dpx, r1 );
+	let grad = ( r1 * dpdx( hS ) + r2 * dpdy( hS ) ) * sign( det );
+	let N = normalize( N0 * abs( det ) - grad + N0 * 1e-9 );
+	let NdV = max( dot( N, V ), 1e-3 );
+	let F = breakersFresnel( NdV, 1.333 );
+	let L = frame.sunDir;
+	let sun = frame.sunColor * ${ this.clouds ? 'cloudsShadow( pos.xz )' : '1.0' };
 
-			// light through the thin sheet: turquoise when backlit
-			const tint = vec3( 0.16, 0.62, 0.56 );
-			const back = pow( saturate( dot( V.negate(), L ).mul( 0.5 ).add( 0.5 ) ), 4.0 );
-			// thick and deep green at the root, thin, bright and clear toward the tip, uneven along the streaks
-			const thin = mix( float( 1.5 ), float( 0.7 ), v ).mul( sv.z.mul( 0.3 ).add( 0.8 ) ).mul( sb.mul( 0.8 ).add( 0.6 ) );
-			const glow = sun.mul( tint ).mul( back.mul( 0.9 ).add( 0.08 ) ).add( G.skyIrradiance.mul( tint ).mul( 1.4 ) ).mul( thin );
-			const aW = F.add( float( 1 ).sub( F ).mul( mix( float( 0.42 ), float( 0.16 ), v ) ).mul( sv.x.mul( 0.5 ).add( 0.75 ) ).mul( sb.mul( 0.7 ).add( 0.65 ) ).min( 0.85 ) );
-			const cW = refl.mul( F ).add( spec ).add( glow.mul( float( 1 ).sub( F ) ).mul( 0.42 ) );
+	// reflection: sky + sun glint
+	let Rr = reflect( - V, N );
+	let R = normalize( vec3f( Rr.x, max( Rr.y, 0.004 ), Rr.z ) );
+	let refl = ${ this.sky ? 'skyReflectionRadiance( R )' : 'frame.horizonColor' };
+	let Hh = normalize( L + V );
+	let spec = sun * ( pow( max( dot( N, Hh ), 0.0 ), 180.0 ) * 12.0 ) * F;
 
-			// The jet stays clear, glassy water while it is in the air: only its leading edge tears into
-			// aerated fingers (filaments of the lace pattern stretched along the flow, merging into a
-			// ragged white rim). Sections of the lip differ a little.
-			const flowM = v.mul( len ).sub( G.time.mul( 1.1 ) ); // metres down the curtain, moving with the jet
-			const fuv = vec2( aw.div( 1.9 ).add( 0.53 ), flowM.div( 1.8 ) );
-			const fl = texture( lace, fuv ).toVar();
-			const sect = fl.z; // slowly varying along the crest
-			const vary = sect.sub( 0.5 ).add( sin( aw.mul( 0.29 ).add( b.mul( 2.1 ) ) ).mul( 0.15 ) );
-			const reach = v.add( vary.mul( 0.3 ) );
-			// slightly irregular leading edge (sections of the lip reach a little further than others)
-			const tipN = sin( aw.mul( 1.3 ).add( G.time.mul( 0.3 ) ) ).mul( 0.6 ).add( sin( aw.mul( 4.7 ).add( 1.3 ) ).mul( 0.4 ) );
-			const edge = v.add( tipN.mul( 0.03 ) ).add( vary.mul( 0.04 ) );
-			const thrown = smoothstep( 0.35, 0.8, b );
-			// a thin, translucent aerated rim along the leading edge (it tears into the drops and
-			// ligaments the spray system throws off it)
-			const rim = smoothstep( 0.9, 0.96, edge ).mul( fl.z.mul( 0.2 ).add( 0.2 ) ).mul( thrown );
-			// once the lip has landed the curtain is a falling mass of whitewater that dissolves (blotchy)
-			// into the splash-up and the roller within a fraction of a second
-			// (in streaks: white fingers run down the curtain ahead of the rest, so along a peeling crest the
-			// broken section feathers into the clear one instead of ending on a vertical line)
-			// (each finger its own length and brightness: the fine strands' per-cell random, gated and grouped
-			// by the broad pattern so fingers cluster, merge and leave gaps instead of a regular row)
-			const fing = sv.w.mul( 0.55 ).add( sv.z.mul( 0.2 ) ).mul( smoothstep( 0.25, 0.75, sbv.w.mul( 0.6 ).add( sb.mul( 0.4 ) ) ).mul( 0.8 ).add( 0.2 ) ).mul( 0.34 );
-			const wh = smoothstep( float( 1 ).sub( v ).mul( 0.18 ).add( 0.9 ).sub( fing ), float( 1 ).sub( v ).mul( 0.18 ).add( 1.0 ).sub( fing ), b ).toVar(); // from the tip up
-			const lc = texture( lace, vec2( aw.mul( 0.83 ).add( 1.9 ), v.mul( len ).sub( G.time.mul( 1.3 ) ) ).div( LACE_TILE * 0.8 ) );
-			const blot = lc.z.mul( 0.7 ).add( lc.y.mul( 0.3 ) );
-			const gone = smoothstep( 1.0, 1.25, b );
-			const clumpW = smoothstep( gone.sub( 0.12 ), gone.add( 0.12 ), blot );
-			const clumps = saturate( blot.sub( gone ).mul( 2.5 ) ); // thicker inside the blotches
-			// thin aerated filaments stretched down the curtain (foam of the previous wave drawn up the
-			// face and thrown out with the lip), more of them toward the tip
-			const fil = float( 1 ).sub( smoothstep( 0.02, 0.12, sv.x ) ).mul( smoothstep( 0.15, 0.8, v ) ).mul( sv.w.mul( 0.5 ).add( 0.25 ) ).mul( sb.mul( 0.9 ).add( 0.3 ) ).mul( thrown );
-			const aer = mix( max( rim, fil ), float( 0.95 ), wh ).toVar();
-			// aerated water is a dense scatterer: bright from every side, glowing when backlit
-			const foamLit = sun.mul( max( dot( N, L ), 0 ).mul( 0.5 ).add( 0.5 ).add( back.mul( 1.2 ) ) ).div( Math.PI ).add( G.skyIrradiance ).mul( 0.9 );
+	// light through the thin sheet: turquoise when backlit
+	let tint = vec3f( 0.16, 0.62, 0.56 );
+	let back = pow( sat( dot( - V, L ) * 0.5 + 0.5 ), 4.0 );
+	// thick and deep green at the root, thin, bright and clear toward the tip, uneven along the streaks
+	let thin = mix( 1.5, 0.7, v ) * ( sv.z * 0.3 + 0.8 ) * ( sb * 0.8 + 0.6 );
+	let glow = ( sun * tint * ( back * 0.9 + 0.08 ) + frame.skyIrradiance * tint * 1.4 ) * thin;
+	let aW = F + min( ( 1.0 - F ) * mix( 0.42, 0.16, v ) * ( sv.x * 0.5 + 0.75 ) * ( sb * 0.7 + 0.65 ), 0.85 );
+	let cW = refl * F + spec + glow * ( 1.0 - F ) * 0.42;
 
-			const tip = float( 1 ).sub( smoothstep( 0.93, 1.0, edge ) );
-			const alpha = vFade.mul( tip ).mul( this.params.sheet ).mul( mix( float( 1 ), clumpW, wh ) ).toVar();
-			const aF = aer.mul( 0.92 );
-			const col = foamLit.mul( mix( float( 1 ), clumps.mul( 0.4 ).add( 0.75 ), wh ) ).mul( aF ).add( cW.mul( float( 1 ).sub( aF ) ) );
-			const aOut = aF.add( aW.mul( float( 1 ).sub( aF ) ) ).mul( alpha );
-			return vec4( col.mul( alpha ), aOut );
+	// The jet stays clear, glassy water while it is in the air: only its leading edge tears into
+	// aerated fingers (filaments of the lace pattern stretched along the flow, merging into a
+	// ragged white rim). Sections of the lip differ a little.
+	let flowM = v * len - t * 1.1; // metres down the curtain, moving with the jet
+	let fuv = vec2f( aw / 1.9 + 0.53, flowM / 1.8 );
+	let fl = textureSample( brkLace, smpAnisoRepeat, fuv );
+	let sect = fl.z; // slowly varying along the crest
+	let vary = sect - 0.5 + sin( aw * 0.29 + b * 2.1 ) * 0.15;
+	let reach = v + vary * 0.3;
+	// slightly irregular leading edge (sections of the lip reach a little further than others)
+	let tipN = sin( aw * 1.3 + t * 0.3 ) * 0.6 + sin( aw * 4.7 + 1.3 ) * 0.4;
+	let edge = v + tipN * 0.03 + vary * 0.04;
+	let thrown = smoothstep( 0.35, 0.8, b );
+	// a thin, translucent aerated rim along the leading edge (it tears into the drops and
+	// ligaments the spray system throws off it)
+	let rim = smoothstep( 0.9, 0.96, edge ) * ( fl.z * 0.2 + 0.2 ) * thrown;
+	// once the lip has landed the curtain is a falling mass of whitewater that dissolves (blotchy)
+	// into the splash-up and the roller within a fraction of a second
+	// (in streaks: white fingers run down the curtain ahead of the rest, so along a peeling crest the
+	// broken section feathers into the clear one instead of ending on a vertical line)
+	// (each finger its own length and brightness: the fine strands' per-cell random, gated and grouped
+	// by the broad pattern so fingers cluster, merge and leave gaps instead of a regular row)
+	let fing = ( sv.w * 0.55 + sv.z * 0.2 ) * ( smoothstep( 0.25, 0.75, sbv.w * 0.6 + sb * 0.4 ) * 0.8 + 0.2 ) * 0.34;
+	let wh = smoothstep( ( 1.0 - v ) * 0.18 + 0.9 - fing, ( 1.0 - v ) * 0.18 + 1.0 - fing, b ); // from the tip up
+	let lc = textureSample( brkLace, smpAnisoRepeat, vec2f( aw * 0.83 + 1.9, v * len - t * 1.3 ) / ( BRK_LACE_TILE * 0.8 ) );
+	let blot = lc.z * 0.7 + lc.y * 0.3;
+	let gone = smoothstep( 1.0, 1.25, b );
+	let clumpW = smoothstep( gone - 0.12, gone + 0.12, blot );
+	let clumps = sat( ( blot - gone ) * 2.5 ); // thicker inside the blotches
+	// thin aerated filaments stretched down the curtain (foam of the previous wave drawn up the
+	// face and thrown out with the lip), more of them toward the tip
+	let fil = ( 1.0 - smoothstep( 0.02, 0.12, sv.x ) ) * smoothstep( 0.15, 0.8, v ) * ( sv.w * 0.5 + 0.25 ) * ( sb * 0.9 + 0.3 ) * thrown;
+	let aer = mix( max( rim, fil ), 0.95, wh );
+	// aerated water is a dense scatterer: bright from every side, glowing when backlit
+	let foamLit = ( sun * ( max( dot( N, L ), 0.0 ) * 0.5 + 0.5 + back * 1.2 ) / PI + frame.skyIrradiance ) * 0.9;
 
-		} )();
+	let tip = 1.0 - smoothstep( 0.93, 1.0, edge );
+	let alpha = in.vs.vLipFade * tip * mat.sheet * mix( 1.0, clumpW, wh );
+	let aF = aer * 0.92;
+	let col = foamLit * mix( 1.0, clumps * 0.4 + 0.75, wh ) * aF + cW * ( 1.0 - aF );
+	let aOut = ( aF + aW * ( 1.0 - aF ) ) * alpha;
+	(*r).color = vec4f( col * alpha, aOut );
+`,
+		} );
+		// the lip opacity multiplier is the material's uniform
+		this.params.sheet = mat.uniforms.sheet;
+		this.material = mat;
 
-		mat.outputNode = fragment;
-		mat.mrtNode = mrt( { velocity: vec4( staticVelocity.mul( fragment.w ), 0, fragment.w ) } );
-		mat.mrtNode.setBlendMode( 'velocity', new THREE.BlendMode( THREE.MaterialBlending ) );
-
-		const mesh = this.mesh = new THREE.Mesh( geo, mat );
+		const mesh = this.mesh = new Mesh( geo, mat );
 		mesh.frustumCulled = false;
 		mesh.castShadow = false;
 		mesh.receiveShadow = false;
 		mesh.renderOrder = 10;
 		mesh.layers.set( LAYERS.TRANSPARENT );
 		mesh.name = 'BreakerLips';
+		// velocity: world positions with no motion of their own -> camera-only reprojection (static)
+		mesh.staticVelocity = true;
 
 	}
 

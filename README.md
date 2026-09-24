@@ -1,11 +1,15 @@
 # Tidewater
 
-A real-time tropical island and ocean for the browser, written directly on WebGPU and WGSL with its own
-small rendering engine. Walk the beach, swim the reef, drive the boat, and watch a humpback breach.
+An island fishing game for the browser. Cast from the pier, the beach or your own boat, fight the fish,
+sell your catch to Joe at the fish stand, and spend it on better gear at Marta's chandlery. Around it is a
+real-time tropical island and ocean: swim the reef, drive the boat out to deep water, and watch a humpback
+breach. It runs directly on WebGPU and WGSL with its own small rendering engine, no framework.
 
-**Live demo:** https://dgreenheck.github.io/tidewater/
+**Play it:** https://dgreenheck.github.io/tidewater/
 
-![Tidewater at golden hour](docs/screenshot.jpg)
+![Fishing off the pier at golden hour](docs/screenshot.jpg)
+
+![The beach in the late afternoon](docs/screenshot-beach.jpg)
 
 ## Requirements
 
@@ -17,6 +21,17 @@ small rendering engine. Walk the beach, swim the reef, drive the boat, and watch
 
 ## Features
 
+**Fishing**
+- A spinning rod and reel that cast, reel and bend under load, with the bail, rotor and crank animated.
+- Bites that depend on the water (shallows, pier, reef, bay, deep water), depth and time of day, across
+  18 Caribbean species.
+- A line-tension fight: keep the tension in the green band, ease off when the fish runs.
+- A full-screen catch card with the fish's length and weight, a fish log with records, and a cooler.
+- Joe's fish stand buys your catch; Marta's chandlery sells line, reels, rods, a bigger hold, fuel, a rebuilt
+  engine, a fish finder and deck floodlights for night fishing.
+- Walk the deck and the wheelhouse while the boat drifts; the boat burns fuel.
+- A first-play guide, contextual tips and a minimap. Progress is saved in the browser.
+
 **Ocean**
 - Four-cascade FFT ocean (Tessendorf spectra) with foam, whitecaps, wind streaks and swell.
 - Depth-aware breaking waves with peeling shoulders, whitewater, spray and foam lace.
@@ -24,6 +39,7 @@ small rendering engine. Walk the beach, swim the reef, drive the boat, and watch
 - Boat wake and bow spray, and a whale wake.
 - Caustics on the seabed and in the water, with light shafts.
 - A split underwater/above-water view at the waterline, with water droplets on the lens after surfacing.
+- Refraction of the seabed through the surface, including behind the pier and boats.
 
 **Sky**
 - Physically based atmosphere (Hillaire 2020) with a sun, moon and stars.
@@ -33,9 +49,11 @@ small rendering engine. Walk the beach, swim the reef, drive the boat, and watch
 
 **World**
 - An island with a beach, hills, headlands and rocks.
-- A fishing village and a pier.
+- A fishing village, a pier, and the vendors' stalls built from Poly Haven scans.
+- Realistic vendor characters (Microsoft Rocketbox) with skinned animation.
 - A coral reef with fish.
-- Palms, broadleaf trees and shrubs with impostors and dithered LOD fades.
+- Palms, bananas, monstera, elephant ear, heliconia, bird of paradise, broadleaf trees, shrubs and dune
+  grass, with impostors and dithered LOD fades.
 - Beach debris.
 - Birds, crabs and marine snow.
 - A humpback whale with an escort of fish, blows, fluke dives and breaches.
@@ -50,7 +68,8 @@ small rendering engine. Walk the beach, swim the reef, drive the boat, and watch
 
 **Audio**
 - Positional audio from real CC0 field recordings: surf timed to each breaking wave, wind, birds, the boat
-  engine, footsteps by surface, underwater ambience and whale song.
+  engine, footsteps by surface, underwater ambience, whale song, and the rod and reel (casts, the bail,
+  reeling, the drag, line snaps, splashes).
 
 ## Controls
 
@@ -106,7 +125,7 @@ Add these to the URL, for example `?fly&noAudio`:
 
 ```sh
 npm install
-npm run dev      # http://127.0.0.1:5188
+npm run dev      # http://127.0.0.1:5189
 npm run build    # static build in dist/
 ```
 
@@ -116,6 +135,7 @@ Every push to `main` deploys to GitHub Pages through `.github/workflows/deploy.y
 
 | Folder | Contents |
 |---|---|
+| `src/game/` | The fishing game: rod, bites, the fight, catch card, cooler and log, vendors and stalls, guide, minimap, HUD |
 | `src/engine/` | The rendering engine: math, scene graph and geometry, GPU resources, WGSL shader composition, materials, lighting and shadows |
 | `src/ocean/` | FFT ocean, water surface and material, shore waves, breakers, swash, wake, caustics, underwater lighting |
 | `src/sky/` | Atmosphere, clouds, sky and environment |
@@ -124,9 +144,12 @@ Every push to `main` deploys to GitHub Pages through `.github/workflows/deploy.y
 | `src/materials/` | Shared lighting: shadow filtering, bounce light, contact shadows, local lights, LOD fades |
 | `src/player/` | Walking, swimming, the boat and the free camera |
 | `src/audio/` | The sample-based soundscape |
-| `src/ui/` | Settings panel and HUD |
+| `src/ui/` | Settings panel, loading screen and HUD |
+| `tools/` | Scripts that fetch and convert the characters, stall props and fishing sounds |
+| `test/` | Headless engine smoke test and game-logic tests (`npm test`), and HUD / loader dev pages |
 
 ## Credits and license
 
 The code is released under the MIT license; see [LICENSE](LICENSE). Third-party assets (CC0 audio from
-Freesound, CC0 scans from Poly Haven) and technique references are listed in [CREDITS.md](CREDITS.md).
+Freesound, CC0 scans from Poly Haven, MIT characters from Microsoft Rocketbox, OFL / Apache fonts) and
+technique references are listed in [CREDITS.md](CREDITS.md).

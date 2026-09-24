@@ -205,11 +205,13 @@ fn underwaterMedium( uv: vec2f ) -> f32 {
 			// temporal resolve integrates the steps instead of freezing a noise pattern on screen
 			let fragPx = pixel + f32( frame.frameIndex % 64u ) * 5.588238;
 			let jitter = _uwIgn( fragPx );
+			// gusts / slicks vary over hundreds of metres: one sample for the whole march
+			let detK = causticsDetailK( underwaterParams.camPos.xz + dir.xz * ( maxD * 0.5 ) );
 			for ( var i = 0; i < steps; i++ ) {
 				let s = ( f32( i ) + jitter ) * ds;
 				let p = underwaterParams.camPos + dir * s;
 				let z = max( st.x - p.y, 0.01 );
-				let caus = causticsSampleLevel( p, z, 1.5 );
+				let caus = causticsSampleShaft( p, z, 1.5, detK );
 				let Tl = exp( - sigT * ( s + z / mu ) );
 				shafts += ( caus - 1.0 ) * Tl * ds;
 			}

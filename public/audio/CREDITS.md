@@ -43,9 +43,22 @@ slice table is in `src/audio/soundBank.js`.
 | `whale_song.ogg` | humpback whale song, recorded diving (French Polynesia), low-passed 2.6 kHz (divers' regulator hiss) — loop | [Diving with whales.wav](https://freesound.org/people/KEVOY/sounds/82325/) | KEVOY | CC0 1.0 |
 | `whale_blow.ogg` | 3 cetacean breaths (explosive exhale + inhale), played pitched down as the humpback's blow | [ORCA.wav](https://freesound.org/people/mikewest/sounds/198937/) | mikewest | CC0 1.0 |
 | `big_splash.ogg` | 2 large splashes (whale breach / re-entry / flukes, pitched down) | [Big Water Splash](https://freesound.org/people/qubodup/sounds/442773/), [Large Splash](https://freesound.org/people/roboroo/sounds/436792/) | qubodup, roboroo | CC0 1.0, CC0 1.0 |
+| `reel_wind.ogg` | spinning reel cranked steadily (gear ticking) — loop, rate follows the crank | [Spinning reel.wav](https://freesound.org/people/tosha73/sounds/509902/) | tosha73 | CC0 1.0 |
+| `reel_drag.ogg` | reel ratchet screaming as line is pulled off (a fish running against the drag) — loop | [Angel Fly Fish Reel Fast Pull_1.wav](https://freesound.org/people/paulprit/sounds/507070/) | paulprit | CC0 1.0 |
+| `line_strain.ogg` | nylon line under strain (creak near the breaking point) — loop | [nylon rope string fishing line handling tying tie tense friction](https://freesound.org/people/kyles/sounds/450849/) | kyles | CC0 1.0 |
+| `rod_swish.ogg` | 5 rod swishes (the cast) | [Fishing Rod Swish Swoosh.wav](https://freesound.org/people/Mrthenoronha/sounds/371313/), [Fishing Rod Cast - Swoosh](https://freesound.org/people/mwchristian95/sounds/725426/) | Mrthenoronha, mwchristian95 | CC0 1.0, CC0 1.0 |
+| `bail_click.ogg` | 4 small sprung-metal clicks (the bail opening / snapping shut) | [Foley_TapeMeasure_ClickLock.wav](https://freesound.org/people/MrFossy/sounds/523282/) | MrFossy | CC0 1.0 |
+| `line_out.ogg` | line paying out off the reel during a cast | [fishingreel_throw.wav](https://freesound.org/people/BranndyBottle/sounds/464697/) | BranndyBottle | CC0 1.0 |
+| `plop.ogg` | 2 bobber / sinker landings | [Fishing Lure-Sinker Hitting water](https://freesound.org/people/JoelMcDaniel/sounds/849752/), [fishingreel_throw.wav](https://freesound.org/people/BranndyBottle/sounds/464697/) | JoelMcDaniel, BranndyBottle | CC0 1.0, CC0 1.0 |
+| `line_snap.ogg` | 4 snaps (strings breaking under tension, used for the line parting) | [Guitar string snap or breaks - various sounds](https://freesound.org/people/khenshom/sounds/537084/) | khenshom | CC0 1.0 |
+| `fish_splash.ogg` | 5 fish splashes / thrashing at the surface | [Fish Splashing Release 1.wav](https://freesound.org/people/paulprit/sounds/507094/), [Fish Splashing Release 2.wav](https://freesound.org/people/paulprit/sounds/507093/) | paulprit | CC0 1.0 |
+| `fish_flop.ogg` | landed fish flapping / flopping | [FishFlappingTail.wav](https://freesound.org/people/ramattahatta/sounds/649003/), [Fish Flopping.wav](https://freesound.org/people/RatBird/sounds/570208/) | ramattahatta, RatBird | CC0 1.0, CC0 1.0 |
+| `coins.ogg` | coins dropped in a bowl (selling fish) | [coins - in paper bowl 05.wav](https://freesound.org/people/Anthousai/sounds/336585/) | Anthousai | CC0 1.0 |
 
 Note: `under_reef.ogg` uses the first ~200 s of 630436's preview (a narrow 1.7 kHz tone notched out).
 
 Note: `splash.ogg` slice 1 is qubodup's cleaned edit of blaukreuz's "130723_Brela_HarborJump_F_4824.wav" (also CC0).
 
 Note: `big_splash.ogg` slice 1 is qubodup's mix of CC0 sounds (wormer2's 415669 / 415670, roboroo's 436792 and others, all CC0).
+
+The fishing sounds are rebuilt with `tools/audio/` (see its README).

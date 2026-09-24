@@ -73,22 +73,21 @@ body {
 }
 
 /* ── loader ────────────────────────────────────────────────────────────── */
+/* Title screen while the island builds and the shaders compile: full-bleed key art with a slow
+   drift, the wordmark bottom left, a progress panel and rotating tips. Everything that moves by
+   itself is a compositor animation (transform / opacity), so it keeps moving while the main thread
+   is blocked compiling pipelines. */
 
 #loader {
 	position: fixed;
 	inset: 0;
 	z-index: 1000;
-	display: grid;
-	place-items: center;
 	overflow: hidden;
 	color: var(--tw-ink);
 	font-family: var(--tw-font);
 	-webkit-font-smoothing: antialiased;
-	background:
-		radial-gradient(120% 70% at 50% -12%, rgba(64, 170, 200, 0.3), transparent 60%),
-		radial-gradient(80% 55% at 50% 115%, rgba(0, 0, 0, 0.75), transparent 70%),
-		linear-gradient(180deg, #0a2636 0%, #061621 42%, #030a11 100%);
-	transition: opacity 700ms var(--tw-ease), visibility 0s linear 700ms;
+	background: #05090d;
+	transition: opacity 900ms var(--tw-ease), visibility 0s linear 900ms;
 }
 
 #loader.tw-hidden {
@@ -97,130 +96,287 @@ body {
 	pointer-events: none;
 }
 
-/* light shafts reaching down from the surface */
-#loader::before {
-	content: '';
-	position: absolute;
-	inset: -20% -30% 15%;
-	background: repeating-linear-gradient(100deg,
-		transparent 0 7%,
-		rgba(150, 230, 240, 0.06) 8% 10%,
-		transparent 11% 17%);
-	filter: blur(8px);
-	transform-origin: 50% 0;
-	-webkit-mask-image: linear-gradient(180deg, #000 0%, transparent 78%);
-	mask-image: linear-gradient(180deg, #000 0%, transparent 78%);
-	animation: tw-rays 9s ease-in-out infinite alternate;
-}
-
-/* drifting particles */
-#loader::after {
-	content: '';
+.loader-art {
 	position: absolute;
 	inset: 0;
-	background-image:
-		radial-gradient(circle at 12% 30%, rgba(200, 240, 250, 0.55) 0 1px, transparent 2px),
-		radial-gradient(circle at 28% 72%, rgba(200, 240, 250, 0.4) 0 1px, transparent 2px),
-		radial-gradient(circle at 44% 18%, rgba(200, 240, 250, 0.35) 0 1px, transparent 2px),
-		radial-gradient(circle at 61% 56%, rgba(200, 240, 250, 0.5) 0 1px, transparent 2px),
-		radial-gradient(circle at 77% 83%, rgba(200, 240, 250, 0.35) 0 1px, transparent 2px),
-		radial-gradient(circle at 86% 37%, rgba(200, 240, 250, 0.45) 0 1px, transparent 2px),
-		radial-gradient(circle at 93% 64%, rgba(200, 240, 250, 0.3) 0 1px, transparent 2px),
-		radial-gradient(circle at 5% 88%, rgba(200, 240, 250, 0.35) 0 1px, transparent 2px);
-	background-size: 100vw 100vh;
-	opacity: 0.8;
-	animation: tw-drift 26s linear infinite;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	object-position: 60% 50%;
+	opacity: 0;
+	transform: scale(1.06);
+	transform-origin: 62% 55%;
+	transition: opacity 1400ms var(--tw-ease);
+	animation: tw-kenburns 48s var(--tw-ease-io) infinite alternate;
+	will-change: transform;
+}
+
+.loader-art.is-in {
+	opacity: 1;
+}
+
+#loader.tw-hidden .loader-art {
+	transform: scale(1.14);
+	transition: opacity 900ms var(--tw-ease), transform 900ms var(--tw-ease);
+}
+
+/* legibility: dark at the bottom and the left where the text sits, the sky left open */
+.loader-scrim {
+	position: absolute;
+	inset: 0;
+	background:
+		linear-gradient(0deg, rgba(3, 7, 11, 0.92) 0%, rgba(3, 7, 11, 0.62) 26%, rgba(3, 7, 11, 0.12) 54%, transparent 70%),
+		linear-gradient(90deg, rgba(3, 7, 11, 0.55) 0%, rgba(3, 7, 11, 0.15) 45%, transparent 70%),
+		radial-gradient(140% 90% at 50% 45%, transparent 55%, rgba(0, 0, 0, 0.45) 100%);
+	pointer-events: none;
 }
 
 .loader-inner {
-	position: relative;
-	z-index: 1;
+	position: absolute;
+	left: clamp(20px, 6vw, 112px);
+	right: clamp(20px, 6vw, 112px);
+	bottom: clamp(24px, 7vh, 96px);
 	display: flex;
 	flex-direction: column;
-	align-items: center;
-	gap: calc(14 * var(--tw-u));
-	padding: var(--tw-5);
-	text-align: center;
+	gap: clamp(20px, 3.2vh, 40px);
+	max-width: 1320px;
+	container-type: inline-size;
+}
+
+.loader-kicker {
+	margin: 0 0 calc(10 * var(--tw-u));
+	font-size: clamp(10px, 1vw, 13px);
+	font-weight: 600;
+	letter-spacing: 0.34em;
+	text-transform: uppercase;
+	color: var(--tw-sun);
+	text-shadow: 0 1px 12px rgba(0, 0, 0, 0.6);
 }
 
 .loader-title {
-	margin-right: -0.42em; /* balance the trailing tracking */
-	font-size: clamp(28px, 4.2vw, 58px);
+	margin: 0 -0.3em 0 -0.04em; /* optical: the trailing tracking and the T's side bearing */
+	/* always fits its column: 9 letters at 0.3em tracking are ~9.2em wide, trailing tracking included */
+	font-size: min(136px, 10.4cqi);
+	white-space: nowrap;
 	font-weight: 600;
-	letter-spacing: 0.42em;
-	line-height: 1.1;
+	letter-spacing: 0.3em;
+	line-height: 0.95;
 	color: transparent;
-	background: linear-gradient(100deg, #cfeff2 0%, #ffffff 38%, #8feee3 50%, #ffffff 62%, #cfeff2 100%);
-	background-size: 250% 100%;
+	background: linear-gradient(180deg, #ffffff 20%, #fff0dc 70%, #ffd7a8 100%);
 	-webkit-background-clip: text;
 	background-clip: text;
-	animation: tw-shimmer 4.5s var(--tw-ease-io) infinite;
+	filter: drop-shadow(0 2px 18px rgba(0, 0, 0, 0.45));
 }
 
-.loader-sub {
-	margin-top: calc(-4 * var(--tw-u));
-	font-size: var(--tw-fs-md);
-	letter-spacing: 0.04em;
+.loader-tagline {
+	margin: calc(12 * var(--tw-u)) 0 0;
+	max-width: 30em;
+	font-size: clamp(13px, 1.25vw, 16px);
+	line-height: 1.5;
+	color: var(--tw-ink-2);
+	text-shadow: 0 1px 10px rgba(0, 0, 0, 0.7);
+}
+
+.loader-panel {
+	display: flex;
+	flex-direction: column;
+	gap: calc(10 * var(--tw-u));
+	width: 100%;
+	max-width: 520px;
+}
+
+.loader-row {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: var(--tw-3);
+	font-size: clamp(12px, 1vw, 13.5px);
+}
+
+.loader-status {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	color: var(--tw-ink);
+	font-weight: 500;
+}
+
+.loader-meta {
+	display: flex;
+	flex: none;
+	gap: calc(12 * var(--tw-u));
+	font-family: var(--tw-mono);
+	font-size: 0.92em;
+	font-variant-numeric: tabular-nums;
 	color: var(--tw-ink-3);
+}
+
+.loader-pct {
+	color: var(--tw-ink-2);
 }
 
 .loader-bar {
 	position: relative;
-	width: calc(240 * var(--tw-u));
-	height: 2px;
-	margin-top: var(--tw-4);
+	height: 3px;
 	overflow: hidden;
-	border-radius: 2px;
-	background: rgba(170, 215, 235, 0.14);
+	border-radius: 3px;
+	background: rgba(200, 225, 235, 0.16);
 }
 
 .loader-fill {
 	position: absolute;
-	top: 0;
-	bottom: 0;
-	left: 0;
-	width: 36%;
+	inset: 0;
 	border-radius: inherit;
-	background: linear-gradient(90deg, rgba(var(--tw-aqua-rgb), 0.25), var(--tw-aqua));
-	box-shadow: 0 0 12px rgba(var(--tw-aqua-rgb), 0.8);
-	animation: tw-indeterminate 1.6s var(--tw-ease-io) infinite;
-}
-
-#loader.tw-determinate .loader-fill {
-	width: 100%;
-	transform: scaleX(0);
+	background: linear-gradient(90deg, rgba(var(--tw-sun-rgb), 0.55), var(--tw-sun) 70%, #ffe7c8);
+	box-shadow: 0 0 10px rgba(var(--tw-sun-rgb), 0.55);
+	transform: scaleX(0.02);
 	transform-origin: 0 50%;
-	animation: none;
-	transition: transform 420ms var(--tw-ease);
+	will-change: transform;
 }
 
-.loader-status {
-	min-height: 1.5em;
-	max-width: min(560px, 86vw);
-	font-family: var(--tw-mono);
-	font-size: var(--tw-fs-sm);
+/* a soft light running along the track: shows the page is alive even while the main thread is busy */
+.loader-glint {
+	position: absolute;
+	top: -2px;
+	bottom: -2px;
+	left: 0;
+	width: 22%;
+	background: linear-gradient(90deg, transparent, rgba(255, 244, 228, 0.55), transparent);
+	transform: translateX(-100%);
+	animation: tw-glint 2.6s var(--tw-ease-io) infinite;
+	pointer-events: none;
+}
+
+.loader-note {
+	max-height: 0;
+	overflow: hidden;
+	opacity: 0;
+	font-size: clamp(11px, 0.9vw, 12.5px);
 	line-height: 1.5;
 	color: var(--tw-ink-3);
+	transition: opacity 600ms var(--tw-ease), max-height 600ms var(--tw-ease);
 }
 
-@keyframes tw-rays {
-	from { transform: skewX(-6deg) translateX(-2%); opacity: 0.75; }
-	to { transform: skewX(6deg) translateX(2%); opacity: 1; }
+#loader.is-compiling .loader-note {
+	max-height: 4em;
+	opacity: 1;
 }
 
-@keyframes tw-drift {
-	from { background-position: 0 0; }
-	to { background-position: 0 -100vh; }
+#loader.tw-error .loader-status {
+	white-space: normal;
+	color: var(--tw-coral);
 }
 
-@keyframes tw-shimmer {
-	0% { background-position: 100% 0; }
-	60%, 100% { background-position: 0% 0; }
+#loader.tw-error .loader-fill {
+	background: var(--tw-coral);
+	box-shadow: none;
 }
 
-@keyframes tw-indeterminate {
+#loader.tw-error .loader-glint,
+#loader.tw-error .loader-tips {
+	display: none;
+}
+
+/* rotating tips: stacked in one grid cell (no layout shift), cross-faded by a CSS cycle so they keep
+   turning while scripts are blocked. 8 tips x 6 s. */
+.loader-tips {
+	display: flex;
+	align-items: flex-start;
+	gap: calc(12 * var(--tw-u));
+	padding-top: calc(14 * var(--tw-u));
+	border-top: 1px solid rgba(200, 225, 235, 0.14);
+}
+
+.loader-tip-label {
+	flex: none;
+	padding: calc(3 * var(--tw-u)) calc(7 * var(--tw-u));
+	border: 1px solid rgba(var(--tw-aqua-rgb), 0.45);
+	border-radius: calc(4 * var(--tw-u));
+	font-size: clamp(9.5px, 0.8vw, 11px);
+	font-weight: 600;
+	letter-spacing: 0.16em;
+	text-transform: uppercase;
+	color: var(--tw-aqua);
+}
+
+.loader-tip-list {
+	display: grid;
+	flex: 1;
+	min-width: 0;
+}
+
+.loader-tip {
+	grid-area: 1 / 1;
+	margin: 0;
+	font-size: clamp(12.5px, 1.05vw, 14.5px);
+	line-height: 1.5;
+	color: var(--tw-ink-2);
+	opacity: 0;
+	animation: tw-tip 48s linear infinite;
+}
+
+.loader-tip kbd {
+	display: inline-block;
+	min-width: 1.4em;
+	padding: 0 0.4em;
+	border: 1px solid rgba(200, 225, 235, 0.35);
+	border-bottom-width: 2px;
+	border-radius: 4px;
+	font-family: var(--tw-mono);
+	font-size: 0.85em;
+	line-height: 1.45;
+	text-align: center;
+	color: var(--tw-ink);
+	background: rgba(200, 225, 235, 0.08);
+}
+
+/* the cycle starts 0.8 s in, so the first tip is readable at once */
+.loader-tip:nth-child(1) { animation-delay: -0.8s; }
+.loader-tip:nth-child(2) { animation-delay: 5.2s; }
+.loader-tip:nth-child(3) { animation-delay: 11.2s; }
+.loader-tip:nth-child(4) { animation-delay: 17.2s; }
+.loader-tip:nth-child(5) { animation-delay: 23.2s; }
+.loader-tip:nth-child(6) { animation-delay: 29.2s; }
+.loader-tip:nth-child(7) { animation-delay: 35.2s; }
+.loader-tip:nth-child(8) { animation-delay: 41.2s; }
+
+@keyframes tw-kenburns {
+	from { transform: scale(1.06) translate3d(0, 0, 0); }
+	to { transform: scale(1.14) translate3d(-1.6%, -0.8%, 0); }
+}
+
+@keyframes tw-glint {
 	from { transform: translateX(-100%); }
-	to { transform: translateX(290%); }
+	to { transform: translateX(560%); }
+}
+
+@keyframes tw-tip {
+	0% { opacity: 0; transform: translateY(4px); }
+	1.6% { opacity: 1; transform: translateY(0); }
+	11% { opacity: 1; transform: translateY(0); }
+	12.5% { opacity: 0; transform: translateY(-3px); }
+	100% { opacity: 0; transform: translateY(-3px); }
+}
+
+@media (max-width: 600px) {
+
+	.loader-art {
+		object-position: 72% 50%;
+	}
+
+	.loader-scrim {
+		background:
+			linear-gradient(0deg, rgba(3, 7, 11, 0.94) 0%, rgba(3, 7, 11, 0.7) 40%, rgba(3, 7, 11, 0.15) 66%, transparent 80%),
+			radial-gradient(140% 90% at 50% 45%, transparent 55%, rgba(0, 0, 0, 0.45) 100%);
+	}
+
+	.loader-title {
+		letter-spacing: 0.22em;
+		margin-right: -0.22em;
+		font-size: min(136px, 11.2cqi);
+	}
+
 }
 
 /* ── root & primitives ─────────────────────────────────────────────────── */
@@ -2406,6 +2562,23 @@ body {
 		animation-iteration-count: 1 !important;
 		transition-duration: 1ms !important;
 		transition-delay: 0s !important;
+	}
+
+	.loader-art {
+		animation: none !important;
+		transform: scale(1.06) !important;
+	}
+
+	.loader-glint {
+		display: none;
+	}
+
+	.loader-tip {
+		animation: none !important;
+	}
+
+	.loader-tip:first-child {
+		opacity: 1;
 	}
 
 }

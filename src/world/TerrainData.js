@@ -60,6 +60,7 @@ export class TerrainData {
 		this.gully = new Uint8Array( n ); // drainage lines carved by the erosion noise
 		this.seagrass = new Uint8Array( n ); // seagrass meadows on the shallow seabed (1.5 - 12 m deep)
 		this.rubble = new Uint8Array( n ); // dark coral rubble / rock heads on the seabed
+		this.scarp = new Uint8Array( n ); // face of the eroded embankment behind the bay beach
 		this.rockSites = []; // outcrops / stacks for the rock scatter: { x, z, r, h, kind }
 		this.pads = []; // building pads flattened by the village (trampled ground in the splat map)
 		this.paths = PATHS;
@@ -366,6 +367,9 @@ export class TerrainData {
 		this._features( H, D, R0, BZ );
 		tick( 'features' );
 
+		this._scarp( H, D, R0, BZ );
+		tick( 'scarp' );
+
 		this._seabed( H, R0 );
 		tick( 'seabed' );
 
@@ -631,6 +635,64 @@ export class TerrainData {
 
 	}
 
+	// Eroded embankment behind the bay beach: storms cut the foredune back into a low scarp (0.4 -
+	// 1.2 m) just above the berm crest and the storm line, where the grass-bound ground meets the
+	// open beach. Its position, height and steepness wander along the shore; slumped stretches are
+	// lower and gentler, fallen chunks lie at the toe, and the raised lip settles back to the old
+	// ground within ~20 - 30 m. Gaps where the village core, the pier foot, the footpaths and rock
+	// come down to the beach. The toe stays above the berm (e > 41 m), so the swash and surf never
+	// reach it. this.scarp marks the face (and the chunks) for the terrain material.
+	_scarp( H, D, R0, BZ ) {
+
+		const res = RES, o = this.origin, n = this.noise, n2 = this.noise2, n3 = this.noise3;
+		const scarp = this.scarp;
+		const i0 = Math.floor( - 200 - o ), i1 = Math.ceil( 230 - o );
+		const j0 = Math.floor( - 190 - o ), j1 = Math.ceil( 0 - o );
+		for ( let j = j0; j <= j1; j ++ ) for ( let i = i0; i <= i1; i ++ ) {
+
+			const k = j * res + i;
+			const bz = BZ[ k ];
+			if ( bz < 0.3 ) continue;
+			const e = - D[ k ];
+			if ( e < 36 || e > 95 ) continue;
+			const x = o + i + 0.5, z = o + j + 0.5;
+
+			// gaps: village core, pier foot, footpaths, rock
+			const vd = Math.hypot( ( x - VILLAGE.x ) * 0.8, z - VILLAGE.z );
+			let gap = smoothstep( 45, 70, vd ) * smoothstep( 10, 22, Math.abs( x - WORLD.pier.x ) ) * ( 1 - smoothstep( 0.15, 0.4, R0[ k ] ) );
+			for ( const p of PATHS ) {
+
+				const [ dist ] = polylineDistance( p.pts, x, z );
+				gap *= smoothstep( p.w + 1.5, p.w + 6, dist );
+
+			}
+
+			const Hs = ( 0.5 + 0.7 * smoothstep( - 0.4, 0.4, n3.noise( x / 38, 4.1 ) ) ) * gap * smoothstep( 0.3, 0.7, bz );
+			if ( Hs < 0.02 ) continue;
+			// slumped stretches: lower, wider, gentler faces
+			const slump = smoothstep( 0.15, 0.6, n.noise( x / 23, 9.1 ) );
+			const w = 1.1 + slump * 1.8;
+			const hs = Hs * ( 1 - slump * 0.35 );
+			const eS = Math.max( 44 + w * 0.5, 49 + n.noise( x / 45, 1.7 ) * 5 + n2.noise( x / 11, z / 11 ) * 1.5 );
+			const t = e - eS;
+			const face = smoothstep( - w * 0.5, w * 0.5, t );
+			const back = 1 - smoothstep( 6, 24 + n2.noise( x / 30, 3.3 ) * 6, t );
+			// fallen chunks and slumped sand at the toe
+			const toe = smoothstep( - 4.5, - 2.5, t ) * ( 1 - smoothstep( - w * 0.5 - 0.4, - w * 0.5 + 0.3, t ) );
+			const chunks = toe * Math.max( 0, n3.noise( x / 1.4, z / 1.4 ) + n2.noise( x / 3.1, z / 3.1 ) * 0.5 ) * 0.22 * hs;
+			H[ k ] += hs * face * back + chunks;
+
+			const faceM = smoothstep( - w * 0.5 - 0.35, - w * 0.5 + 0.25, t ) * ( 1 - smoothstep( w * 0.5 - 0.1, w * 0.5 + 0.7, t ) );
+			// the mask climbs from ~0.55 at the toe to 1 at the lip (the material puts the root mat and
+			// humus under the lip and an undercut shadow at the foot)
+			const up = 0.55 + 0.45 * smoothstep( - w * 0.5, w * 0.5, t );
+			const m = Math.max( faceM * up * smoothstep( 0.12, 0.35, hs ), toe * smoothstep( 0.02, 0.1, chunks ) * 0.3 );
+			scarp[ k ] = Math.max( scarp[ k ], Math.round( clamp( m, 0, 1 ) * 255 ) );
+
+		}
+
+	}
+
 	// Shallow seabed biomes: seagrass meadows (irregular, ragged, with sand blowouts) and dark
 	// rubble / rock heads, 1.5 - 12 m deep. Nothing in the swash zone, the first ~1.2 m of depth,
 	// the sandy channel along the pier or the reef core (the reef system dresses that). Meadows
@@ -750,7 +812,7 @@ export class TerrainData {
 					rk = Math.max( rk, smoothstep( 0.55, 0.9, slope ) * smoothstep( - 0.12, - 0.3, lap ) * ( 1 - bz ) * 0.8 );
 
 				}
-				rock[ k ] = clamp( rk, 0, 1 );
+				rock[ k ] = clamp( rk * ( 1 - this.scarp[ k ] / 255 ), 0, 1 );
 
 				// loose sand: the bay beach and dunes, small coves, the seabed
 				let sd;

@@ -39,7 +39,7 @@ const BLADE_TIER = [ 0, 0, 1, 1, 2, 2, 2 ];
 // blades per clump in each tier (coverage compensation)
 const TIER_N = [ 2, 2, 3 ];
 const OATS = 12; // sea oat slots per cell
-const VINES = 16; // creeper slots per cell
+const VINES = 28; // creeper slots per cell
 
 const KIND = { GRASS: 0, OAT_STALK: 1, OAT_HEAD: 2, CREEPER: 3, FLOWER: 4 };
 
@@ -361,14 +361,14 @@ function buildPatch( level, clumps, seed = 7 ) {
 		const slot = [ x, z, rand(), 2 ];
 		let az = rand() * Math.PI * 2;
 		const pts = [];
-		const n = 9;
-		let px = - Math.cos( az ) * 0.65, pz = - Math.sin( az ) * 0.65;
+		const n = 12;
+		let px = - Math.cos( az ) * 1.1, pz = - Math.sin( az ) * 1.1;
 		for ( let i = 0; i < n; i ++ ) {
 
 			pts.push( [ px, 0.01, pz ] );
 			az += ( rand() - 0.5 ) * 0.5;
-			px += Math.cos( az ) * 0.16;
-			pz += Math.sin( az ) * 0.16;
+			px += Math.cos( az ) * 0.19;
+			pz += Math.sin( az ) * 0.19;
 
 		}
 
@@ -383,7 +383,7 @@ function buildPatch( level, clumps, seed = 7 ) {
 			// leaves stand on short petioles, angled forward off the runner, tilted up
 			const la = Math.atan2( dz, dx ) + side * ( 0.7 + 0.5 * rand() );
 			const ldx = Math.cos( la ), ldz = Math.sin( la );
-			const r = ( 0.05 + 0.03 * rand() ) * ( 0.6 + 0.4 * Math.sin( Math.PI * i / n ) );
+			const r = ( 0.07 + 0.04 * rand() ) * ( 0.6 + 0.4 * Math.sin( Math.PI * i / n ) );
 			b.fan( slot, KIND.CREEPER, [ p1[ 0 ] + ldx * r * 0.9, p1[ 2 ] + ldz * r * 0.9 ], r, ldx, ldz, 0.3 + 0.3 * rand(), 7, notched, rand(), 0.015 );
 
 		}
@@ -734,9 +734,9 @@ function createGrassMaterial( field ) {
 	let isOat = kind > 0.5 && kind < 2.5;
 	let lush = m.g;
 	let dune = m.r;
-	// dune tufts are sparse, the meadow is a closed sward
+	// the backshore grass is dense in its clumps (the mask carries the clumping and the edge)
 	let duneF = dune / ( dune + lush + 1e-3 );
-	let grassP = mix( lush, dune * 0.4, duneF );
+	let grassP = mix( lush, min( dune * 1.1, 1.0 ), duneF );
 	let density = select( select( m.a, m.b, isOat ), grassP, isGrass );
 	let r = vegHash12( xz * 1.37 + 0.51 );
 	let r2 = vegHash12( xz * 2.11 + 7.3 );
@@ -751,12 +751,13 @@ function createGrassMaterial( field ) {
 	// lower where it is dry; wiry dune tufts
 	let patchN = vegNoise( xz * ${ f( 1 / 6.5 ) } + 17.3 ) * 0.7 + vegNoise( xz * ${ f( 1 / 2.3 ) } ) * 0.3;
 	let lushH = mix( 0.7, 1.3, patchN ) * ( mt.lush * 0.25 + 1.0 ) * ( 1.0 - mt.dry * 0.25 );
-	let grassH = mix( lushH, 0.55, duneF ) * ( r2 * 0.35 + 0.83 ) * ( density * 0.35 + 0.65 );
+	// dune tufts vary a lot in size (young shoots to big old clumps)
+	let grassH = mix( lushH, 0.62, duneF ) * mix( r2 * 0.35 + 0.83, r2 * r2 * 0.9 + 0.5, duneF ) * ( density * 0.35 + 0.65 );
 	let oatH = r2 * 0.55 + 1.0;
 	let vineS = r2 * 0.4 + 0.8;
 	let hScale = select( select( vineS, oatH, isOat ), grassH, isGrass );
 	// meadow clumps fan out wider than the wiry dune tufts
-	let spread = select( 1.0, mix( 1.35, 1.0, duneF ), isGrass );
+	let spread = select( 1.0, mix( 1.35, 1.3, duneF ), isGrass );
 
 	// distance LOD: tiers fade out (narrow to nothing), the remaining blades widen so the
 	// coverage (blade density x width) stays constant; tier 0 thins out per blade near R_FAR
@@ -805,7 +806,7 @@ function createGrassMaterial( field ) {
 	let oL = length( o0 );
 	let ob = normalize( o0 + disp + vec3f( 0.0, 1e-5, 0.0 ) ) * oL;
 
-	let wScale = select( 1.0, mix( 1.5, 1.2, duneF ), isGrass );
+	let wScale = select( 1.0, mix( 1.5, 1.55, duneF ), isGrass );
 	let wide = wScale * widthK * min( scale * 2.0, max( scale, 0.5 ) );
 	let sideR = vec3f( side.x * cy - side.z * sy, side.y, side.x * sy + side.z * cy );
 	let pos = base + ob + sideR * wide;

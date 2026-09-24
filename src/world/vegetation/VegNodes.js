@@ -260,7 +260,7 @@ fn vegPlantDeform( P: vec3f, N0: vec3f, iPos: vec4f, iDat: vec4f, veg: vec4f, aM
 
 	// LOD window / distance fade: shrink around the base (ferns fade out earlier)
 	let dCam = length( vegParams.camPos - base );
-	let fernFade = select( 1.0, 1.0 - smoothstep( ${ f( UNDER_FERN_FADE[ 0 ] ) }, ${ f( UNDER_FERN_FADE[ 1 ] ) }, dCam ), kindI > 2.5 );
+	let fernFade = select( 1.0, 1.0 - smoothstep( ${ f( UNDER_FERN_FADE[ 0 ] ) }, ${ f( UNDER_FERN_FADE[ 1 ] ) }, dCam ), kindI > 2.5 && kindI < 3.5 );
 	let k = vegLodScale( base, lodRange ) * fernFade * select( 0.0, 1.0, keepKind );
 	out.pos = base + ( pos - base ) * k;
 	return out;

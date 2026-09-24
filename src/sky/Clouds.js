@@ -42,9 +42,11 @@ const SDF_RES = 256, SDF_H = 16; // distance field cells (horizontal over the ti
 const SDF_R = 24; // cells searched horizontally
 const SHAPE_RES = 128, SHAPE_SIZE = 2048;
 const SHEAR = 0.12; // horizontal lean of the clouds per metre of height (downwind)
-const EDGE = 12; // density ramp of the raw shape value (softness of the cloud surface: crisp, the detail erosion shapes it)
+const EDGE = 15; // density ramp of the raw shape value (softness of the cloud surface: crisp, the detail erosion shapes it)
 const ISLAND_NEAR = 2500, ISLAND_FAR = 9000; // m: big clusters only a little away from the island
-const DETAIL_RES = 64, DETAIL_SIZE = 480;
+// broad, rounded billows: the coarsest erosion lumps are ~190 m (the fine octaves are kept light,
+// they only read as grain on the lit surfaces)
+const DETAIL_RES = 64, DETAIL_SIZE = 760;
 // detail erosion (after sky-pro-webgpu / Nubis): three worley fbm octaves per fetch (r: 4 - 16, g: 8 - 32,
 // b: 16 - 64 cells per period). An octave fades to the mean once its features shrink under ~2 px (a mip
 // filter without mips); `crease` is 0 on a lump, 1 between lumps
@@ -168,12 +170,12 @@ const CL_HS: f32 = ${ f( Math.sin( ha ) ) };
 
 // top of a cloud column (fraction of the layer) from the cell profile (0..1), the cell's top and
 // the turret noise: broad rounded domes, uneven
-fn clSmallTop( cs: f32, top: f32, lump: f32 ) -> f32 { return top * pow( cs, 0.6 ) * ( lump * 0.8 + 0.65 ); }
+fn clSmallTop( cs: f32, top: f32, lump: f32 ) -> f32 { return top * pow( cs, 0.42 ) * ( lump * 0.8 + 0.65 ); }
 fn clBigTop( cb: f32, lump: f32 ) -> f32 { return pow( cb, 0.6 ) * ( lump * 0.35 + 0.7 ); }
-fn clCreaseOf( x: f32 ) -> f32 { return smoothstep( 0.4, 0.72, x ); }
+fn clCreaseOf( x: f32 ) -> f32 { return smoothstep( 0.42, 0.64, x ); }
 // erosion grows with the height in the cloud: flat, dense bases, billowy tops; the undersides use the
 // inverted field (wisps instead of lumps)
-fn clErosionAmount( b: vec4f ) -> f32 { return mix( 0.3, 1.0, smoothstep( 0.0, 0.5, b.y ) ); }
+fn clErosionAmount( b: vec4f ) -> f32 { return mix( 0.32, 1.15, smoothstep( 0.03, 0.5, b.y ) ); }
 fn clErosionField( F: f32, b: vec4f ) -> f32 { return mix( 1.0 - F, F, smoothstep( 0.02, 0.2, b.y ) ); }
 // density with every detail octave at its mean (reflections, shadows, deep light samples): the same
 // cloud as the detailed one, seen through a coarse filter
@@ -470,7 +472,10 @@ fn cloudsBase( p: vec3f, w: vec2f ) -> vec4f {
 	// flat, slightly uneven base, the column's (domed) top, edges from the cell profile (steep,
 	// so the shape noise can't break fragments off the rim)
 	let hb = n.y * 0.025;
-	let Ce = sat( ( w.y - hL ) * 2.2 ) * smoothstep( 0.0, 0.45, w.x ) * smoothstep( hb, hb + 0.012, hL );
+	// columns whose top stays very low hold no cloud: the saddles between overlapping weak cells
+	// along a street made long, thin, flat ribbons, and the thin rims of each dome made it a flat
+	// pancake. Without them the cells stay separate and their sides rise steeply.
+	let Ce = sat( ( w.y - hL ) * 2.2 ) * smoothstep( 0.0, 0.45, w.x ) * smoothstep( hb, hb + 0.012, hL ) * smoothstep( 0.07, 0.15, w.y );
 	// the shape noise carves the boundary. x is the raw shape value (density before the ramp,
 	// negative outside): the detail erodes it in the same units, and the coarse search uses it
 	// to slow down near a cloud
@@ -481,7 +486,7 @@ fn cloudsBase( p: vec3f, w: vec2f ) -> vec4f {
 fn cloudsOctaves( uvw: vec3f, s: f32, foot: f32 ) -> f32 {
 	let d = textureSampleLevel( cloudsDetailTex, smpLinearRepeat, uvw, 0.0 ).xyz;
 	let w = vec3f( smoothstep( s * 0.24, s * 0.09, foot ), smoothstep( s * 0.12, s * 0.045, foot ), smoothstep( s * 0.06, s * 0.0225, foot ) );
-	return dot( mix( vec3f( CL_D_MEAN ), d, w ), vec3f( 0.6, 0.25, 0.15 ) );
+	return dot( mix( vec3f( CL_D_MEAN ), d, w ), vec3f( 0.56, 0.32, 0.12 ) );
 }
 
 // full density with detail erosion. b: result of cloudsBase, foot: pixel footprint (m) that filters the
@@ -496,12 +501,12 @@ fn cloudsErode( p: vec3f, b: vec4f, foot: f32 ) -> vec2f {
 	var f2 = CL_D_MEAN;
 	if ( foot < ${ f( D_S1 * 0.24 ) } ) {
 		f1 = cloudsOctaves( dp, ${ f( D_S1 ) }, foot );
-		// close range: a finer fetch (lumps down to ~2 m) keeps near clouds crisp
+		// close range: a finer fetch (lumps down to ~3 m) keeps near clouds crisp
 		if ( foot < ${ f( D_S2 * 0.24 ) } ) {
 			f2 = cloudsOctaves( dp * ${ f( D_NEAR ) } + 0.37, ${ f( D_S2 ) }, foot );
 		}
 	}
-	let crease = clCreaseOf( clErosionField( f1 * 0.65 + f2 * 0.35, b ) );
+	let crease = clCreaseOf( clErosionField( f1 * 0.78 + f2 * 0.22, b ) );
 	// the creases are eaten: round lumps (cauliflower) on the upper parts, wisps underneath
 	return vec2f( sat( ( b.x - crease * clErosionAmount( b ) - 0.012 ) * CL_EDGE ), 1.0 - crease );
 }
@@ -766,7 +771,9 @@ fn blobs( p: vec2f, cells: vec2f, meso: f32, seed: f32 ) -> vec2f {
 		let cell = clMod2( ip + o, cells ) + seed;
 		let hx = clHash2( cell ); let hy = clHash2( cell + 19.7 ); let hr = clHash2( cell + 41.3 ); let hp = clHash2( cell + 7.1 );
 		let d = length( o + vec2f( hx, hy ) * 0.6 + 0.2 - fp );
-		let rad = hr * hr * 0.5 + 0.4;
+		// radii 0.34 - 0.74 cells (was up to 0.9): neighbours in a row no longer fuse into one long ridge,
+		// which from underneath read as a stretched, smeared tube
+		let rad = hr * hr * 0.4 + 0.34;
 		let on = smoothstep( hp - 0.15, hp + 0.15, meso + 0.12 );
 		let v = sat( 1.0 - d / rad ) * on;
 		if ( v > b.x ) { b = vec2f( v, hr ); }
@@ -781,13 +788,14 @@ ${ MAIN } {
 	// cloud streets along the wind (x), about 3 km apart
 	let street = sin( pw.y * ${ f( 2 * PI * 11 ) } + clVnoise2( p, vec2f( 3.0 ) ) * 6.0 ) * 0.5 + 0.5;
 	// fair weather cumulus: cells of 0.5 - 2 km, mostly along the streets
-	let small = blobs( pw, vec2f( 15.0, 19.0 ), meso * 0.7 + street * 0.4 - 0.25, 0.0 );
+	// (loosely: a street seen end-on from under it lines its cells up into one long tube)
+	let small = blobs( pw, vec2f( 15.0, 19.0 ), meso * 0.7 + street * 0.22 - 0.16, 0.0 );
 	// big cells and towers (used far from the island only)
 	let big = blobs( pw, vec2f( 6.0, 8.0 ), meso - 0.1, 3.7 );
 	// turrets: several bumps per cell
 	let lump = clVnoise2( pw, vec2f( 80.0 ) ) * 0.65 + clVnoise2( pw + 0.5, vec2f( 160.0 ) ) * 0.35;
 	// top of the small cells (fraction of the layer): bigger cells grow taller
-	let top = ( small.y * 0.35 + 0.35 ) * ( clVnoise2( p, vec2f( 12.0 ) ) * 0.5 + 0.75 );
+	let top = ( small.y * 0.35 + 0.4 ) * ( clVnoise2( p, vec2f( 12.0 ) ) * 0.5 + 0.75 );
 	textureStore( outTex, gid.xy, vec4f( small.x, sat( top ), lump, big.x ) );
 }` ),
 
@@ -1009,9 +1017,9 @@ fn cloudsOutside( tp: vec2u ) -> bool { return tp.x >= u32( cloudsParams.traceSi
 	if ( cloudsOutside( tp ) ) { return; }
 	let px = cloudsTracedPixel( tp );
 	let rd = cloudsViewDir( px / cloudsParams.viewSize );
-	// well distributed per frame (interleaved gradient noise on the grid of traced pixels, the
-	// offset changes every trace): the residual noise is high frequency, easy to average
-	let jitter = cloudsIGN( vec2f( tp ) + cloudsTrace.frameNoise );
+	// well distributed in space (interleaved gradient noise on the grid of traced pixels) and over
+	// the traces of each pixel (per cycle offset): the residual noise is high frequency, easy to average
+	let jitter = fract( cloudsIGN( vec2f( tp ) ) + cloudsTrace.frameNoise );
 	let m = cloudsMarchView( rd, jitter );
 	textureStore( traceOut, tp, vec4f( m.L, m.T ) );
 	// depth + opacity of the cumulus: the resolve reprojects either the cumulus or the high layers
@@ -1306,7 +1314,12 @@ ${ MAIN } {
 		// R2 sequence over the traces (one offset per 16 frame cycle, so each pixel sees them all)
 		const n = Math.floor( this._traces / 16 ) + 1;
 		this.subPixel.value.set( ( ( 0.5 + n * 0.7548776662 ) % 1 ) - 0.5, ( ( 0.5 + n * 0.5698402910 ) % 1 ) - 0.5 ).multiplyScalar( 0.25 );
-		this.frameNoise.value = ( this._traces ++ % 64 ) * 5.588238;
+		// march jitter: a pixel is traced once per 16 frame cycle, so the offset advances per cycle
+		// (golden ratio sequence on top of the pixel's IGN value): every trace of a pixel gets a new,
+		// well spread offset and the history converges. (Stepping it per trace, mod 64, gave each
+		// pixel only 4 offsets: a fixed residual of the step and light-march pattern, seen as grain.)
+		this.frameNoise.value = ( n * 0.6180339887 ) % 1;
+		this._traces ++;
 
 		// this trace's own copy of the per-trace state
 		const set = this._traceSet( this._traceIndex ++ );
@@ -1512,8 +1525,8 @@ fn cloudsMarch${ name }( rd: vec3f, jitter: f32 ) -> CloudsMarch {
 
 				if ( b.x > 0.002 ) {
 					fineSteps = 3;
-					// detail level from the pixel footprint (m): the close range octave (lumps of ~7 - 28 m)
-					// fades out beyond ~2 km, the erosion (30 - 120 m) beyond ~15 km, so nothing smaller
+					// detail level from the pixel footprint (m): the close range octave (lumps of ~13 - 51 m)
+					// fades out beyond ~3 km, the erosion (~47 - 190 m) beyond ~24 km, so nothing smaller
 					// than about two pixels is ever sampled (that would only alias into grain)
 					let foot = t * pxAngle;
 					var er = vec2f( clMeanDensity( b ), 1.0 - clMeanCrease( b ) );
@@ -1543,17 +1556,17 @@ ${ light }
 							+ dens * 25.0 ) * cloudsParams.densityScale;
 						let skyVis = 0.2 + 0.8 / ( skyTau * 0.35 + 1.0 );
 						// darker bases (their direct light is scattered away by the cloud above)
-						let baseShadow = mix( 1.0, mix( 0.35, 1.0, smoothstep( -0.1, 0.45, b.y ) ), 0.6 );
+						let baseShadow = mix( 1.0, mix( 0.28, 1.0, smoothstep( -0.1, 0.45, b.y ) ), 0.72 );
 						let depthP = pow( dens, mix( 0.5, 1.6, b.y ) ) * 0.95 + 0.05;
 						let vertP = pow( smoothstep( 0.02, 0.2, b.y ), 0.8 ) * 0.85 + 0.15;
 						let powder = mix( 1.0, depthP * vertP, powderK );
 						// ambient: the sky lights the tops; the bases only see the dark sea and the
 						// horizon (darker, bluer), and crevices of the detail noise are occluded
 						let up = sat( b.y * 1.4 );
-						let ambH = mix( vec3f( 0.38, 0.43, 0.52 ), vec3f( 1.0 ), sqrt( up ) ) * skyVis * ( er.y * 0.6 + 0.55 );
+						let ambH = mix( vec3f( 0.38, 0.43, 0.52 ), vec3f( 1.0 ), sqrt( up ) ) * skyVis * ( er.y * 0.75 + 0.42 );
 						// after sunset the tops stay lit longest
 						let alt = pr.y + dot( pr.xz, pr.xz ) / ${ f( 2 * EARTH_R ) };
-						let S = sunE * ( sun * powder * baseShadow * cloudsEarthShadow( light, alt, pr.xz ) ) + amb * ambH
+						let S = sunE * ( sun * powder * baseShadow * ( er.y * 0.3 + 0.7 ) * cloudsEarthShadow( light, alt, pr.xz ) ) + amb * ambH
 							+ bounce * ( 1.0 - up );
 						let Tstep = exp( - sig * ds );
 						let tap = exp( t * ${ f( - 1 / AP_DIST ) } );

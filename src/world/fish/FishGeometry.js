@@ -13,7 +13,7 @@ import * as THREE from '../../engine/index.js';
 //    the species (forked, lunate, rounded, truncate); pectorals fan out from a short base behind
 //    the gill cover; tunas get finlets.
 //  - eyes: domes over the painted eye (nearest level of detail).
-// Poses: 'swim' (fins spread) and 'dead' (fins folded against the body, for market fish).
+// Poses: 'swim' (fins spread) and 'dead' (fins relaxed and partly lowered: landed and market fish).
 //
 // aData per vertex:
 //   x: position along the fish (0 snout .. 1 tail tip): swimming wave, bending
@@ -489,7 +489,7 @@ function midlineFins( M, S, segs, sign, o ) {
 
 		const part = sign > 0 ? ( seg.spiny ? PART.DORSAL1 : PART.DORSAL2 ) : PART.ANAL;
 		const ids = pickRays( seg.rays, [ 40, 7, 3, 2 ][ o.lod ] );
-		const fold = dead ? ( seg.spiny ? 0.8 : 0.55 ) : 0;
+		const fold = dead ? ( seg.spiny ? 0.42 : 0.22 ) : 0;
 		const rays = ids.map( ( k ) => {
 
 			const t = seg.rays > 1 ? k / ( seg.rays - 1 ) : 0;
@@ -499,7 +499,7 @@ function midlineFins( M, S, segs, sign, o ) {
 			let h = prof( seg.h, t ) + ( sign > 0 ? c.T : c.B ) * 0.1;
 			let rake = lerp( seg.rake[ 0 ], seg.rake[ 1 ], t );
 			rake = lerp( rake, 1.45, fold );
-			h *= dead ? ( seg.rays > 30 ? 0.6 : 0.92 ) : 1;
+			h *= dead ? ( seg.rays > 30 ? 0.85 : 0.95 ) : 1;
 			const tip = [ 0, y0 + sign * h * Math.cos( rake ), zOf( u ) - h * Math.sin( rake ) ];
 			return { b: [ 0, y0, zOf( u ) ], t: tip, ub: u * L, ut: ( u * L ) + h * Math.sin( rake ) };
 
@@ -520,7 +520,7 @@ function caudalFin( M, S, o ) {
 	const dead = o.pose === 'dead';
 	const R = C.rays;
 	const ids = pickRays( R, [ 40, 9, 5, 3 ][ o.lod ] );
-	const span = C.span * ( dead ? 0.85 : 1 );
+	const span = C.span * ( dead ? 0.93 : 1 );
 	const rays = ids.map( ( k ) => {
 
 		const s = - 1 + 2 * k / ( R - 1 ); // -1 lower lobe .. 1 upper lobe
@@ -577,7 +577,7 @@ function pairedFins( M, S, F, part, o ) {
 				xb = side * ( c.W * 0.22 + t * c.W * 0.12 );
 				alpha = lerp( - 0.35, - 0.75, t );
 				len = F.len * ( 1 - 0.45 * t );
-				spread = dead ? 0.06 : 0.35;
+				spread = dead ? 0.14 : 0.35;
 
 			} else {
 
@@ -586,8 +586,8 @@ function pairedFins( M, S, F, part, o ) {
 				const shape = F.shape;
 				alpha = shape === 'falcate' ? lerp( 0.05, - 0.55, t ) : shape === 'pointed' ? lerp( 0.1, - 0.85, t ) : lerp( 0.25, - 1.1, t );
 				len = F.len * ( shape === 'falcate' ? 1 - 0.85 * Math.pow( t, 0.55 ) : shape === 'pointed' ? 1 - 0.62 * Math.pow( t, 0.9 ) : 0.62 + 0.38 * Math.sin( Math.PI * ( 0.15 + 0.85 * t ) ) );
-				spread = dead ? 0.05 : F.spread;
-				if ( dead ) alpha = alpha * 0.35 - 0.12; // folded: rays close together, pointing back
+				spread = dead ? 0.16 : F.spread;
+				if ( dead ) alpha = alpha * 0.6 - 0.08; // relaxed: rays closer together, pointing back
 
 			}
 

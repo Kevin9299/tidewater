@@ -19,9 +19,12 @@ const _spatialOffsets = [ 0, 0.5, 0.25, 0.75 ];
 
 export class GTAO {
 
-	constructor( depthTexture, camera, { samples = 16 } = {} ) {
+	// depthIsColor: the depth comes in a single-channel colour texture (e.g. an r32float half-res copy)
+	// instead of a depth texture
+	constructor( depthTexture, camera, { samples = 16, depthIsColor = false } = {} ) {
 
 		this.depthTexture = depthTexture;
+		this.depthIsColor = depthIsColor;
 		this.camera = camera;
 		this.resolutionScale = 1;
 		this.useTemporalFiltering = false;
@@ -97,11 +100,11 @@ const GTAO_STEPS: i32 = ${ STEPS };
 
 fn gtaoSampleDepth( uv: vec2f ) -> f32 {
 	let s = vec2i( textureDimensions( gtaoDepth ) );
-	return textureLoad( gtaoDepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 );
+	return textureLoad( gtaoDepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 )${ this.depthIsColor ? '.x' : '' };
 }
 fn gtaoLoad( p: vec2i ) -> f32 {
 	let s = vec2i( textureDimensions( gtaoDepth ) );
-	return textureLoad( gtaoDepth, clamp( p, vec2i( 0 ), s - 1 ), 0 );
+	return textureLoad( gtaoDepth, clamp( p, vec2i( 0 ), s - 1 ), 0 )${ this.depthIsColor ? '.x' : '' };
 }
 // three's getViewPosition (WebGPU coordinate system)
 fn gtaoViewPosition( uv: vec2f, depth: f32 ) -> vec3f {
@@ -142,7 +145,7 @@ fn fragment( in: FSIn ) -> vec4f {
 	// Sidestep the nearest-rounding during depth access for the unjittered center pixel to avoid banding
 	var depth: f32;
 	if ( gtao.resolutionScaleU < 1.0 ) {
-		let g = textureGather( gtaoDepth, smpNearestClamp, uvNode );
+		let g = textureGather( ${ this.depthIsColor ? '0, ' : '' }gtaoDepth, smpNearestClamp, uvNode );
 		depth = min( min( g.x, g.y ), min( g.z, g.w ) );
 	} else {
 		depth = gtaoSampleDepth( uvNode );

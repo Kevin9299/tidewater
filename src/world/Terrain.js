@@ -354,9 +354,13 @@ const TERRAIN_SURFACE = /* wgsl */`
 		sand = sand * ( 1.0 - pathW * 0.07 );
 
 		// wind ripples on the dry sand: crests across the wind (bent by the fbm), wavelength
-		// 8-13 cm, fading where trodden; visible in the albedo too (finer sand on the crests)
+		// ~10.5 cm, fading where trodden; visible in the albedo too (finer sand on the crests).
+		// (A wavelength varying in space must not divide the absolute coordinate: the phase then
+		// swings by x * dλ / λ², which at 100 m from the origin turned the ripples into patches
+		// of random direction and spacing with seams and moiré, and made fwidth switch them off
+		// in blotches. The spacing varies through the smooth warp instead.)
 		let wd = frame.windDir;
-		let ph1 = dot( xz, wd ) * 6.2832 / mix( 0.08, 0.13, macroB ) + dM.w * 24.0 + dN.w * 7.0;
+		let ph1 = dot( xz, wd ) * ( 6.2832 / 0.105 ) + dM.w * 24.0 + dN.w * 7.0 + macroB * 30.0;
 		let fade1 = 1.0 - smoothstep( 0.6, 2.2, fwidth( ph1 ) );
 		let rip1 = pow( sin( ph1 ) * 0.5 + 0.5, 1.6 );
 		let windK = fade1 * smoothstep( 1.5, 2.2, h ) * ( 1.0 - pathW ) * ( 1.0 - trod * 0.7 )
@@ -475,6 +479,46 @@ const TERRAIN_SURFACE = /* wgsl */`
 		albedo = mix( albedo, sand, max( sandW, underW * notRock ) );
 		albedo = mix( albedo, rockAlbedo, rockW );
 
+		// ---- eroded beach scarp (splat alpha on land): storm-cut face of the foredune. Layered
+		// sandy soil (laminae of paler and darker sand, darker humus-stained patches), live roots
+		// and pale dead-root tangles hanging out of the face, damp darker sand at the toe.
+		let scarpW = sat( sp.w * 1.6 ) * landW * notRock;
+		var scarpH = 0.0;
+		if ( scarpW > 0.003 ) {
+
+			// laminae: thin storm layers, warped and wedging out, with a set of cross-beds at a low angle
+			let tanF = normalize( vec2f( -N0.z, N0.x ) + vec2f( 1e-4, 0.0 ) );
+			let alongF = dot( xz, tanF );
+			let hw = h + ( dM.w - 0.5 ) * 0.5 + ( dN.w - 0.5 ) * 0.12 + ( macroB - 0.5 ) * 0.35;
+			let lam = sin( hw * ( 6.2832 / 0.11 ) + dN.x * 2.0 ) * 0.5 + 0.5;
+			let cross = sin( ( hw + alongF * 0.09 ) * ( 6.2832 / 0.075 ) ) * 0.5 + 0.5;
+			let lamB = smoothstep( 0.3, 0.7, sin( ( hw + dM.y * 0.4 ) * ( 6.2832 / 0.43 ) ) * 0.5 + 0.5 );
+			let layerMix = mix( lam, cross, smoothstep( 0.4, 0.6, dM.x ) );
+			var soil = mix( ${ S( 0.5, 0.42, 0.31 ) }, ${ S( 0.68, 0.6, 0.46 ) }, smoothstep( 0.3, 0.8, layerMix ) * 0.45 + lamB * 0.2 + ( grain - 0.45 ) * 0.5 + ( dM.w - 0.5 ) * 0.3 );
+			// humus-stained, rootier soil in patches (the old dune surface caught in the cut)
+			soil = mix( soil, ${ S( 0.26, 0.2, 0.14 ) }, smoothstep( 0.55, 0.8, dM.y + ( macroB - 0.5 ) * 0.5 ) * 0.55 );
+			// roots: horizontal coordinate along the face, stretched down the fall line
+			let ru = terDetail( vec2f( dot( xz, tanF ) / 0.8, h / 0.5 ) + vec2f( 0.37, 0.11 ) );
+			let rv = terDetail( vec2f( dot( xz, tanF ) / 1.7 + h * 0.6, h / 0.9 ) + vec2f( 0.71, 0.29 ) );
+			let rootLive = smoothstep( 0.035, 0.0, abs( ru.x - 0.5 ) ) * smoothstep( 0.45, 0.62, ru.w );
+			let rootDead = smoothstep( 0.03, 0.0, abs( rv.z - 0.52 ) ) * smoothstep( 0.5, 0.66, rv.y );
+			soil = mix( soil, ${ S( 0.17, 0.12, 0.08 ) }, rootLive * 0.85 );
+			soil = mix( soil, ${ S( 0.8, 0.75, 0.66 ) }, rootDead * 0.75 );
+			// damp, darker sand toward the toe and in seepage streaks
+			let seep = smoothstep( 0.6, 0.8, terDetail( vec2f( dot( xz, tanF ) / 2.3, h / 6.0 ) ).w ) * 0.35;
+			soil = soil * ( 1.0 - seep - smoothstep( 0.5, 1.0, sp.w ) * 0.08 );
+			// under the lip: the dark, rooty topsoil the grass grows in, overhanging the cut
+			let lip = smoothstep( 0.86, 0.97, sp.w + ( dN.y - 0.45 ) * 0.1 );
+			soil = mix( soil, ${ S( 0.2, 0.15, 0.1 ) } * ( dN.x * 0.4 + 0.8 ), lip * 0.85 );
+			// foot of the face: undercut by the swash of storm waves, in its own shadow
+			soil *= 1.0 - ( 1.0 - smoothstep( 0.6, 0.78, sp.w ) ) * smoothstep( 0.35, 0.55, sp.w ) * 0.25;
+			// slumped sand and fallen chunks at the toe: damp beach sand rather than soil
+			soil = mix( ${ S( 0.63, 0.56, 0.44 ) } * ( grain * 0.3 + 0.85 ), soil, smoothstep( 0.35, 0.75, sp.w ) );
+			albedo = mix( albedo, soil, scarpW );
+			scarpH = ( lip * 0.03 + layerMix * 0.012 + lamB * 0.018 + rootLive * 0.012 + rootDead * 0.009 + dN.x * 0.025 );
+
+		}
+
 		// ---- wetness (swash zone) from the shore system, else a static damp band
 		let wetFoam = terWetFoam( xz, h );
 		let wet = sat( wetFoam.x ) * ( 1.0 - jungleW * 0.8 ) * landW;
@@ -511,6 +555,7 @@ const TERRAIN_SURFACE = /* wgsl */`
 		rough = mix( rough, mix( 0.42, 0.16, wet ), wetK );
 		rough = mix( rough, 0.7, residue );
 		rough = mix( rough, 0.75, underW );
+		rough = mix( rough, 0.94, scarpW );
 		outRough = rough;
 
 		// ---- micro relief for the normal
@@ -528,6 +573,7 @@ const TERRAIN_SURFACE = /* wgsl */`
 		var hd = mix( mix( groundH, screeH, screeW ), dirtH, pathW );
 		hd = mix( hd, sandH + seabedH, max( sandW, underW * notRock ) );
 		hd = mix( hd, rockHd, rockW );
+		hd = mix( hd, scarpH, scarpW );
 		hdOut = hd;
 
 		// ---- ambient occlusion: baked horizon + cavity, plus litter / crevices / seagrass canopy

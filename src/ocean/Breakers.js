@@ -1,6 +1,6 @@
 import { Vector3, Sphere, Mesh, BufferGeometry, BufferAttribute } from '../engine/index.js';
-import { StorageBuffer, UniformBlock, ShaderModule, ComputeKernel, Material, commonModule, LAYERS } from '../engine/webgpu.js';
-import { GRAVITY } from '../engine/render/Frame.js';
+import { GPU, StorageBuffer, UniformBlock, ShaderModule, ComputeKernel, Material, Readback, commonModule, LAYERS } from '../engine/webgpu.js';
+import { GRAVITY, G } from '../engine/render/Frame.js';
 import { makeLaceTexture, LACE_TILE } from './SurfFoam.js';
 
 // Plunging breakers along the main beach.
@@ -75,6 +75,7 @@ export class Breakers {
 			sheet: [ 'f32', 1 ], // lip opacity multiplier
 			emitRange: [ 'f32', 240 ], // no emission beyond this camera distance
 			amplitude: [ 'f32', 1 ], // WaterSurface.amplitude (FFT displacement scale), copied each update
+			budget: [ 'f32', 0.3 ], // emission scale that keeps the spray ring from wrapping (see update)
 		} );
 		const F = this.uniforms.fields;
 		this.params = { spray: F.spray, sheet: F.sheet, emitRange: F.emitRange };
@@ -160,6 +161,52 @@ fn breakersSprayShadow( p: vec3f, seedTag: f32 ) -> f32 {
 		this.cameraPos.value.copy( camera.position );
 		if ( this.surface && this.surface.amplitude ) this.uniforms.fields.amplitude.value = this.surface.amplitude.value;
 		if ( this.kernel ) this.kernel.dispatch( Math.ceil( this.NS / 64 ) );
+		this._budget();
+
+	}
+
+	// Emission budget. The emitters write into the spray's GPU ring (NG slots): emitting faster than
+	// NG per particle lifetime overwrites particles a few frames after they're born (big surf made
+	// ~8k a frame into a 32k ring: every sprite popped out again within ~60 ms). The ring head is read
+	// back (a few frames late) and the emission scale steered so the ring holds ~2 s of spray.
+	_budget() {
+
+		const sp = this.spray;
+		if ( ! sp || ! sp.head ) return;
+		if ( ! this._rb ) {
+
+			this._rb = new Readback( { byteLength: 4, ring: 3, label: 'breakersHead' } );
+			this._hist = [];
+			this._simT = new Map(); // GPU frame -> simulation time (emission is scaled by frame.dt)
+
+		}
+
+		if ( this._rb.request( sp.head ) ) this._simT.set( GPU.frame, G.time.value );
+		if ( this._rb.latest && this._simT.has( this._rb.frame ) ) {
+
+			const head = new Uint32Array( this._rb.latest )[ 0 ];
+			const now = this._simT.get( this._rb.frame );
+			for ( const f of this._simT.keys() ) if ( f < this._rb.frame ) this._simT.delete( f );
+			const H = this._hist;
+			if ( ! H.length || H[ H.length - 1 ].t !== now ) H.push( { head, t: now } );
+			while ( H.length > 2 && now - H[ 0 ].t > 2.5 ) H.shift();
+			if ( H.length > 1 ) {
+
+				const a = H[ 0 ], b = H[ H.length - 1 ];
+				const dt = b.t - a.t;
+				if ( dt > 1.0 ) {
+
+					const rate = ( ( b.head - a.head ) >>> 0 ) / dt; // particles / s (uint wrap safe)
+					const target = sp.NG / 2.0;
+					const k = this.uniforms.fields.budget;
+					const want = rate > 1 ? k.value * Math.sqrt( target / rate ) : 1;
+					k.value = Math.min( 1, Math.max( 0.05, k.value + ( want - k.value ) * 0.04 ) );
+
+				}
+
+			}
+
+		}
 
 	}
 
@@ -355,13 +402,18 @@ fn breakersCount( rate: f32, gain: f32, seed: u32, salt: u32 ) -> u32 {
 fn breakersEmit( i: u32, slot: u32, root: vec3f, dir: vec2f, b: f32, H: f32, trough: f32, c: f32, m: f32, depth: f32, bore: vec4f ) {
 	let camFade = smoothstep( breakersP.emitRange, breakersP.emitRange * 0.35, length( root - breakersP.cameraPos ) );
 	let gain = breakersP.spray * camFade * frame.dt;
+	// the many sub-pixel drops and ligaments take the ring budget; the few, visible spray and mist
+	// sprites always get their full rate
+	let gainD = gain * breakersP.budget;
 	let d3 = vec3f( dir.x, 0.0, dir.y );
 	let tg = vec3f( - dir.y, 0.0, dir.x );
 	let up = vec3f( 0.0, 1.0, 0.0 );
 	let Hc = clamp( H, 0.15, 3.0 );
-	let E = pow( Hc, 2.5 );
+	// (the energy released goes as H^2.5, but what reads on screen saturates: bigger breakers make
+	// bigger, longer-lived structures, not ever more particles)
+	let E = pow( Hc, 1.7 );
 	let Hb = max( bore.x, 0.0 );
-	let Eb = pow( min( Hb, 2.0 ) / 0.6, 2.5 );
+	let Eb = pow( min( Hb, 2.0 ) / 0.6, 1.7 );
 	let Wt = bore.y;
 	let q = clamp( b / 0.9, 0.0, 1.0 );
 	let Xi = H * 0.8;
@@ -385,13 +437,13 @@ fn breakersEmit( i: u32, slot: u32, root: vec3f, dir: vec2f, b: f32, H: f32, tro
 	let drift = smoothstep( 9.0, 15.0, offshore ) * smoothstep( -0.4, 0.1, b ) * ( 1.0 - smoothstep( 0.75, 0.9, b ) );
 
 	// ---- drops and ligaments (ballistic)
-	let n0 = breakersCount( lipShed * 14.0 * E, gain, seed, 1u ); // drops off the lip
-	let n1 = n0 + breakersCount( lipShed * 5.0 * E, gain, seed, 2u ); // ligaments off the lip
-	let n2 = n1 + breakersCount( impact * 520.0 * E, gain, seed, 3u ); // splash-up drops
-	let n3 = n2 + breakersCount( impact * 90.0 * E, gain, seed, 4u ); // splash-up ligaments (torn strands)
-	let n4 = n3 + breakersCount( roller * 90.0 * Eb, gain, seed, 5u ); // roller front (breaks up its silhouette)
-	let n5 = n4 + breakersCount( clash * 40.0 * Eb, gain, seed, 6u ); // bore / backwash collision
-	let n6 = n5 + breakersCount( drift * 24.0 * Hc, gain, seed, 7u ); // spindrift
+	let n0 = breakersCount( lipShed * 9.0 * E, gainD, seed, 1u ); // drops off the lip
+	let n1 = n0 + breakersCount( lipShed * 5.0 * E, gainD, seed, 2u ); // ligaments off the lip
+	let n2 = n1 + breakersCount( impact * 240.0 * E, gainD, seed, 3u ); // splash-up drops
+	let n3 = n2 + breakersCount( impact * 90.0 * E, gainD, seed, 4u ); // splash-up ligaments (torn strands)
+	let n4 = n3 + breakersCount( roller * 45.0 * Eb, gainD, seed, 5u ); // roller front (breaks up its silhouette)
+	let n5 = n4 + breakersCount( clash * 40.0 * Eb, gainD, seed, 6u ); // bore / backwash collision
+	let n6 = n5 + breakersCount( drift * 24.0 * Hc, gainD, seed, 7u ); // spindrift
 	if ( n6 > 0u ) {
 		let base = sprayReserve( n6 );
 		for ( var j = 0u; j < n6; j++ ) {
@@ -451,7 +503,8 @@ fn breakersEmit( i: u32, slot: u32, root: vec3f, dir: vec2f, b: f32, H: f32, tro
 			let isSpit = j < c1;
 			let isRol = j < c2;
 			// torn sheets of the splash-up (half-width): many small ones, a few big
-			let sz = select( select( select( 0.08, sqrt( Hb / 0.5 ) * ( r2 * 0.04 + 0.05 ), isRol ), sqrt( Hc ) * 0.14, isSpit ), sqrt( Hc ) * ( r2 * r2 * 0.14 + 0.08 ), isImp );
+			// (heavy-tailed: many small torn sheets, a few big ones; never a row of equal puffs)
+			let sz = select( select( select( 0.05 + r2 * r2 * 0.08, sqrt( Hb / 0.5 ) * ( r2 * r2 * 0.06 + 0.03 ), isRol ), sqrt( Hc ) * ( r2 * r2 * 0.14 + 0.05 ), isSpit ), sqrt( Hc ) * ( r2 * r2 * r2 * 0.18 + 0.05 ), isImp );
 			// splash-up: sheets thrown up and forward out of the plunge line, rising up to ~1.3 H and
 			// falling back as curtains
 			let pl = breakersPlunge( C, r1, r3 );
@@ -478,7 +531,25 @@ fn breakersEmit( i: u32, slot: u32, root: vec3f, dir: vec2f, b: f32, H: f32, tro
 	// ---- mist: the fine spray that drifts off with the wind (and the air pushed by the wave)
 	// (few, large, faint sprites: mist is the biggest overdraw of the spray)
 	let m0 = breakersCount( haze * 5.0 * E + spit * 3.0 * E, gain, seed, 31u );
-	let m1 = m0 + breakersCount( roller * 2.5 * Eb, gain, seed, 32u );
+	// the lip feathers as it throws: a thin wisp torn off the crest and carried by the air (with the
+	// wind; the drag toward the air velocity turns it back over the crest in an offshore wind)
+	let mL = breakersCount( lipShed * 1.6 * E, gain, seed, 33u );
+	// the churning top of the bore smokes: a thin haze drifting off it softens its silhouette (a bore
+	// front isn't a hard white edge), some of it lingering as it drifts up the beach
+	let m1 = m0 + breakersCount( roller * 4.5 * Eb, gain, seed, 32u );
+	if ( mL > 0u ) {
+		let base = sprayReserve( mL );
+		for ( var j = 0u; j < mL; j++ ) {
+			let ring = spraySlot( base, j );
+			let h = seed + j * 23u;
+			let r0 = sprayRand( h, 61u );
+			let r1 = sprayRand( h, 62u );
+			let r2 = sprayRand( h, 63u );
+			let p = breakersTipAt( C, r1 * 0.4 ) + up * ( r2 * 0.1 ) + breakersAlong( C, r0 );
+			let v = d3 * ( c * ( r1 * 0.2 + 0.85 ) ) + up * ( r2 * 0.8 + 0.3 );
+			sprayWrite( ring, p, v, ( r2 * r2 * 0.2 + 0.1 ) * sqrt( Hc ), SPRAY_MIST, r1 * 0.8 + 0.7, tag + r0 * 0.999 );
+		}
+	}
 	if ( m1 > 0u ) {
 		let base = sprayReserve( m1 );
 		for ( var j = 0u; j < m1; j++ ) {
@@ -491,10 +562,10 @@ fn breakersEmit( i: u32, slot: u32, root: vec3f, dir: vec2f, b: f32, H: f32, tro
 			let isImp = j < m0;
 			let pl = breakersPlunge( C, r1, r3 );
 			let ft = breakersFacePoint( C, r1 * 0.3 );
-			let p = select( ft.p + ft.n * 0.15, pl.p + pl.n * 0.2 + up * ( r2 * Hc * 0.4 ), isImp ) + breakersAlong( C, r0 );
-			let v = select( d3 * ( c * 0.8 ) + up * 0.2, d3 * ( c * ( r1 * 0.3 + 0.4 ) ) + up * ( r3 * 0.9 + 0.4 ), isImp );
-			let size = select( r3 * 0.15 + 0.3, sqrt( Hc ) * ( r3 * 0.3 + 0.45 ), isImp );
-			let life = select( r3 * 1.0 + 1.5, r3 * 1.5 + 2.5, isImp );
+			let p = select( ft.p + ft.n * 0.15 + up * ( r2 * r2 * Hb * 0.35 ), pl.p + pl.n * 0.2 + up * ( r2 * Hc * 0.4 ), isImp ) + breakersAlong( C, r0 );
+			let v = select( d3 * ( c * ( r1 * 0.3 + 0.65 ) ) + up * ( r2 * 0.4 + 0.15 ), d3 * ( c * ( r1 * 0.3 + 0.4 ) ) + up * ( r3 * 0.9 + 0.4 ), isImp );
+			let size = select( ( r3 * r3 * 0.35 + 0.18 ) * sqrt( max( Hb, 0.2 ) / 0.6 ), sqrt( Hc ) * ( r3 * 0.3 + 0.45 ), isImp );
+			let life = select( r3 * r3 * 3.0 + 1.2, r3 * 1.5 + 2.5, isImp );
 			sprayWrite( ring, p, v, size, SPRAY_MIST, life, tag + r0 * 0.999 );
 		}
 	}

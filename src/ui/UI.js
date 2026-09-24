@@ -1894,6 +1894,7 @@ export class UI {
 		this.onPanelInteract = null; // ( event ) pointerdown on the settings panel or rail
 		this.onPanelToggle = null; // ( open )
 		this.onHelpToggle = null; // ( open )
+		this.onReplayGuide = null; // (): the fishing game's first-play guide
 		// Opening the panel exits pointer lock so the cursor can reach it.
 		this.releasePointerOnPanel = true;
 
@@ -2146,8 +2147,12 @@ export class UI {
 					</section>
 					<section>
 						<h3>Interact</h3>
-						${ row( k( 'E' ), 'Interact, board or leave the boat' ) }
+						${ row( k( 'E' ), 'Interact<small>Board, helm, step ashore, trade</small>' ) }
 						${ row( k( 'V' ), 'Boat camera<small>1st / 3rd person</small>' ) }
+						${ row( k( 'R' ), 'Fishing rod<small>Take out / put away</small>' ) }
+						${ row( k( 'LMB' ), 'Cast, strike, reel<small>Hold to wind up / reel</small>' ) }
+						${ row( k( 'RMB' ), 'Reel in an empty line' ) }
+						${ row( k( 'I' ), 'Cooler and fish log' ) }
 						${ row( k( 'F' ), 'Free camera' ) }
 						${ row( k( 'T' ), 'Pause time' ) }
 						${ row( k( 'L' ), 'Flashlight' ) }
@@ -2161,8 +2166,13 @@ export class UI {
 						${ row( k( 'Esc' ), 'Release the mouse' ) }
 					</section>
 				</div>
+				<div class="tw-help-guide">
+					<span><b>How to play:</b> catch fish, sell them to Joe at the fish stand by the pier, and buy upgrades from Marta at the chandlery by the boathouse. Both are on the map (lower right).</span>
+					<button type="button" class="gm-btn is-ghost tw-help-replay">Replay the guide</button>
+				</div>
 			</div>`;
 		el.querySelector( '.tw-help-close' ).addEventListener( 'click', () => this.toggleHelp( false ) );
+		el.querySelector( '.tw-help-replay' ).addEventListener( 'click', () => callHook( this.onReplayGuide ) );
 		el.addEventListener( 'click', ( e ) => {
 
 			if ( e.target === el ) this.toggleHelp( false );
@@ -3201,23 +3211,106 @@ export class UI {
 	}
 
 	// ── loader (static markup in index.html) ────────────────────────────────
+	//
+	// setLoading( p, status, until ): a stage starts at progress p (0..1). While it runs the bar creeps
+	// towards `until` (default p + 0.05) without reaching it, so a long stage never looks frozen while
+	// scripts run. setLoadingDetail( done, total ): sub-progress of the current stage (e.g. pipelines
+	// compiled / total), mapped between p and `until`. setLoadingError( message ).
 
-	setLoading( progress01, status ) {
+	setLoading( progress01, status, until ) {
 
 		const L = document.getElementById( 'loader' );
 		if ( ! L ) return;
+		const ld = this._loaderState();
 		if ( typeof progress01 === 'number' && isFinite( progress01 ) ) {
 
-			L.classList.add( 'tw-determinate' );
-			const fill = L.querySelector( '.loader-fill' );
-			if ( fill ) fill.style.transform = `scaleX(${ clamp( progress01, 0, 1 ).toFixed( 4 ) })`;
+			const p = clamp( progress01, 0, 1 );
+			ld.from = Math.max( p, ld.shown );
+			ld.until = clamp( typeof until === 'number' ? until : p + 0.05, ld.from, p >= 1 ? 1 : 0.995 );
+			ld.stageT = performance.now();
+			ld.tau = typeof until === 'number' ? 40000 : 6000;
+			ld.detail = - 1;
+			if ( p >= 1 ) ld.shown = 1;
 
 		}
 
 		if ( status != null ) {
 
-			const s = L.querySelector( '.loader-status' );
-			if ( s ) s.textContent = String( status );
+			ld.status = String( status );
+			if ( ld.statusEl ) ld.statusEl.textContent = ld.status;
+			L.classList.toggle( 'is-compiling', /shader/i.test( ld.status ) );
+
+		}
+
+		this._loaderPaint();
+
+	}
+
+	setLoadingDetail( done, total ) {
+
+		const ld = this._loaderState();
+		if ( ! ( total > 0 ) ) return;
+		ld.detail = clamp( done / total, 0, 1 );
+		if ( ld.statusEl ) ld.statusEl.textContent = `${ ld.status.replace( /…$/, '' ) } · ${ done } / ${ total }`;
+		this._loaderPaint();
+
+	}
+
+	setLoadingError( message ) {
+
+		const L = document.getElementById( 'loader' );
+		if ( ! L ) return;
+		const ld = this._loaderState();
+		L.classList.add( 'tw-error' );
+		L.classList.remove( 'is-compiling' );
+		ld.status = String( message );
+		if ( ld.statusEl ) ld.statusEl.textContent = ld.status;
+		ld.stopped = true;
+
+	}
+
+	_loaderState() {
+
+		if ( this._ld ) return this._ld;
+		const L = document.getElementById( 'loader' );
+		const q = ( sel ) => L && L.querySelector( sel );
+		const ld = this._ld = {
+			from: 0, until: 0.05, shown: 0, stageT: performance.now(), tau: 6000, detail: - 1, status: '',
+			t0: performance.now(), stopped: false,
+			fill: q( '.loader-fill' ), pct: q( '.loader-pct' ), time: q( '.loader-time' ), statusEl: q( '.loader-status' ),
+		};
+		// eased bar + elapsed clock while scripts run (the CSS glint and tips keep moving when they don't)
+		const tick = () => {
+
+			if ( ld.stopped ) return;
+			this._loaderPaint();
+			ld.raf = requestAnimationFrame( tick );
+
+		};
+
+		ld.raf = requestAnimationFrame( tick );
+		return ld;
+
+	}
+
+	_loaderPaint() {
+
+		const ld = this._ld;
+		if ( ! ld ) return;
+		const now = performance.now();
+		const goal = ld.detail >= 0
+			? ld.from + ( ld.until - ld.from ) * ld.detail
+			: ld.from + ( ld.until - ld.from ) * ( 1 - Math.exp( - ( now - ld.stageT ) / ld.tau ) );
+		const dt = Math.min( 0.1, ( now - ( ld.lastT || now ) ) / 1000 );
+		ld.lastT = now;
+		// ease toward the goal; a jump after a blocked stretch settles in ~0.3 s instead of snapping
+		ld.shown += ( Math.max( goal, ld.shown ) - ld.shown ) * ( dt > 0 ? 1 - Math.exp( - dt * 9 ) : 0 );
+		if ( ld.fill ) ld.fill.style.transform = `scaleX(${ Math.max( 0.02, ld.shown ).toFixed( 4 ) })`;
+		if ( ld.pct ) ld.pct.textContent = Math.floor( ld.shown * 100 ) + '%';
+		if ( ld.time ) {
+
+			const s = Math.floor( ( now - ld.t0 ) / 1000 );
+			ld.time.textContent = Math.floor( s / 60 ) + ':' + String( s % 60 ).padStart( 2, '0' );
 
 		}
 
@@ -3229,14 +3322,22 @@ export class UI {
 		const L = document.getElementById( 'loader' );
 		if ( ! L ) return Promise.resolve();
 		if ( this._loaderGone ) return this._loaderGone;
-		this.setLoading( 1 );
+		this.setLoading( 1, 'Ready' );
+		L.classList.remove( 'is-compiling' );
 		L.classList.add( 'tw-hidden' );
 		this._loaderGone = new Promise( ( resolve ) => setTimeout( () => {
+
+			if ( this._ld ) {
+
+				this._ld.stopped = true;
+				cancelAnimationFrame( this._ld.raf );
+
+			}
 
 			L.style.display = 'none';
 			resolve();
 
-		}, 720 ) );
+		}, 920 ) );
 		return this._loaderGone;
 
 	}

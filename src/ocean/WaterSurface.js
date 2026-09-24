@@ -177,7 +177,9 @@ ${ SH ? /* wgsl */`
 	let sw = shoreEvaluate( worldXZ, depth, ground );
 	extra += sw.disp;
 	shoreN = clamp( sw.nShore, vec3f( -1.0 ), vec3f( 1.0 ) );
-	shoreFoam = sw.foam + sw.swashFoam * smoothstep( 0.4, -0.2, depth );
+	// (the foam line on the swash front is added per pixel in the water shader: on this coarse mesh
+	// it would end short of the front and follow the triangles)
+	shoreFoam = sw.foam;
 	surfMask = vec2f( sw.face, sw.roller );
 	let swashLevel = sw.swashLevel;` : '' }
 ${ WK ? '	extra += wakeDisplacement( worldXZ );' : '' }

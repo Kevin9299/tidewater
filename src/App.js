@@ -38,6 +38,7 @@ import { ShoreWaves } from './ocean/ShoreWaves.js';
 import { ShoreSim } from './ocean/ShoreSim.js';
 import { Caustics } from './ocean/Caustics.js';
 import { installUnderwaterLighting } from './ocean/UnderwaterLighting.js';
+import { RefractionPass } from './ocean/RefractionPass.js';
 import { installGroundBounce } from './materials/GroundBounce.js';
 import { LocalLights, addVillageLights, addBoatLights } from './materials/LocalLights.js';
 import { installContactShadows, ContactShadows } from './materials/ContactShadows.js';
@@ -54,6 +55,9 @@ import { PostFX } from './post/PostFX.js';
 import { AirHaze } from './post/AirHaze.js';
 import { FlyCamera } from './player/FlyCamera.js';
 import { Player } from './player/Player.js';
+import { Game } from './game/Game.js';
+import { STAND } from './game/FishStand.js';
+import { CHANDLERY } from './game/Chandlery.js';
 import { BoatController } from './player/BoatController.js';
 import { BoatSpray } from './player/BoatSpray.js';
 import { WakeSim } from './ocean/WakeSim.js';
@@ -78,10 +82,17 @@ export class App {
 
 	}
 
-	async init( progress = () => {} ) {
+	async init( onProgress = () => {} ) {
 
 		const qs = this.qs;
-		progress( 0.05, 'Starting WebGPU…' );
+		// report a stage, then let the page paint it before the (synchronous) stage work starts
+		const progress = async ( p, text, until ) => {
+
+			onProgress( p, text, until );
+			if ( typeof requestAnimationFrame === 'function' ) await new Promise( ( r ) => requestAnimationFrame( () => setTimeout( r, 0 ) ) );
+
+		};
+		await progress( 0.02, 'Starting WebGPU…' );
 		const engine = this.engine = new Engine( document.getElementById( 'app' ) );
 		await engine.init();
 		// systems take `renderer` first as in the three.js version: it is the Engine now (GPU access is global)
@@ -99,7 +110,7 @@ export class App {
 		this.fly.setPose( new Vector3( 20, 6, - 20 ), Math.PI * 0.9, - 0.12 );
 
 		// ---------------------------------------------------------------- sky
-		progress( 0.1, 'Building atmosphere…' );
+		await progress( 0.04, 'Building the atmosphere…' );
 		this.atmosphere = new Atmosphere( renderer );
 		this.sky = new Sky( this.atmosphere );
 		if ( ! qs.has( 'noClouds' ) ) {
@@ -119,22 +130,22 @@ export class App {
 		this.environment = new Environment( renderer, scene, this.sky );
 
 		// ---------------------------------------------------------------- island
-		progress( 0.18, 'Generating island…' );
+		await progress( 0.06, 'Shaping the island…' );
 		this.terrainData = new TerrainData();
 		this.colliders = new Colliders();
 		// the village flattens building pads into the heightmap: build it before any terrain
 		// data is derived (shore field, GPU textures, meshes)
-		progress( 0.24, 'Building the village…' );
+		await progress( 0.12, 'Building the village…' );
 		this.village = new Village( { scene, terrain: this.terrainData, colliders: this.colliders } );
 		if ( ! qs.has( 'noVeg' ) ) {
 
-			progress( 0.27, 'Planting…' );
+			await progress( 0.14, 'Planting the island…' );
 			this.vegetation = new Vegetation( { scene, terrain: this.terrainData, village: this.village } );
 			useStaticVelocity( this.vegetation.group );
 
 		}
 
-		progress( 0.3, 'Propagating swell…' );
+		await progress( 0.19, 'Rolling in the swell…' );
 		this.shoreField = computeShoreField( this.terrainData, { res: 512, swellDir: [ WORLD.swellDir.x, WORLD.swellDir.y ] } );
 		this.terrainGPU = new TerrainGPU( this.terrainData, this.shoreField );
 		// terrain and rocks apply the heightfield sun shadow (long hill shadows) in their own lighting
@@ -146,7 +157,7 @@ export class App {
 		this.terrain.mesh.material.appliesHillShadow = true;
 		this.rocks.material.appliesHillShadow = true;
 
-		progress( 0.36, 'Growing the reef…' );
+		await progress( 0.23, 'Growing the reef…' );
 		this.reef = new Reef( { scene, terrain: this.terrainData, shoreField: this.shoreField } );
 
 		this.boat = new BoatModel();
@@ -155,7 +166,7 @@ export class App {
 		this.boat.group.rotation.y = WORLD.boatDock.heading;
 
 		// ---------------------------------------------------------------- ocean
-		progress( 0.45, 'Simulating ocean spectrum…' );
+		await progress( 0.3, 'Simulating the ocean…' );
 		this.fft = new OceanFFT( renderer );
 		if ( this.reef.setOcean ) this.reef.setOcean( this.fft ); // coral / sea fan sway follows the simulated swell
 		this.foamTexture = createFoamTexture( renderer );
@@ -203,7 +214,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		underwaterMode( this.boat.group, 'lite' );
 		if ( this.vegetation ) underwaterMode( this.vegetation.group, 'none' );
 
-		installUnderwaterLighting( {
+		this.underwaterLighting = installUnderwaterLighting( {
 			fft: this.fft, caustics: this.caustics, clouds: this.clouds, terrain: this.terrainGPU,
 			shore: this.shore, surface: this.surface, shoreSim: this.shoreSim,
 		} );
@@ -211,6 +222,9 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		// sunlight bounced off the ground (one diffuse bounce, re-baked with the terrain sun shadow)
 		installGroundBounce( { terrain: this.terrainGPU, clouds: this.clouds } );
 		this.sceneRenderer = new SceneRenderer( engine.meshRenderer, scene, camera );
+		// the water's refraction source: the scene below the water only, half resolution
+		this.refraction = new RefractionPass( { meshRenderer: engine.meshRenderer, scene, camera, sceneRenderer: this.sceneRenderer, scale: 0.5 } );
+		this.sceneRenderer.onBeforeWater = () => this.refraction.render( G.seaLevel.value );
 		if ( this.sky.background ) this.sceneRenderer.background = this.sky.background;
 		// screen-space contact shadows for the sun from last frame's opaque depth (foliage only casts)
 		installContactShadows( { depthTexture: this.sceneRenderer.opaqueCopy.depthTexture, skip: [ this.vegetation && this.vegetation.group, this.boat.group ] } );
@@ -229,7 +243,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		// the sea is not drawn inside the boat (its hull volume masks the surface)
 		this.sceneRenderer.addHullMask( this.boat.createHullVolumeGeometry(), this.boat.group );
 		this.waterMaterial = new WaterMaterial( {
-			surface: this.surface, sky: this.sky, sceneCopy: this.sceneRenderer.opaqueCopy,
+			surface: this.surface, sky: this.sky, sceneCopy: this.sceneRenderer.opaqueCopy, refraction: this.refraction,
 			hullMask: this.sceneRenderer.hullMaskRT.texture, hullMaskActive: this.sceneRenderer.hullMaskActive,
 		} );
 		this.waterMaterial.clouds = this.clouds;
@@ -304,7 +318,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		this.freeCam = qs.has( 'fly' );
 
 		// ---------------------------------------------------------------- post
-		progress( 0.8, 'Compiling shaders…' );
+		await progress( 0.34, 'Preparing the shaders…' );
 		this.underwater = new Underwater( {
 			depthTexture: this.sceneRenderer.sceneRT.depthTexture, maskTexture: this.sceneRenderer.waterMaskTexture,
 			query: this.query, caustics: this.caustics, fft: this.fft,
@@ -324,6 +338,18 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		// recorded field recordings (public/audio, credits in public/audio/CREDITS.md); ?noAudio turns it off
 		this.audio = qs.has( 'noAudio' ) ? null : new SoundScape();
 		this.player.audio = this.audio;
+		// the fishing game (rod, bites, catch, cooler, fish stand)
+		this.game = new Game( this );
+		// the lanterns at Joe's fish stand and Marta's chandlery (lit from dusk like the village lamps);
+		// positions are in each stall's frame (x right, z toward the customer), turned by its yaw
+		for ( const [ s, lx, ly, lz ] of [ [ STAND, - 0.9, 1.85, 0.1 ], [ CHANDLERY, - 0.75, 1.58, - 1.45 ] ] ) {
+
+			const c = Math.cos( s.yaw ), sn = Math.sin( s.yaw );
+			const x = s.x + lx * c + lz * sn, z = s.z - lx * sn + lz * c;
+			this.localLights.add( { position: new Vector3( x, this.terrainData.heightAt( s.x, s.z ) + ly, z ), color: new Color( 1.0, 0.72, 0.42 ), intensity: 5 * 1.5, range: 11, kind: 'lantern', flicker: 0.08 } );
+
+		}
+
 		this.boatCtl.onSlam = ( s ) => this.audio && this.audio.hullSlap( s );
 		engine.domElement.addEventListener( 'click', () => {
 
@@ -344,9 +370,10 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 
 		// ---- compile pipelines asynchronously (keeps the page responsive), then prime a few
 		// frames behind the loading screen so any remaining first-use stalls happen there
-		progress( 0.86, 'Compiling shaders…' );
+		// stage weights: in the browser the pipeline compile below takes far longer than everything before it
+		await progress( 0.36, 'Compiling shaders…', 0.95 );
 		await this.precompile();
-		progress( 0.95, 'Warming up…' );
+		await progress( 0.96, 'Warming up…' );
 		for ( let i = 0; i < 2; i ++ ) {
 
 			this.frame( 1 / 60 );
@@ -454,7 +481,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 			this.fly.setPose( this.camera.position.clone(), e.y, e.x );
 			this.fly.velocity.set( 0, 0, 0 );
 
-		} else if ( this.player.mode !== 'boat' ) {
+		} else if ( this.player.mode !== 'boat' && this.player.mode !== 'deck' ) {
 
 			this.dropPlayerAtCamera();
 
@@ -568,6 +595,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		this.wake.update( dt );
 		if ( this.freeCam ) this.fly.update( dt );
 		else this.player.update( dt );
+		this.game.update( dt );
 		this.updateSun();
 
 		this.atmosphere.update( dt, this.camera.position.y );
@@ -596,6 +624,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		this.marineSnow.update( this.camera, this.camera.position.y < ( this.cameraWaterHeight ?? 0 ) + LENS_REACH );
 		this.airMotes.update( dt, this.camera, this.cameraWaterHeight ?? 0 );
 		if ( this.shoreSim ) this.shoreSim.update();
+		this.underwaterLighting.update( this.camera );
 		this.breakers.update( this.camera );
 		this.spray.update();
 

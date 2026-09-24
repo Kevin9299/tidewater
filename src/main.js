@@ -6,7 +6,7 @@ const ui = new UI();
 const app = new App();
 window.__ui = ui;
 
-app.init( ( p, text ) => ui.setLoading( p, text ) ).then( async () => {
+app.init( ( p, text, until ) => ui.setLoading( p, text, until ) ).then( async () => {
 
 	app.ui = new AppUI( app, ui );
 	ui.setLoading( 1, 'Ready' );
@@ -22,6 +22,6 @@ app.init( ( p, text ) => ui.setLoading( p, text ) ).then( async () => {
 } ).catch( ( e ) => {
 
 	console.error( e );
-	ui.setLoading( null, 'Error: ' + e.message );
+	ui.setLoadingError( 'Something went wrong: ' + e.message );
 
 } );

@@ -52,7 +52,7 @@ export const viewPositionFromViewZ = ( uv, viewZ ) => `viewPositionFromViewZ( ${
 // shader: previous world position = current, staticVelocity), r.mask = ( seenFromBelow, 1, 0, 1 ).
 export class WaterMaterial extends Material {
 
-	constructor( { surface, sky, sceneCopy, reflection = null, hullMask = null, hullMaskActive = null } ) {
+	constructor( { surface, sky, sceneCopy, refraction = null, reflection = null, hullMask = null, hullMaskActive = null } ) {
 
 		super( {
 			name: 'water',
@@ -107,6 +107,8 @@ export class WaterMaterial extends Material {
 		// opaque scene color/depth copies (made by SceneRenderer right before the water pass)
 		this.sceneDepthTexture = sceneCopy.depthTexture;
 		this.sceneColorTexture = sceneCopy.texture;
+		// what lies below the water only (ocean/RefractionPass.js): the refraction source
+		this.refraction = refraction;
 		// camera distance to the nearest hull-volume surface per pixel (SceneRenderer, 0 = none)
 		this.hullMaskTexture = hullMask;
 		this.hullMaskActive = hullMaskActive;
@@ -141,6 +143,15 @@ export class WaterMaterial extends Material {
 			SIM && S.shoreSim.module, REFL && this.reflection.module, this.cameraWaterHeightNode && this.cameraWaterHeightNode.module ].filter( Boolean );
 		this.bindings.waterSceneColor = { texture: this.sceneColorTexture };
 		this.bindings.waterSceneDepth = { texture: this.sceneDepthTexture, sampleType: 'unfilterable-float' };
+		const REFR = !! this.refraction;
+		if ( REFR ) {
+
+			this.bindings.waterRefrColor = { texture: this.refraction.texture };
+			this.bindings.waterRefrDepth = { texture: this.refraction.depthTexture, sampleType: 'unfilterable-float' };
+
+		}
+
+		this.setDefine( 'WATER_REFRACTION', REFR ? 1 : 0 );
 		if ( HULL ) this.bindings.waterHullMask = { texture: this.hullMaskTexture, sampleType: 'unfilterable-float' };
 		this.setDefine( 'WATER_HULL', HULL ? 1 : 0 );
 
@@ -168,9 +179,12 @@ export class WaterMaterial extends Material {
 	_shadeWGSL( { T, SH, SIM, SF, CL, HULL, REFL } ) {
 
 		const S = this.waterSurface;
-		const hasCrest = SH && S.shore.crestPath !== undefined;
-		const hasMedium = SH && S.shore.surfMedium !== undefined;
-		const hasClip = T && SH && S.shore.swashClip !== undefined;
+		// the ShoreWaves module always provides shoreCrestPath / shoreSurfMedium (WGSL; the TSL-era
+		// guards on JS methods of the same names were always false in the port)
+		const hasCrest = SH;
+		const hasMedium = SH;
+		// the ShoreWaves module always provides shoreSwashEdge / shoreSwashClip (WGSL)
+		const hasClip = T && SH;
 		const camWaterH = this.cameraWaterHeightNode ? String( this.cameraWaterHeightNode ) : 'frame.cameraWaterHeight';
 
 		return /* wgsl */`
@@ -204,8 +218,29 @@ export class WaterMaterial extends Material {
 ${ CL ? '	sunLight *= cloudsShadow( pos.xz );' : '' }
 ${ T ? '	sunLight *= terrainSunShadowAt( pos );' : '' }
 
+	// water film thickness at this pixel and the distance to the swash front (ShoreWaves.swashEdge):
+	// the sheet ends exactly on its analytic leading edge, not on the mesh triangles
+	var thickness = ${ T ? 'pos.y - terrainHeightAt( pos.xz )' : '10.0' };
+	var frontD = 1e3;
+	var swTau = 0.0;
+	var swRt = 0.0;
+${ hasClip ? `	{
+		let se = shoreSwashEdge( pos.xz, thickness );
+		thickness = se.x; frontD = se.y; swTau = se.z; swRt = se.w;
+	}` : '' }
+	// the foam line riding the swash front, per pixel: a dense bubbly bead right at the edge while
+	// the sheet runs up, a thinning lace behind it; weaker in the backwash (it sinks into the sand)
+	let uprush = smoothstep( 0.46, 0.32, swTau );
+	let bead = smoothstep( -0.01, 0.05, frontD ) * smoothstep( 0.6, 0.12, frontD );
+	let trail = smoothstep( -0.01, 0.25, frontD ) * smoothstep( 2.2, 0.3, frontD );
+	// patchy along the front (dense bunches and thin stretches), not an even white rope
+	let edgePatch = ${ hasClip ? 'smoothstep( -0.45, 0.55, perlin2( pos.xz * 0.42 ) ) * 0.7 + smoothstep( -0.3, 0.6, perlin2( pos.xz * 1.7 + vec2f( 3.1, 7.7 ) ) ) * 0.3' : '1.0' };
+	let edgeFoam = ( bead * mix( 0.45, 1.1, uprush ) * mix( 0.35, 1.0, edgePatch ) + trail * mix( 0.12, 0.4, uprush ) * edgePatch ) * smoothstep( 0.0, 1.0, swRt ) * smoothstep( 0.4, -0.2, vDepth );
+	// the meniscus: the last decimetre of the sheet bends down to the sand
+	let lipW = 1.0 - smoothstep( 0.0, 0.14, frontD );
+
 	let simState = ${ SIM ? 'shoreSimSample( pos.xz )' : 'vec4f( 0.0 )' };
-	let surf = waterSurfaceFragment( lagXZ, footprint, vDepth, in.vs.vFoam, in.vs.vShoreN, in.vs.vShoreFoam, simState.x, simState, in.vs.vSurfMask, pos );
+	let surf = waterSurfaceFragment( lagXZ, footprint, vDepth, in.vs.vFoam, in.vs.vShoreN, in.vs.vShoreFoam + edgeFoam, simState.x, simState, in.vs.vSurfMask, pos );
 	var foam = surf.foam;
 	// the whale's churned white water and flat fluke-print slick (WhaleWater.js)
 	let whaleW = whaleWater( pos.xz );
@@ -247,12 +282,9 @@ ${ SH ? '	let folded = surf.jacobian < 0.1 || normalize( in.vs.vShoreN ).y < 0.3
 	if ( ! viewFromBelow ) {
 
 		// ================= ABOVE WATER =================
-		// water film thickness at this pixel; near the leading edge the surface bends down
-		// to meet the sand like a rounded bead (meniscus), tilting the normal toward dry land
-		var thickness = ${ T ? 'pos.y - terrainHeightAt( pos.xz )' : '10.0' };
-		// the swash sheet ends exactly on its analytic leading edge (ShoreWaves.swashClip), not on the mesh triangles
-${ hasClip ? '		thickness = shoreSwashClip( pos.xz, thickness );' : '' }
-		let edgeW = 1.0 - smoothstep( 0.0, 0.006, thickness );
+		// near the leading edge the surface bends down to meet the sand like a rounded bead
+		// (meniscus), tilting the normal toward dry land
+		let edgeW = max( 1.0 - smoothstep( 0.0, 0.006, thickness ), lipW );
 		let nr = ${ T ? 'terrainNormalRock( pos.xz )' : 'vec4f( 0.0 )' };
 		let uphill = normalize( - vec2f( nr.x, nr.y ) + vec2f( 1e-5, 0.0 ) );
 		let N = normalize( Nview + vec3f( uphill.x, 0.0, uphill.y ) * ( edgeW * edgeW * 0.7 ) );
@@ -321,15 +353,40 @@ ${ T ? `		let L0 = max( pos.y - terrainHeightAt( pos.xz ), 0.0 ) / tDown;
 		let clipEnd = frame.proj * ( frame.view * vec4f( pEnd, 1.0 ) );
 		let ndcEnd = clipEnd.xy / max( clipEnd.w, 1e-4 );
 		let uvR = vec2f( ndcEnd.x * 0.5 + 0.5, ndcEnd.y * -0.5 + 0.5 );
-		let dR = _waterSceneDepthAt( uvR );
-		let sceneZR = - viewDepth( dR );
-		// the refracted sample must lie behind the water surface (else something above water is in the way)
-		let valid = surfViewZ - sceneZR > 0.05 && uvR.x > 0.0 && uvR.x < 1.0 && uvR.y > 0.0 && uvR.y < 1.0;
-		let uvF = select( screenUV, uvR, valid );
-		let sceneCol = select( textureSampleLevel( waterSceneColor, smpLinearClamp, uvF, 0.0 ).rgb, skyReflectionRadiance( normalize( vec3f( Tv.x, max( abs( Tv.y ), 0.03 ), Tv.z ) ) ), thruCrest );
+		let onScreen = all( uvR > vec2f( 0.0 ) ) && all( uvR < vec2f( 1.0 ) );
+		var uvF = screenUV;
+		var dR = sceneDepthC;
+		var sceneCol = vec3f( 0.0 );
+		var found = false;
+#if WATER_REFRACTION
+		// the scene below the water only (RefractionPass): nothing above the water (pier, rails, posts,
+		// the boat) can hide the refracted end point. Coverage in alpha: bilinear across its edge, then
+		// un-premultiplied, so the clip boundary blends instead of darkening.
+		if ( onScreen ) {
+			let rc = textureSampleLevel( waterRefrColor, smpLinearClamp, uvR, 0.0 );
+			let rSize = vec2f( textureDimensions( waterRefrDepth ) );
+			let rd = textureLoad( waterRefrDepth, vec2i( min( uvR * rSize, rSize - 1.0 ) ), 0 ).x;
+			if ( rc.a > 0.5 && rd > 0.0 ) {
+				sceneCol = rc.rgb / rc.a;
+				uvF = uvR;
+				dR = rd;
+				found = true;
+			}
+		}
+#endif
+		if ( ! found ) {
+			// nothing under the water there (shallows above the clip height, off screen): the opaque copy,
+			// where the refracted sample lies behind the water surface, else the unrefracted pixel
+			let dO = _waterSceneDepthAt( uvR );
+			let valid = onScreen && surfViewZ + viewDepth( dO ) > 0.05;
+			uvF = select( screenUV, uvR, valid );
+			dR = select( sceneDepthC, dO, valid );
+			sceneCol = textureSampleLevel( waterSceneColor, smpLinearClamp, uvF, 0.0 ).rgb;
+		}
+		sceneCol = select( sceneCol, skyReflectionRadiance( normalize( vec3f( Tv.x, max( abs( Tv.y ), 0.03 ), Tv.z ) ) ), thruCrest );
 
 		// objects in front of the sea floor (pylons, rocks, reef) shorten the path
-		let qView = viewPositionFromViewZ( uvF, - viewDepth( select( sceneDepthC, dR, valid ) ) );
+		let qView = viewPositionFromViewZ( uvF, - viewDepth( dR ) );
 		let qDist = length( qView - posV );
 		var pathLen = clamp( min( Lter, qDist ), 0.0, 400.0 );
 		pathLen = min( pathLen, crestT );
@@ -380,18 +437,25 @@ ${ hasMedium ? `		// surf zone: sand and bubbles stirred up by the breakers (see
 		let sssCol = vec3f( 0.12, 0.55, 0.45 ) * 0.06;
 		let sss = sunLight * sssCol * back * crest * mat.sss * smoothstep( 0.0, 0.25, L.y );
 
-		let transmitted = sceneCol * Tview + inSun + inAmb + sss;
+		// the bead of the meniscus shades the sand right under it
+		let transmitted = sceneCol * Tview * ( 1.0 - 0.3 * lipW ) + inSun + inAmb + sss;
 
 		// ---- foam
 		// foam: bright diffuse scatterer (albedo ~0.85), wrapped sun + sky irradiance (skyIrradiance = E/PI)
 ${ SF ? '		let foamLit = surfFoamLight( surf.foamInfo, N, L, V, sunLight, pos );' : '		let foamLit = ( sunLight * ( max( dot( N, L ), 0.0 ) * 0.75 + 0.25 ) * INV_PI + frame.skyIrradiance * 0.95 ) * 0.85;' }
 		let foamCol = foamLit * mat.foamIntensity;
 
-		let water = mix( transmitted, reflCol, F ) + sunSpec;
+		// a thin bright rim just behind the edge: the rounded bead catches the sky
+		let rim = smoothstep( 0.0, 0.025, frontD ) * smoothstep( 0.1, 0.035, frontD );
+		let water = mix( transmitted, reflCol, F ) + sunSpec + skyRefl * ( 0.22 * rim );
 		let shaded = mix( water, foamCol + sunSpec * 0.05, sat( foam ) );
 		// fade into the sand right at the leading edge (anti-aliased by the film thickness)
 		let edgeAA = smoothstep( 0.0, max( fwidth( thickness ) * 1.5, 0.004 ), thickness );
-		outCol = mix( textureSampleLevel( waterSceneColor, smpLinearClamp, screenUV, 0.0 ).rgb, shaded, edgeAA );
+		// contact shadow: the sand just ahead of the advancing edge is darkened (the bead's
+		// shadow and the wetting front), fading within ~15 cm
+		let contact = smoothstep( -0.16, -0.005, frontD ) * ( 1.0 - edgeAA );
+		let sandC = textureSampleLevel( waterSceneColor, smpLinearClamp, screenUV, 0.0 ).rgb * ( 1.0 - 0.3 * contact );
+		outCol = mix( sandC, shaded, edgeAA );
 
 	} else {
 
@@ -504,8 +568,10 @@ fn _waterProject( p: vec3f ) -> vec2f {
 // back toward the camera and at the end of the search range.
 fn _waterSSR( posV: vec3f, Rv: vec3f ) -> vec4f {
 	var hit = false;
-	var t = 0.15;
-	var dt = 0.25;
+	// steps grow with the distance: far away the first ones would all land in the same pixel
+	let stepScale = max( - posV.z / 60.0, 1.0 );
+	var t = 0.15 * stepScale;
+	var dt = 0.25 * stepScale;
 	var prevT = 0.0;
 	for ( var i = 0; i < 14; i++ ) {
 		prevT = t;

@@ -16,8 +16,7 @@ import { SCAN, SCAN_SIZE } from './ScannedDebris.js';
 //
 //  - village: clutter groups against the back and side walls of the houses and sheds (crate
 //    stacks, barrels, lobster traps with floats and rope, tyres, buckets, planks, firewood),
-//    gear stored under the stilt huts, beached skiffs, a wheelbarrow, board piles and rows of
-//    flat fieldstones along the paths
+//    gear stored under the stilt huts, beached skiffs, a wheelbarrow and board piles
 //  - shore: the wrack line along the upper swash limit (sargassum mats, seagrass ribbons,
 //    twigs, coconuts and husks, shells, coral rubble, rope, net scraps, floats and a little
 //    litter), driftwood logs and root balls along the storm line, fallen fronds and coconuts under
@@ -366,7 +365,6 @@ export class DebrisPlacer {
 
 		step( 'village', this._village );
 		step( 'boats', this._boatsAndYards );
-		step( 'pathStones', this._pathStones );
 		step( 'logs', this._logs );
 		step( 'palms', this._palmLitter );
 		step( 'wrack', this._wrack );
@@ -835,55 +833,6 @@ export class DebrisPlacer {
 
 	}
 
-	// ------------------------------------------------------------------ stones lining the paths
-
-	_pathStones() {
-
-		const rand = this.rand;
-		const g = this.ground;
-		const B = this.B;
-		const plaza = [ 41.5, - 111 ];
-		for ( const P of PATHS ) {
-
-			const pts = P.pts;
-			let acc = 0;
-			for ( let k = 0; k < pts.length - 1; k ++ ) {
-
-				const [ ax, az ] = pts[ k ], [ bx, bz ] = pts[ k + 1 ];
-				const L = Math.hypot( bx - ax, bz - az );
-				const dx = ( bx - ax ) / L, dz = ( bz - az ) / L;
-				for ( let s = 0; s < L; s += 0.8 + rand() * 0.9 ) {
-
-					acc += 1;
-					const cx = ax + dx * s, cz = az + dz * s;
-					const dVillage = Math.hypot( cx - plaza[ 0 ], cz - plaza[ 1 ] );
-					if ( dVillage > 70 ) continue; // only through and near the village
-					// runs with gaps
-					if ( this.noise.noise( cx * 0.09, cz * 0.09 ) < - 0.25 ) continue;
-					for ( const side of [ - 1, 1 ] ) {
-
-						if ( rand() < 0.22 ) continue;
-						const off = P.w + 0.28 + rand() * 0.2;
-						const x = cx - dz * side * off, z = cz + dx * side * off;
-						const h = g( x, z );
-						if ( h < 1.8 || this.sand( x, z ) > 0.55 && h < 2.6 ) continue; // not on the open beach
-						const sz = 0.09 + rand() * 0.08;
-						if ( ! this.clear( x, z, sz * 1.2, { path: 0.05 } ) ) continue;
-						stone( B, g, x, z, sz * ( 1.2 + rand() * 0.6 ), sz * ( 0.38 + rand() * 0.18 ), sz, rand, {
-							palette: 1 + 0.08 + rand() * 0.62, angular: 0.9, sink: 0.4, tilt: 0.18,
-						} );
-						this.take( x, z, sz );
-						this.count( 'pathStones' );
-
-					}
-
-				}
-
-			}
-
-		}
-
-	}
 
 	// ------------------------------------------------------------------ driftwood
 

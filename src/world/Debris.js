@@ -11,7 +11,7 @@ import { ScannedDebris } from './debris/ScannedDebris.js';
 // Ground clutter and debris: the shoreline wrack line (driftwood, seaweed, coconuts, shells,
 // coral, rope, net scraps, floats, a little litter), rocky-cove stones, fallen palm fronds, and
 // the lived-in details around the village (crate stacks, barrels, lobster traps, floats, tyres,
-// buckets, boards, firewood, skiffs, a wheelbarrow, dry-stone walls, stones lining the paths),
+// buckets, boards, firewood, skiffs, a wheelbarrow, dry-stone walls),
 // plus a camera-following field of pebbles, cobbles and shell grit (debris/PebbleField).
 //
 // Placement: debris/DebrisPlacement (keeps clear of boardwalks, the pier, paths, doorways, the

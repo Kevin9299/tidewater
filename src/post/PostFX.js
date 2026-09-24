@@ -96,7 +96,22 @@ export class PostFX {
 		this.finalDepth = sceneRT.depthTexture;
 
 		// ---- ambient occlusion on the opaque depth (normals reconstructed from depth)
-		this.aoPass = new GTAO( this.opaqueDepth, camera, { samples: 12 } );
+		// GTAO reads a half-resolution depth copy (one texel per AO pixel): its horizon taps spread
+		// over a large screen radius, and the full-res reads were mostly cache misses
+		this.aoDepth = new RenderTarget( 1, 1, { colors: [ 'r32float' ], label: 'aoDepth' } );
+		this._aoDepthPass = new FullscreenPass( {
+			label: 'AO depth',
+			colorFormats: [ 'r32float' ],
+			bindings: { aoFullDepth: { texture: () => this.opaqueDepth } },
+			code: /* wgsl */`
+fn fragment( in: FSIn ) -> vec4f {
+	let s = vec2i( textureDimensions( aoFullDepth ) );
+	let p = min( vec2i( in.pos.xy ) * 2, s - 1 );
+	return vec4f( textureLoad( aoFullDepth, p, 0 ), 0.0, 0.0, 1.0 );
+}
+`,
+		} );
+		this.aoPass = new GTAO( this.aoDepth.texture, camera, { samples: 12, depthIsColor: true } );
 		this.aoPass.resolutionScale = 0.5;
 		this.aoPass.radius.value = 2.2;
 		this.aoPass.thickness.value = 2.0;
@@ -447,10 +462,21 @@ fn rcas( uvIn: vec2f ) -> vec3f {
 	let hitMin = min( mn4, e ) / ( mx4 * 4.0 + 1e-5 );
 	let hitMax = ( vec3f( 1.0 ) - max( mx4, e ) ) / ( mn4 * 4.0 - 4.0 );
 	let lobeRGB = max( - hitMin, hitMax );
-	let lobe = max( ${ - ( 0.25 - 1.0 / 16.0 ) }, min( max( lobeRGB.r, max( lobeRGB.g, lobeRGB.b ) ), 0.0 ) ) * post.sharpen;
+	// the sky (depth 0) is only sharpened lightly: clouds and cirrus are soft by nature, and the lobe
+	// turned their sampling noise into fine grain (mbDepth: the scene depth, bound by the blur module)
+	let dS = textureLoad( mbDepth, clamp( vec2i( uvIn * vec2f( textureDimensions( mbDepth ) ) ), vec2i( 0 ), vec2i( textureDimensions( mbDepth ) ) - 1 ), 0 );
+	let skyK = select( 1.0, 0.3, dS < 1e-7 );
+	let lobe = max( ${ - ( 0.25 - 1.0 / 16.0 ) }, min( max( lobeRGB.r, max( lobeRGB.g, lobeRGB.b ) ), 0.0 ) ) * post.sharpen * skyK;
 	let r = max( ( ( b + d + f + h ) * lobe + e ) / ( lobe * 4.0 + 1.0 ), vec3f( 0.0 ) );
 	// back to HDR (inverse of the max-channel Reinhard)
 	return r / max( 1.0 - max( r.r, max( r.g, r.b ) ), 1e-3 );
+}
+
+// integer hash (per pixel and frame) -> [0, 1)
+fn postHash( p: vec2u, f: u32 ) -> f32 {
+	var x = p.x * 1664525u + p.y * 1013904223u + f * 2654435761u;
+	x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u; x *= 0x846ca68bu; x ^= x >> 16u;
+	return f32( x >> 8u ) / 16777216.0;
 }
 
 fn bloomAt( uv: vec2f ) -> vec3f { return textureSampleLevel( postBloom, smpLinearClamp, uv, 0.0 ).rgb * post.bloom; }
@@ -474,12 +500,17 @@ fn fragment( in: FSIn ) -> vec4f {
 	let dv = ( uv - 0.5 ) * vec2f( 1.0, 0.8 );
 	let v = 1.0 - smoothstep( 0.25, 0.75, length( dv ) ) * post.vignette;
 	c = c * v;
-	// fine film grain (luminance-weighted, hides banding in dark gradients)
-	let n = fract( sin( dot( uv * vec2f( 1920.0, 1080.0 ), vec2f( 12.9898, 78.233 ) ) ) * 43758.5453 ) - 0.5;
+	// fine film grain (luminance-weighted): triangular white noise on the real pixel grid, new every
+	// frame (a fixed pattern on a fixed grid showed as diagonal hatching in dark gradients)
+	let px = vec2u( in.pos.xy );
+	let fi = frame.frameIndex;
+	let n = ( postHash( px, fi ) + postHash( px + vec2u( 7919u, 104729u ), fi ) - 1.0 ) * 0.5;
 	c = c + c * ( n * post.grain );
 	// renderOutput: ACES filmic tone mapping with the exposure, sRGB transfer
 	let t = acesFilmicToneMapping( c, frame.exposure );
-	return vec4f( linearToSrgb( t ), 1.0 );
+	// +-1 LSB triangular dither before the 8-bit output: no banding in the sky gradients
+	let dq = ( postHash( px + vec2u( 31337u, 271u ), fi ) + postHash( px + vec2u( 1013u, 65537u ), fi ) - 1.0 ) / 255.0;
+	return vec4f( linearToSrgb( t ) + vec3f( dq ), 1.0 );
 }
 `,
 		} );
@@ -511,6 +542,7 @@ fn fragment( in: FSIn ) -> vec4f {
 		this.aoPass.resolutionScale = 0.5 * this.scale;
 		this.aoPass.setSize( ow, oh );
 		const aw = Math.round( ow * 0.5 * this.scale ), ah = Math.round( oh * 0.5 * this.scale );
+		this.aoDepth.setSize( aw, ah );
 		this.aoBlurX.setSize( aw, ah );
 		this.aoBlurY.setSize( aw, ah );
 		if ( this.haze ) this.haze.setSize( ow, oh );
@@ -590,6 +622,7 @@ fn fragment( in: FSIn ) -> vec4f {
 		if ( ! this._built ) this.beginFrame();
 		const T = this._timers || null;
 		this.motionBlur.compute( this._outW, this._outH );
+		this._aoDepthPass.render( { colorViews: [ this.aoDepth.texture ] } );
 		this.aoPass.render();
 		this._aoBlurXPass.render( { colorViews: [ this.aoBlurX.texture ] } );
 		this._aoBlurYPass.render( { colorViews: [ this.aoBlurY.texture ] } );
@@ -642,3 +675,5 @@ fn fragment( in: FSIn ) -> vec4f {
 }
 
 export { Texture };
+// the game's tone curve, for other views that present HDR (the catch card's fish portrait)
+export { ACES as ACES_WGSL };

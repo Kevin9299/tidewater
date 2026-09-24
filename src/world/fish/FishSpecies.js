@@ -257,7 +257,7 @@ export const SPECIES = {
 	// mahi-mahi (dolphinfish): blunt forehead, a dorsal fin along the whole back, forked tail
 	mahi: {
 		pattern: PATTERN.mahi, body: 0.83, sec: 2.0,
-		top: [ [ 0, 0.01 ], [ 0.01, 0.045 ], [ 0.025, 0.085 ], [ 0.05, 0.115 ], [ 0.1, 0.13 ], [ 0.18, 0.132 ], [ 0.32, 0.122 ], [ 0.48, 0.106 ], [ 0.64, 0.086 ], [ 0.8, 0.06 ], [ 0.92, 0.036 ], [ 1, 0.026 ] ],
+		top: [ [ 0, 0.016 ], [ 0.005, 0.075 ], [ 0.013, 0.12 ], [ 0.03, 0.148 ], [ 0.07, 0.16 ], [ 0.18, 0.154 ], [ 0.32, 0.134 ], [ 0.48, 0.112 ], [ 0.64, 0.088 ], [ 0.8, 0.06 ], [ 0.92, 0.036 ], [ 1, 0.026 ] ],
 		bot: [ [ 0, 0.01 ], [ 0.03, 0.045 ], [ 0.08, 0.072 ], [ 0.15, 0.09 ], [ 0.3, 0.096 ], [ 0.45, 0.09 ], [ 0.6, 0.078 ], [ 0.75, 0.06 ], [ 0.9, 0.035 ], [ 1, 0.022 ] ],
 		wid: [ [ 0, 0.008 ], [ 0.04, 0.034 ], [ 0.15, 0.05 ], [ 0.3, 0.052 ], [ 0.5, 0.045 ], [ 0.7, 0.035 ], [ 0.9, 0.02 ], [ 1, 0.015 ] ],
 		mouth: { corner: 0.075, y: - 0.03, tip: - 0.02, protrude: 0.004 },
@@ -360,9 +360,9 @@ export const SKIN = {
 	angel: { back: 0x0e0e12, flank: 0x121216, belly: 0x16161a, fin: 0x0e0e12, edge: 0x2c2410, rough: 0.45 },
 	barracuda: { back: 0x36464c, flank: 0xb4bcc0, belly: 0xe6eaec, fin: 0x5a6464, edge: 0x2c3434, rough: 0.3 },
 	redSnapper: { back: 0xb83a3c, flank: 0xd86a6a, belly: 0xeeccc4, fin: 0xcc3c34, edge: 0xb82c24, rough: 0.33 },
-	grouper: { back: 0x6c5440, flank: 0x9a7e60, belly: 0xcdbfa8, fin: 0x6e5a40, edge: 0x3c3024, rough: 0.4 },
+	grouper: { back: 0x7a6248, flank: 0xb49c7c, belly: 0xd8ccb4, fin: 0x6e5a40, edge: 0x3c3024, rough: 0.4 },
 	tuna: { back: 0x0e1628, flank: 0x66748a, belly: 0xd6dade, fin: 0x1e2630, edge: 0x161a22, rough: 0.28 },
-	mahi: { back: 0x16706a, flank: 0xc4bc3c, belly: 0xeee49c, fin: 0x2c5c9c, edge: 0x1c4c9c, rough: 0.3 },
+	mahi: { back: 0x125c6a, flank: 0xcdb52a, belly: 0xefe29a, fin: 0x2c5c9c, edge: 0x1c4c9c, rough: 0.3 },
 	mullet: { back: 0x485856, flank: 0xb4bcbe, belly: 0xe6eaea, fin: 0x848c8c, edge: 0x6c7474, rough: 0.33 },
 	needlefish: { back: 0x36766c, flank: 0xb4cccc, belly: 0xeef2f2, fin: 0x76968e, edge: 0x46666c, rough: 0.3 },
 	jack: { back: 0x56768c, flank: 0xbcc8d0, belly: 0xe6ecee, fin: 0x86949c, edge: 0x3c444c, rough: 0.3 },

@@ -30,12 +30,15 @@ import { G, GRAVITY } from '../engine/render/Frame.js';
 //   struct ShoreMedium { scatter: vec3f, absorb: vec3f };  fn shoreSurfMedium( xz, depth ) -> ShoreMedium
 //   fn shoreCrestPath( lagXZ: vec2f, depth: f32, Tv: vec3f ) -> f32
 //   fn shoreSwashClip( xz: vec2f, thickness: f32 ) -> f32
+//   fn shoreSwashEdge( xz: vec2f, thickness: f32 ) -> vec4f   ( clipped thickness, distance to the
+//        swash front (m, > 0 on the water side; 1e3 away from the swash), tau, run-up Rt )
 // Consumes terrainHeightAt( xz ) and terrainShoreSample( xz ) from the terrain module.
 
 const TAU = Math.PI * 2;
 const BEACH_SLOPE = 0.066; // run-up is converted to a horizontal excursion with this slope
 const SWASH_UP = 0.4, SWASH_DOWN = 0.55; // fractions of the period: uprush, backwash
-const SWASH_OVERSHOOT = 0.6; // the mesh sheet reaches this far (m) past the leading edge
+const SWASH_OVERSHOOT = 1.2; // the mesh sheet reaches this far (m) past the leading edge (> the mesh spacing,
+// so the per-pixel front, not the triangles, always decides where the sheet ends)
 
 const f = ( x ) => {
 
@@ -97,19 +100,26 @@ ${ mode === 'normal' ? `	{
 		let n = normalize( cross( tAcross, tAlong ) + vec3f( 0.0, 1e-4, 0.0 ) );
 
 		// the whitewater roller is not a smooth tube: lumps of foam tumble along its front and over
-		// its top (relief of a few decimetres, with its slope in the normal)
+		// its top (relief of a few decimetres, with its slope in the normal). Noise, not a sum of sines:
+		// regular bumps along the crest read as a row of identical puffs. Bigger, fewer lumps in some
+		// stretches, a lower, smoother churn in others (different for every wave).
 		let sx = u * lam; // rest position along the wave direction (m, seaward)
 		let t = frame.time;
-		let a3 = along * 0.61 + t * 0.9;
-		let a1 = along * 1.7 + sx * 1.1 - t * 2.3 + sin( a3 ) * 2.0;
-		let a2 = along * 4.3 - sx * 2.7 + t * 3.7;
-		let amp = roller * 0.2;
-		let lump = sin( a1 ) * 0.6 + sin( a2 ) * 0.4;
+		let mW = floor( ph.s + 0.5 );
+		let lumpy = sat( perlin2( vec2f( along * 0.045, mW * 3.7 ) ) * 1.2 + 0.55 );
+		let amp = roller * mix( 0.25, 0.7, lumpy );
+		let q1 = vec2f( along * 0.28, sx * 0.7 - t * 0.8 );
+		let q2 = vec2f( along * 0.8 + 11.3, sx * 1.6 - t * 1.5 );
+		let eL = 0.25;
+		let L0 = perlin2( q1 ) * 0.7 + perlin2( q2 ) * 0.3;
+		let La = perlin2( q1 + vec2f( eL * 0.28, 0.0 ) ) * 0.7 + perlin2( q2 + vec2f( eL * 0.8, 0.0 ) ) * 0.3;
+		let Ls = perlin2( q1 + vec2f( 0.0, eL * 0.7 ) ) * 0.7 + perlin2( q2 + vec2f( 0.0, eL * 1.6 ) ) * 0.3;
+		// lumps stand up from the roller (rounded caps, flatter troughs between them)
+		let lump = max( L0 * 1.5 + 0.2, -0.3 );
 		disp.y += lump * amp;
-		let c1a = cos( a1 );
-		let c2a = cos( a2 );
-		let dAlong = c1a * ( cos( a3 ) * ( 2.0 * 0.61 ) + 1.7 ) * 0.6 + c2a * ( 4.3 * 0.4 );
-		let dShore = c1a * ( - 1.1 * 0.6 ) + c2a * ( 2.7 * 0.4 ); // d/d(shoreward) = - d/dsx
+		let dAlong = select( 0.0, ( La - L0 ) / eL * 1.5, L0 * 1.5 + 0.2 > -0.3 );
+		let dSx = select( 0.0, ( Ls - L0 ) / eL * 1.5, L0 * 1.5 + 0.2 > -0.3 );
+		let dShore = - dSx; // d/d(shoreward) = - d/dsx
 		let g = ( vec2f( - dir.y, dir.x ) * dAlong + dir * dShore ) * amp * n.y;
 		nShore = normalize( vec3f( n.x - g.x, max( n.y, 0.04 ), n.z - g.y ) );
 	}` : '' }
@@ -142,7 +152,10 @@ ${ mode === 'normal' ? `	{
 	let uFlow = mix( uWave, uSwash, wSwash ) * select( 0.0, 1.0, covered || d > 0.02 );
 
 	var o: ShoreSample;
-	o.disp = disp; o.nShore = nShore; o.env = env; o.foam = s0.z * env; o.breaking = s0.w; o.u = u; o.dir = dir;
+	// the churn of a bore is uneven along the crest: dense in some stretches, torn into patches and
+	// lace in others (different for every wave, drifting slowly along it)
+	let wwPatch = smoothstep( -0.5, 0.45, perlin2( vec2f( along * 0.06 + frame.time * 0.05, m * 2.9 + 0.4 ) ) );
+	o.disp = disp; o.nShore = nShore; o.env = env; o.foam = s0.z * env * mix( 0.3, 1.0, wwPatch ); o.breaking = s0.w; o.u = u; o.dir = dir;
 	o.exposure = exposure; o.swashLevel = swashLevel; o.swashCovered = select( 0.0, 1.0, covered ); o.thick = thick;
 	o.swashFoam = swashFoam; o.runup = swr.Rt; o.inland = swr.inland; o.dRdt = dRdt; o.tau = swr.tau;
 	o.flow = dir * uFlow; o.flowSpeed = uFlow; o.face = face; o.roller = roller;
@@ -256,9 +269,28 @@ struct ShoreRunup { tau: f32, Rt: f32, inland: f32, RhMax: f32, su: f32, sb: f32
 
 fn shoreHash1( x: f32 ) -> f32 { return fract( sin( x * 127.1 + 311.7 ) * 43758.5453 ); }
 
-// along-shore phase wobble (in periods): crests bend over the uneven bottom
+// Bathymetry along the beach that the travel-time field doesn't resolve: a bar with rip channels
+// cut through it every ~100 m (irregular spacing and width). Over the bar the waves are bigger and
+// break first and farther out (the peaks); in the channels they are much smaller and roll through
+// unbroken almost to the shorebreak, so a set never closes out along the whole beach at once.
+// Returns 1 over the bar, less in a channel; rip (0..1) is the channel mask.
+struct ShoreBar { k: f32, rip: f32 };
+fn shoreBar( along: f32 ) -> ShoreBar {
+	let w = sin( along * 0.021 + 1.9 ) * 1.4 + sin( along * 0.009 + 0.3 ) * 0.9;
+	let r = sin( along * 0.059 + w );
+	let width = 0.8 + sin( along * 0.017 + 4.1 ) * 0.08; // channels of different width
+	let rip = smoothstep( width, 0.985, r );
+	// the bar itself is uneven: broad peaks and lower shoulders
+	let bar = 0.9 + ( sin( along * 0.031 + 7.3 ) * 0.6 + sin( along * 0.083 + 1.1 ) * 0.4 ) * 0.14;
+	return ShoreBar( bar * ( 1.0 - rip * 0.58 ), rip );
+}
+
+// along-shore phase wobble (in periods): crests bend over the uneven bottom (and run ahead in the
+// deeper rip channels, where the waves travel faster)
 fn shoreWobble( along: f32 ) -> f32 {
-	return sin( along * 0.029 + 0.7 ) * 0.07 + sin( along * 0.083 + 2.1 ) * 0.035;
+	return sin( along * 0.029 + 0.7 ) * 0.07 + sin( along * 0.083 + 2.1 ) * 0.035
+		+ sin( along * 0.19 + 0.4 ) * 0.022 + sin( along * 0.37 + 2.6 ) * 0.011
+		+ shoreBar( along ).rip * 0.045;
 }
 
 // ------------------------------------------------------------ per-wave height
@@ -273,8 +305,10 @@ fn shoreWaveAmp( m: f32, along: f32 ) -> f32 {
 	let warp = sin( along * 0.016 + m * 0.9 ) * 1.6;
 	let a1 = sin( along * 0.062 + m * 1.7 + warp );
 	let a2 = sin( along * 0.13 + m * 4.1 + 1.3 - warp * 0.7 );
-	let alongV = a1 * 0.6 + a2 * 0.4;
-	return max( shoreP.amplitude * waveSet * ( 1.0 + rnd * shoreP.variation * 0.5 + alongV * shoreP.variation * 0.7 ), 0.02 );
+	// (plus a shorter ~20 m variation: bores that rise and sag along the crest, more peel sections)
+	let a3 = sin( along * 0.29 + m * 2.3 + warp * 0.5 ) * 0.6 + sin( along * 0.47 + m * 5.9 + 0.8 ) * 0.4;
+	let alongV = a1 * 0.6 + a2 * 0.4 + a3 * 0.28;
+	return max( shoreP.amplitude * waveSet * ( 1.0 + rnd * shoreP.variation * 0.5 + alongV * shoreP.variation * 0.7 ) * shoreBar( along ).k, 0.02 );
 }
 
 // ------------------------------------------------------------ cross-section shape
@@ -558,17 +592,22 @@ fn shoreSwashRunup( sh: vec4f, along: f32, groundH: f32 ) -> ShoreRunup {
 // Water film thickness clipped at the leading edge of the swash sheet, for the water shader's
 // edge fade: min( thickness, distance to the front (m) * 0.08 ). Only evaluated where the film is
 // thin, so the sheet ends on the analytic front instead of the mesh triangles at ~no cost.
-fn shoreSwashClip( p: vec2f, t: f32 ) -> f32 {
-	var out = t;
+fn shoreSwashEdge( p: vec2f, t: f32 ) -> vec4f {
+	var out = vec4f( t, 1e3, 0.0, 0.0 );
 	if ( t < 0.2 ) {
 		let g = terrainHeightAt( p );
 		if ( g > frame.seaLevel ) {
 			let ph = shorePhaseAt( p );
 			let r = shoreSwashRunup( ph.sh, ph.along, g );
-			out = min( t, ( r.Rt - r.inland ) * 0.08 );
+			let front = r.Rt - r.inland;
+			out = vec4f( min( t, front * 0.08 ), front, r.tau, r.Rt );
 		}
 	}
 	return out;
+}
+
+fn shoreSwashClip( p: vec2f, t: f32 ) -> f32 {
+	return shoreSwashEdge( p, t ).x;
 }
 
 // ------------------------------------------------------------ evaluate()

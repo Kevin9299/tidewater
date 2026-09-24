@@ -57,7 +57,7 @@ const KIND = {
 	deposit: [ 1, 0, 3, 4, 2 ], // foam left where it falls into the water (drops' worth)
 	stretch: [ 1 / 40, 0, 1 / 40, 1 / 30, 1 / 60 ], // motion blur (s of travel)
 	alpha: [ 0.55, 0.06, 0.8, 0.66, 0.22 ], // (dense spray: see-through, streaked by its motion, never cotton wool)
-	fadeIn: [ 0.02, 0.2, 0.02, 0.03, 0.02 ],
+	fadeIn: [ 0.02, 0.2, 0.02, 0.12, 0.02 ], // (dense spray blooms out of the splash instead of popping in)
 	fadeOut: [ 0.8, 0.45, 0.8, 0.7, 0.5 ], // fraction of life when it starts to fade
 };
 
@@ -532,7 +532,7 @@ ${ deposit ? /* wgsl */`				// fell into the water (not onto the sand): its bubb
 				vUV: 'vec2f',
 				vCol: 'vec4f', // premultiplied-ready radiance, opacity
 				vMisc: 'vec4f', // kind, water height, softness, seed
-				vFwd: 'vec3f', // forward-scattered sun (thin parts glow with it)
+				vFwd: 'vec4f', // forward-scattered sun (thin parts glow with it), w: half-size in pixels
 			},
 			vertex: /* wgsl */`
 	let posA = sprayPosR[ v.instance ];
@@ -556,7 +556,10 @@ ${ deposit ? /* wgsl */`				// fell into the water (not onto the sand): its bubb
 	// pixel footprint at this distance: drops are drawn at least ~1.3 px wide
 	let p11 = frame.proj[ 1 ][ 1 ];
 	let pixel = dist * 2.0 / ( p11 * frame.resolution.y );
-	let r = velA.w; // radius (m)
+	let r0 = velA.w; // radius (m)
+	// dense spray is thrown out of the splash as a compact mass and spreads (grows from ~half size)
+	let tAge = age / max( life, 1e-3 );
+	let r = select( r0, r0 * mix( 0.45, 1.0, smoothstep( 0.0, 0.25, tAge ) ), kind > 2.5 && kind < 3.5 );
 	let size = max( r, pixel * 1.3 );
 
 	// motion blur along the velocity projected on the view plane; ligaments are elongated anyway
@@ -579,10 +582,13 @@ ${ deposit ? /* wgsl */`				// fell into the water (not onto the sand): its bubb
 	let tilt = ( fract( info.w * 7.31 ) - 0.5 ) * 0.7;
 	let sUp = up * cos( tilt ) + side * sin( tilt );
 	let sSide = side * cos( tilt ) - up * sin( tilt );
-	let axisY = select( select( mUp, sUp, isSheet ), up, water );
-	let axisX = select( select( mRight, sSide, isSheet ), side, water );
+	// mist streams with the air: drawn along its motion, stretched by its speed (wisps, not discs)
+	let alongMotion = isSheet || ( isMist && speed > 0.3 );
+	let axisY = select( select( mUp, sUp, alongMotion ), up, water );
+	let axisX = select( select( mRight, sSide, alongMotion ), side, water );
 	let sheetLen = select( 0.0, size * clamp( speed * 0.08, 0.0, 0.8 ), isSheet );
-	let halfY = size + stretchLen * 0.5 + elong + sheetLen;
+	let mistLen = select( 0.0, size * clamp( ( speed - 0.3 ) * 0.35, 0.0, 1.4 ), isMist );
+	let halfY = size + stretchLen * 0.5 + elong + sheetLen + mistLen;
 	let halfX = select( size, size * 1.05, isSheet );
 	let corner = v.position.xy;
 	let world = p + axisX * ( corner.x * halfX ) + axisY * ( corner.y * halfY );
@@ -616,7 +622,7 @@ ${ deposit ? /* wgsl */`				// fell into the water (not onto the sand): its bubb
 	let cClear = frame.skyIrradiance * 0.95 + sun * 0.05;
 	let fClear = sun * ( sprayPhaseHG( cosT, 0.8 ) * 1.1 );
 	let col = select( select( select( cSpray, cClear, isClear ), cMist, isMist ), cWater, water );
-	o.vFwd = select( select( select( fSpray, fClear, isClear ), fMist, isMist ), vec3f( 0.0 ), water );
+	o.vFwd = vec4f( select( select( select( fSpray, fClear, isClear ), fMist, isMist ), vec3f( 0.0 ), water ), halfX / pixel );
 
 	// opacity over the particle's life
 	let t = age / max( life, 1e-3 );
@@ -660,7 +666,11 @@ ${ deposit ? /* wgsl */`				// fell into the water (not onto the sand): its bubb
 	let fib = textureSample( sprayPuff, smpLinearRepeat, vec2f( uv.x * 0.5, uv.y * 0.26 ) + sd ).x;
 	let fine = textureSample( sprayPuff, smpLinearRepeat, vec2f( uv.x * 1.2, uv.y * 0.6 ) + sd * 2.3 ).x;
 	let field = fib * 0.6 + fine * 0.4 + ( env - 0.55 ) * 0.75 - smoothstep( 0.8, 1.0, r2 );
-	let erode = mix( 0.26, 0.7, t );
+	// a torn sheet only a few pixels across can't show its tears: a solid white dot, and a cluster of
+	// them reads as cauliflower puffs. Small on screen, it is drawn thinner and more torn: a far
+	// splash-up is a ragged, see-through burst
+	let farK = smoothstep( 14.0, 3.0, in.vs.vFwd.w ) * select( 0.0, 1.0, isSheet && ! isClear );
+	let erode = mix( 0.26, 0.7, t ) + farK * 0.16;
 	let dens = sat( ( field - erode ) * 3.0 );
 	// torn edges are thin, translucent water: soft and see-through, the core dense white
 	let torn = smoothstep( erode - 0.04, erode + 0.2, field ) * ( dens * 0.45 + 0.55 );
@@ -687,9 +697,9 @@ ${ deposit ? /* wgsl */`				// fell into the water (not onto the sand): its bubb
 	let soft = vMisc.z * 1.5 + 0.03;
 	let fadeScene = sat( ( posViewZ - sceneZ ) / soft );
 	let fadeWater = sat( ( in.P.y - vMisc.y ) / ( soft * 0.6 ) + 0.15 );
-	let aOut = in.vs.vCol.w * shape * fadeScene * fadeWater;
+	let aOut = in.vs.vCol.w * shape * fadeScene * fadeWater * ( 1.0 - farK * 0.4 );
 	if ( aOut < 0.002 ) { discard; }
-	r.color = vec4f( ( in.vs.vCol.rgb * shade + in.vs.vFwd * glow ) * aOut, aOut );
+	r.color = vec4f( ( in.vs.vCol.rgb * shade + in.vs.vFwd.xyz * glow ) * aOut, aOut );
 `,
 		} );
 

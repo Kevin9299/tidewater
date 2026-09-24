@@ -8,8 +8,8 @@ import { loadTexture } from './WhaleTextures.js';
 
 // Humpback whale (Megaptera novaeangliae), ~14.5 m.
 //
-// Geometry: authoring/whale (anatomy tables -> parametric lofts, baked to public/models/whale:
-// three levels of detail, one draw call each, one shared material).
+// Geometry: generated offline (anatomy tables -> parametric lofts), baked to public/models/whale:
+// three levels of detail, one draw call each, one shared material.
 // Rig: a chain of K spine frames from the snout to the fluke tips plus a joint per flipper,
 // posed on the CPU every frame (WhaleBrain: route, surfacing, blows, fluke-up dive) and
 // applied in the vertex shader (each vertex follows the frame at its rest axial position).
@@ -500,7 +500,7 @@ fn whalePose( p: vec3f, n: vec3f, rig: vec4f, o: i32 ) -> WhalePosed {
 
 	}
 
-	// Baked skin (authoring/whale/bake_textures.mjs): albedo + roughness, and relief height
+	// Baked skin (generated offline): albedo + roughness, and relief height
 	// (16 bit in R/G) applied as a bump from three height taps (the TSL version worked in view
 	// space; the same surface-gradient construction runs in world space here).
 	_skinShading( m, hasTex, f ) {

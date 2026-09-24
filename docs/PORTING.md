@@ -37,6 +37,7 @@ GPU side, `src/engine/webgpu.js`:
 | CSM / `SoftCSMShadowNode` | `SunShadows` (render/Shadows.js); receivers sample `sunShadow( P, N, pixel )` automatically in `shadeSurface` |
 | post passes (`rtt`, `pass`, QuadMesh) | `FullscreenPass( { code, bindings, colorFormats } )`, or a compute kernel |
 | `renderer.render( scene, camera )` into a target | `meshRenderer.render( scene, { camera, kind: 'color', colorViews, colorFormats, depthView, … } )` |
+| `GLTFLoader` + `SkinnedMesh` / `AnimationMixer` | `loadGLB( url )` (engine/loaders/GLTF.js) + `SkinnedModel.create( gltf )` (engine/render/Skinning.js): `model.group`, `model.play( clip, { fade, loop, speed } )`, `model.update( dt )`; GPU skinning in the material vertex hook (attributes `skinIndex` vec4u / `skinWeight` vec4f, joints in a storage buffer with last frame's joints for the motion vectors), shadows skin the same way |
 | async readback (`getArrayBufferAsync`) | `Readback` (ring of staging buffers), `readBuffer` / `readTexture` for one-offs |
 | `mx_noise_float`, `mx_fractal_noise_float`, `mx_worley_noise_vec2`, `mx_cell_noise_float`, `hash`, `interleavedGradientNoise`, `vogelDiskSample`, `luminance`, `perturbNormal` | `commonModule` (render/wgsl/common.js): `mx_noise_float3/2`, `mx_fractal_noise_float3`, `mx_worley_noise_vec2_3/2`, `mx_cell_noise_float3/2`, `hash11/21/31/22/33`, `interleavedGradientNoise`, `vogelDiskSample`, `luminance`, `perturbNormalByHeight`, `perturbNormalByMap`, depth helpers `viewDepth`, `worldFromDepth`, `projectToUv` |
 

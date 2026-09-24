@@ -1,4 +1,4 @@
-import { BufferGeometry, CircleGeometry, Float32BufferAttribute, Matrix4, PlaneGeometry, Vector2, Vector3 } from '../../engine/index.js';
+import { BufferGeometry, CircleGeometry, Color, Float32BufferAttribute, Matrix4, PlaneGeometry, Vector2, Vector3 } from '../../engine/index.js';
 import {
 	slab, loft, fanCap, box, roundedBox, cylinder, rod, sphere, torus, lathe, tube, prepare, mat4, alignY,
 	auxVertices, paintVertices, mergePrepared,
@@ -27,7 +27,7 @@ export const HOUSE = {
 const STAINLESS = { color: PALETTE.stainless, rough: 0.22, metal: 1 };
 const BLACK_PLASTIC = { color: 0x1a1b1d, rough: 0.55, metal: 0 };
 const WHITE_PAINT = { color: 0xf1f0eb, rough: 0.35, metal: 0 };
-const FRAME = { color: 0xb9bdc1, rough: 0.4, metal: 1 };
+const FRAME = { color: 0xa4a8ab, rough: 0.55, metal: 1 }; // weathered, oxidised aluminium
 const VINYL = { color: 0x1f2a3a, rough: 0.6, metal: 0 };
 
 export function wsZ( L, y ) {
@@ -117,6 +117,7 @@ export function buildWheelhouse( kit, L, parts ) {
 	buildRoof( kit, L );
 	buildConsole( kit, L, parts );
 	buildSeating( kit, L );
+	buildCabinDetail( kit, L );
 	buildRoofGear( kit, L, parts );
 
 }
@@ -155,7 +156,10 @@ function buildWalls( kit, L ) {
 	for ( const s of [ 1, - 1 ] ) {
 
 		const map = ( u, v, side ) => V( s * ( wallX( L, u, v ) - side * wallT ), v, u );
-		kit.add( 'gelcoat', slab( outline, holes, map ), { color: PALETTE.gelcoat, rough: 0.3 } );
+		// the inner face is painted panelling (seams, screws, grime); the outside stays glossy gelcoat
+		const wall = slab( outline, holes, map );
+		auxVertices( wall, ( p ) => Math.abs( p.x ) < wallX( L, p.z, p.y ) - wallT * 0.5 ? [ 0.5, 0, 2, 0 ] : [ 0.3, 0, 0, 0 ] );
+		kit.add( 'gelcoat', wall, { color: PALETTE.gelcoat } );
 
 		for ( const h of holes ) {
 
@@ -165,6 +169,29 @@ function buildWalls( kit, L ) {
 			kit.add( 'fittings', slab( outer, [ offsetPoly( h, - 0.006 ) ], fmap ), FRAME );
 
 			// (no glass in the openings: the windows are left open)
+
+			// black rubber gasket lining the opening, inside the frame ring
+			const gmap = ( u, v, side ) => V( s * ( wallX( L, u, v ) + 0.004 - side * ( wallT + 0.008 ) ), v, u );
+			kit.add( 'fittings', slab( offsetPoly( h, - 0.005 ), [ offsetPoly( h, - 0.014 ) ], gmap ), { color: 0x0e0f10, rough: 0.8 } );
+
+			// pop rivets around the frame on the inside face
+			const ring = offsetPoly( h, 0.011 );
+			for ( let i = 0; i < ring.length; i ++ ) {
+
+				const a = ring[ i ], b = ring[ ( i + 1 ) % ring.length ];
+				const len = Math.hypot( b[ 0 ] - a[ 0 ], b[ 1 ] - a[ 1 ] );
+				const n = Math.max( 2, Math.round( len / 0.075 ) );
+				for ( let k = 0; k < n; k ++ ) {
+
+					const u = lerp( a[ 0 ], b[ 0 ], ( k + 0.5 ) / n ), v = lerp( a[ 1 ], b[ 1 ], ( k + 0.5 ) / n );
+					const xr = s * ( wallX( L, u, v ) + 0.008 - ( wallT + 0.016 ) - 0.001 );
+					const rv = cylinder( 0.0045, 0.0045, 0.003, 6 );
+					rv.applyMatrix4( mat4( xr, v, u, 0, 0, Math.PI / 2 ) );
+					kit.add( 'fittings', rv, { color: 0xc9ccd0, rough: 0.35, metal: 1 } );
+
+				}
+
+			}
 
 		}
 
@@ -188,7 +215,9 @@ function buildWalls( kit, L ) {
 	}
 
 	cOutline.push( [ hw, HOUSE.wsBottomY ], [ - hw, HOUSE.wsBottomY ] );
-	kit.add( 'gelcoat', slab( cOutline, [], ( u, v, side ) => V( u, v, L.houseFront - side * 0.04 ) ), { color: PALETTE.gelcoat, rough: 0.3 } );
+	const coaming = slab( cOutline, [], ( u, v, side ) => V( u, v, L.houseFront - side * 0.04 ) );
+	auxVertices( coaming, ( p ) => p.z < L.houseFront - 0.02 ? [ 0.5, 0, 2, 0 ] : [ 0.3, 0, 0, 0 ] );
+	kit.add( 'gelcoat', coaming, { color: PALETTE.gelcoat } );
 
 }
 
@@ -260,15 +289,32 @@ function buildRoof( kit, L ) {
 	const yb = HOUSE.roofUnderY;
 	const N = 22;
 	const profiles = [];
+	// cluster stations near both ends for the rounded corners, plus a pair on each end wall of the
+	// wheelhouse so the headliner pattern (per-vertex aux) switches inside the wall, not across the roof
+	const zs = [];
 	for ( let i = 0; i <= N; i ++ ) {
 
 		const f = i / N;
-		// cluster stations near both ends for the rounded corners
 		const g = 0.5 - 0.5 * Math.cos( Math.PI * f );
-		const z = lerp( HOUSE.roofZ0, HOUSE.roofZ1, lerp( f, g, 0.6 ) );
+		zs.push( lerp( HOUSE.roofZ0, HOUSE.roofZ1, lerp( f, g, 0.6 ) ) );
+
+	}
+
+	for ( const zw of [ L.houseBack, L.houseFront ] ) for ( const dz of [ - 0.012, 0.012 ] ) {
+
+		const z = zw + dz;
+		if ( z > HOUSE.roofZ0 + 0.02 && z < HOUSE.roofZ1 - 0.02 ) zs.push( z );
+
+	}
+
+	zs.sort( ( a, b ) => a - b );
+	for ( const z of zs ) {
+
 		const hw = roofHalf( L, z );
+		// inner face of the side wall under the roof (the headliner ends there)
+		const wIn = wallX( L, Math.min( Math.max( z, L.houseBack ), L.houseFront ), yb ) - HOUSE.wallT;
 		const half = [
-			[ 0, yb ], [ hw * 0.5, yb ], [ hw - 0.03, yb ], [ hw - 0.008, yb + 0.008 ], [ hw, yb + 0.025 ],
+			[ 0, yb ], [ wIn * 0.5, yb ], [ wIn - 0.01, yb ], [ wIn + 0.01, yb ], [ hw - 0.03, yb ], [ hw - 0.008, yb + 0.008 ], [ hw, yb + 0.025 ],
 			[ hw - 0.004, roofTopY( hw ) - 0.012 ], [ hw - 0.02, roofTopY( hw ) ], [ hw * 0.75, roofTopY( hw * 0.75 ) ],
 			[ hw * 0.5, roofTopY( hw * 0.5 ) ], [ hw * 0.25, roofTopY( hw * 0.25 ) ], [ 0, roofTopY( 0 ) ],
 		];
@@ -278,13 +324,21 @@ function buildRoof( kit, L ) {
 
 	}
 
+	const N2 = profiles.length - 1;
 	const g = loft( profiles, { closed: true } );
 	orientOutwardFn( g, ( p ) => V( p.x, p.y - 2.345, 0 ) );
 	metricUV( g, ( p ) => [ p.x, p.z ] );
-	auxVertices( g, ( p ) => [ 0.35, 0, p.y > yb + 0.03 ? 1 : 0, 0 ] );
+	// non-skid on top; the underside is headliner over the wheelhouse, gelcoat on the overhangs
+	auxVertices( g, ( p ) => {
+
+		if ( p.y > yb + 0.03 ) return [ 0.35, 0, 1, 0 ];
+		const inside = p.z > L.houseBack && p.z < L.houseFront && Math.abs( p.x ) < wallX( L, Math.min( Math.max( p.z, L.houseBack ), L.houseFront ), yb ) - HOUSE.wallT;
+		return [ 0.35, 0, inside ? 3 : 0, 0 ];
+
+	} );
 	kit.add( 'gelcoat', g, { color: PALETTE.gelcoat } );
 	kit.add( 'gelcoat', fanCap( profiles[ 0 ], V( 0, 0, - 1 ) ), { color: PALETTE.gelcoat, rough: 0.3 } );
-	kit.add( 'gelcoat', fanCap( profiles[ N ], V( 0, 0, 1 ) ), { color: PALETTE.gelcoat, rough: 0.3 } );
+	kit.add( 'gelcoat', fanCap( profiles[ N2 ], V( 0, 0, 1 ) ), { color: PALETTE.gelcoat, rough: 0.3 } );
 
 	// stainless grab rails along the roof edges
 	for ( const s of [ 1, - 1 ] ) {
@@ -372,7 +426,9 @@ function buildConsole( kit, L, parts ) {
 	}
 
 	const endX = ( z, y ) => Math.min( d.halfW, L.halfBreadth( L.tAtSheerZ( z ), Math.min( y, L.sheerY( L.tAtSheerZ( z ) ) ) ) - L.shell - 0.004 );
-	kit.add( 'gelcoat', slab( outline, [], ( u, v, side ) => V( ( side ? - 1 : 1 ) * endX( u, v ), v, u ) ), { color: PALETTE.gelcoat, rough: 0.3 } );
+	const body = slab( outline, [], ( u, v, side ) => V( ( side ? - 1 : 1 ) * endX( u, v ), v, u ) );
+	auxVertices( body, () => [ 0.5, 0, 2, 0 ] );
+	kit.add( 'gelcoat', body, { color: PALETTE.gelcoat } );
 
 	// anti-glare dash top and instrument panel
 	const top = box( d.halfW * 2 - 0.01, 0.01, d.zBack - d.zTop );
@@ -383,7 +439,7 @@ function buildConsole( kit, L, parts ) {
 	const panel = box( d.halfW * 2 - 0.04, pf.length - 0.02, 0.012 );
 	panel.applyMatrix4( mat4( 0, 0, 0, pf.angle, 0, 0 ) );
 	panel.translate( ...pf.at( 0, 0.5 ).addScaledVector( pf.normal, 0.004 ).toArray() );
-	kit.add( 'fittings', panel, { color: 0x1d1f22, rough: 0.7 } );
+	kit.add( 'fittings', panel, { color: 0x1d1f22, rough: 0.7, pattern: 4 } );
 
 	// teak fiddle rail along the dash top edge
 	const fr = box( d.halfW * 2 - 0.02, 0.03, 0.022 );
@@ -410,7 +466,10 @@ function buildConsole( kit, L, parts ) {
 	const swm = new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw );
 	const swPlate = box( 0.34, 0.1, 0.008 );
 	swPlate.applyMatrix4( swm );
-	kit.add( 'fittings', swPlate, { color: 0x2d3036, rough: 0.5 } );
+	kit.add( 'fittings', swPlate, { color: 0x2d3036, rough: 0.5, pattern: 4 } );
+	const tape = box( 0.3, 0.014, 0.002 );
+	tape.applyMatrix4( new Matrix4().makeBasis( V( - 1, 0, 0 ), pf.along, pf.normal ).setPosition( sw.clone().addScaledVector( pf.along, - 0.038 ).addScaledVector( pf.normal, 0.005 ) ) );
+	kit.add( 'fittings', tape, { color: 0xffffff, rough: 0.5, pattern: 8 } );
 	for ( let i = 0; i < 6; i ++ ) {
 
 		const r = box( 0.03, 0.045, 0.015 );
@@ -567,6 +626,296 @@ function buildSeating( kit, L ) {
 	const bc = roundedBox( 0.42, 0.07, 0.73, 0.03, 1 );
 	bc.translate( 0.86, y0 + 0.435, 0.45 );
 	kit.add( 'fittings', bc, VINYL );
+
+}
+
+// ------------------------------------------------------------------ lived-in detail: sole, headliner, props
+
+// inner face of the wheelhouse side wall (s = 1 port, -1 starboard) and the inward normal
+function wallIn( L, s, z, y ) {
+
+	return s * ( wallX( L, z, y ) - HOUSE.wallT );
+
+}
+
+function buildCabinDetail( kit, L ) {
+
+	const d = HOUSE.dash;
+	const y0 = L.deckY;
+	const yb = HOUSE.roofUnderY;
+	const hullIn = ( z ) => Math.min( houseHalfWidth( L, z ) - HOUSE.wallT, L.halfBreadth( L.tAtSheerZ( z ), y0 ) - L.shell ) - 0.015;
+
+	// ---- teak-and-holly sole from the house back to the console (planks fore and aft)
+	const soleOut = [];
+	const zA = L.houseBack - 0.02, zB = d.zFace - 0.005;
+	for ( let i = 0; i <= 6; i ++ ) {
+
+		const z = lerp( zA, zB, i / 6 );
+		soleOut.push( [ z, - hullIn( z ) ] );
+
+	}
+
+	for ( let i = 6; i >= 0; i -- ) {
+
+		const z = lerp( zA, zB, i / 6 );
+		soleOut.push( [ z, hullIn( z ) ] );
+
+	}
+
+	const sole = slab( soleOut, [], ( u, v, side ) => V( v, y0 + 0.009 - side * 0.009, u ), { back: false } );
+	kit.add( 'wood', sole, { rough: 0.5, pattern: 2 } );
+
+	// ---- headliner battens (varnished) across the roof, and a teak grab rail overhead
+	for ( const z of [ - 0.22, 0.26, 0.74 ] ) {
+
+		const w = 2 * ( wallX( L, z, yb ) - HOUSE.wallT ) - 0.02;
+		const b = box( 0.045, 0.016, w );
+		b.applyMatrix4( mat4( 0, yb - 0.008, z, 0, Math.PI / 2, 0 ) );
+		kit.add( 'wood', b, { rough: 0.35 } );
+
+	}
+
+	const gy = yb - 0.06;
+	kit.add( 'wood', rod( V( - 0.32, gy, - 0.2 ), V( - 0.32, gy, 0.9 ), 0.016, 10 ), { rough: 0.35 } );
+	for ( const z of [ - 0.12, 0.35, 0.82 ] ) kit.add( 'fittings', rod( V( - 0.32, gy, z ), V( - 0.32, yb - 0.004, z ), 0.011, 8 ), STAINLESS );
+
+	// ---- overhead rod rack on the port side: three rods with cork grips and reels
+	for ( const z of [ - 0.3, 0.35, 0.95 ] ) {
+
+		const br = box( 0.36, 0.012, 0.03 );
+		br.translate( 0.64, yb - 0.08, z );
+		kit.add( 'fittings', br, BLACK_PLASTIC );
+		for ( const x of [ 0.48, 0.8 ] ) kit.add( 'fittings', rod( V( x, yb - 0.08, z ), V( x, yb - 0.002, z ), 0.005, 6 ), STAINLESS );
+
+	}
+
+	for ( const [ i, x ] of [ 0.54, 0.64, 0.74 ].entries() ) {
+
+		const y = yb - 0.066;
+		const z0 = - 0.42 + i * 0.05, z1 = 1.12;
+		kit.add( 'fittings', rod( V( x, y, z0 ), V( x, y, z1 ), 0.007, 6, 0.0025 ), { color: [ 0x1b1c1e, 0x2a3a52, 0x4a1f1a ][ i ], rough: 0.3 } );
+		kit.add( 'fittings', rod( V( x, y, z0 ), V( x, y, z0 + 0.24 ), 0.013, 8 ), { color: 0xb48a5c, rough: 0.85 } );
+		const reel = cylinder( 0.034, 0.034, 0.03, 12 );
+		reel.applyMatrix4( mat4( x, y - 0.045, z0 + 0.3, 0, 0, Math.PI / 2 ) );
+		kit.add( 'fittings', reel, { color: [ 0x8a8d91, 0xb89040, 0x2b2d30 ][ i ], rough: 0.3, metal: 1 } );
+		kit.add( 'fittings', rod( V( x, y - 0.012, z0 + 0.3 ), V( x, y - 0.03, z0 + 0.3 ), 0.004, 5 ), { color: 0x2b2d30, rough: 0.4 } );
+
+	}
+
+	// ---- port wall: breaker panel below the forward window, oilskin and lifejacket on hooks aft
+	{
+
+		const z = 0.56, y = 1.33, x = wallIn( L, 1, z, y );
+		const pnl = box( 0.014, 0.22, 0.34 );
+		pnl.translate( x - 0.007, y, z );
+		kit.add( 'fittings', pnl, { color: 0x3a3d42, rough: 0.5, pattern: 4 } );
+		for ( let r = 0; r < 2; r ++ ) {
+
+			const ry = y + 0.045 - r * 0.1;
+			const lt = box( 0.002, 0.014, 0.3 );
+			lt.translate( x - 0.015, ry + 0.035, z );
+			kit.add( 'fittings', lt, { color: 0xffffff, rough: 0.5, pattern: 8 } );
+			for ( let k = 0; k < 8; k ++ ) {
+
+				const bk = box( 0.016, 0.034, 0.02 );
+				bk.translate( x - 0.021, ry, z - 0.135 + k * 0.0386 );
+				kit.add( 'fittings', bk, { color: 0x121314, rough: 0.4 } );
+				const tog = box( 0.012, 0.012, 0.008 );
+				tog.translate( x - 0.034, ry + ( ( k * 7 + r * 3 ) % 5 === 0 ? - 0.007 : 0.007 ), z - 0.135 + k * 0.0386 );
+				kit.add( 'fittings', tog, { color: ( k * 7 + r * 3 ) % 5 === 0 ? 0xb02a22 : 0x1e1f21, rough: 0.4 } );
+
+			}
+
+		}
+
+	}
+
+	const hang = ( z, yTop, color, scale ) => {
+
+		const x = wallIn( L, 1, z, yTop );
+		kit.add( 'fittings', rod( V( x, yTop + 0.02, z ), V( x - 0.05, yTop + 0.04, z ), 0.006, 6 ), STAINLESS );
+		// garment hanging by its collar: narrow at the hook, sloping shoulders, a slightly flared hem
+		// with an open bottom, pressed flat against the wall; sleeves hang down the front
+		const prof = [ [ 0.17, 0.0 ], [ 0.2, 0.03 ], [ 0.2, 0.3 ], [ 0.21, 0.5 ], [ 0.2, 0.56 ], [ 0.12, 0.62 ], [ 0.05, 0.66 ], [ 0.001, 0.665 ] ];
+		const g = lathe( prof.map( ( [ r, h ] ) => [ r * scale, h * scale ] ), 20 );
+		g.applyMatrix4( mat4( x - 0.06, yTop - 0.66 * scale, z, 0, 0, 0, 0.3, 1, 1 ) );
+		kit.add( 'fittings', g, { color, rough: 0.6, pattern: 9 } );
+		for ( const sd of [ - 1, 1 ] ) {
+
+			const sh = V( x - 0.07, yTop - 0.12 * scale, z + sd * 0.17 * scale );
+			const sleeve = tube( [ sh, V( x - 0.1, yTop - 0.3 * scale, z + sd * 0.2 * scale ), V( x - 0.11, yTop - 0.52 * scale, z + sd * 0.16 * scale ) ], 0.045 * scale, 10, 8 );
+			kit.add( 'fittings', sleeve, { color, rough: 0.6, pattern: 9 } );
+
+		}
+
+		const hood = sphere( 0.1 * scale, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.6 );
+		hood.applyMatrix4( mat4( x - 0.04, yTop - 0.03, z, 0.5, 0, 0, 0.5, 0.8, 1 ) );
+		kit.add( 'fittings', hood, { color: new Color( color ).multiplyScalar( 0.85 ).getHex(), rough: 0.6, pattern: 9 } );
+	};
+
+	hang( - 0.12, 1.92, 0xe0a81c, 1.0 ); // yellow oilskin
+	hang( 0.14, 1.9, 0xe2531a, 0.8 ); // orange lifejacket
+
+	// ---- starboard wall: extinguisher on its bracket, photos and the tide table, torch in a clip
+	{
+
+		const z = - 0.18, yb0 = y0 + 0.2, x = wallIn( L, - 1, z, 0.8 );
+		const ex = x + 0.075;
+		const body = lathe( [ [ 0, 0 ], [ 0.058, 0.0 ], [ 0.062, 0.02 ], [ 0.062, 0.3 ], [ 0.05, 0.35 ], [ 0.018, 0.37 ], [ 0, 0.37 ] ], 18 );
+		body.translate( ex, yb0, z );
+		kit.add( 'fittings', body, { color: 0xb3150f, rough: 0.35 } );
+		const valve = box( 0.03, 0.05, 0.05 );
+		valve.translate( ex, yb0 + 0.39, z );
+		kit.add( 'fittings', valve, { color: 0x1a1a1a, rough: 0.4 } );
+		kit.add( 'fittings', rod( V( ex, yb0 + 0.41, z ), V( ex + 0.02, yb0 + 0.42, z + 0.09 ), 0.007, 6 ), { color: 0x8c8f93, rough: 0.3, metal: 1 } );
+		kit.add( 'fittings', tube( [ V( ex, yb0 + 0.38, z + 0.02 ), V( ex + 0.03, yb0 + 0.3, z + 0.07 ), V( ex + 0.05, yb0 + 0.15, z + 0.06 ), V( ex + 0.06, yb0 + 0.08, z + 0.03 ) ], 0.008, 12, 5 ), { color: 0x141414, rough: 0.6 } );
+		for ( const h of [ 0.12, 0.26 ] ) {
+
+			const strap = torus( 0.064, 0.004, 4, 20 );
+			strap.applyMatrix4( mat4( ex, yb0 + h, z, Math.PI / 2, 0, 0 ) );
+			kit.add( 'fittings', strap, STAINLESS );
+
+		}
+
+		const plate = box( 0.006, 0.3, 0.07 );
+		plate.translate( x + 0.003, yb0 + 0.19, z );
+		kit.add( 'fittings', plate, STAINLESS );
+		// instruction label on the cylinder
+		const lab = cylinder( 0.0625, 0.0625, 0.1, 18, 1, true, - 0.9, 1.8 );
+		lab.translate( ex, yb0 + 0.19, z );
+		kit.add( 'fittings', lab, { color: 0xffffff, rough: 0.5, pattern: 8 } );
+
+	}
+
+	const onWall = ( s, z, y, w, h, roll, opts ) => {
+
+		const q = new PlaneGeometry( w, h );
+		q.applyMatrix4( mat4( 0, 0, 0, 0, s > 0 ? - Math.PI / 2 : Math.PI / 2, 0 ) );
+		q.applyMatrix4( new Matrix4().makeRotationX( roll ) );
+		q.translate( 0, y, z );
+		// follow the wall (it curves with the hull and leans in above the rail): each vertex sits
+		// 12 mm off the analytic inner face (the wall mesh is faceted: its chords stand ~1 cm proud of
+		// the curve), so no part of the card can dip behind it
+		const pos = q.getAttribute( 'position' );
+		for ( let i = 0; i < pos.count; i ++ ) pos.setX( i, wallIn( L, s, pos.getZ( i ), pos.getY( i ) ) - s * 0.012 );
+		pos.needsUpdate = true;
+		q.computeVertexNormals();
+		kit.add( 'fittings', q, opts );
+
+	};
+
+	onWall( - 1, 0.02, 1.47, 0.1, 0.13, 0.06, { color: 0xffffff, rough: 0.3, pattern: 7, anim: 0.15 } );
+	onWall( - 1, 0.15, 1.42, 0.12, 0.09, - 0.1, { color: 0xffffff, rough: 0.3, pattern: 7, anim: 0.7 } );
+	onWall( - 1, 0.36, 1.36, 0.19, 0.25, 0.02, { color: 0xffffff, rough: 0.9, pattern: 5 } );
+	// masking tape holding the tide table
+	for ( const [ dz, dy ] of [ [ - 0.09, 0.12 ], [ 0.09, 0.12 ] ] ) onWall( - 1, 0.36 + dz, 1.36 + dy, 0.05, 0.018, 0.5, { color: 0xd8cfa8, rough: 0.8 } );
+
+	{
+
+		// torch in its clip, forward on the starboard wall
+		const z = 0.85, y = 1.3, x = wallIn( L, - 1, z, y ) + 0.035;
+		kit.add( 'fittings', rod( V( x, y, z - 0.1 ), V( x, y, z + 0.1 ), 0.02, 12 ), { color: 0xf2c21b, rough: 0.45 } );
+		kit.add( 'fittings', rod( V( x, y, z + 0.1 ), V( x, y, z + 0.13 ), 0.026, 12 ), { color: 0x1a1a1a, rough: 0.4 } );
+		for ( const dz of [ - 0.06, 0.05 ] ) {
+
+			const clip = torus( 0.023, 0.003, 4, 12, Math.PI * 1.3 );
+			clip.applyMatrix4( mat4( x, y, z + dz, 0, Math.PI / 2, - 0.65 ) );
+			kit.add( 'fittings', clip, BLACK_PLASTIC );
+
+		}
+
+	}
+
+	// ---- dash top: clipboard with the fishing log, mug of coffee in a holder
+	{
+
+		const ytop = d.yTop + 0.01;
+		const m = mat4( 0.74, ytop + 0.004, 1.26, 0, 0.18, 0 );
+		const board = box( 0.23, 0.005, 0.31 );
+		board.applyMatrix4( m );
+		kit.add( 'fittings', board, { color: 0x6b4a2b, rough: 0.7 } );
+		const paper = new PlaneGeometry( 0.21, 0.28 );
+		paper.applyMatrix4( mat4( 0, 0.0035, 0.012, - Math.PI / 2, 0, 0 ) );
+		paper.applyMatrix4( m );
+		kit.add( 'fittings', paper, { color: 0xffffff, rough: 0.9, pattern: 5 } );
+		const clip = box( 0.08, 0.014, 0.03 );
+		clip.applyMatrix4( mat4( 0, 0.008, 0.14 ) );
+		clip.applyMatrix4( m );
+		kit.add( 'fittings', clip, STAINLESS );
+
+		const mx = - 0.76, mz = 1.34;
+		const holder = torus( 0.05, 0.006, 6, 18 );
+		holder.applyMatrix4( mat4( mx, ytop + 0.035, mz, Math.PI / 2, 0, 0 ) );
+		kit.add( 'fittings', holder, BLACK_PLASTIC );
+		const mug = cylinder( 0.042, 0.038, 0.095, 18, 1, true );
+		mug.translate( mx, ytop + 0.048, mz );
+		kit.add( 'fittings', mug, { color: 0x1f4a3a, rough: 0.25 } );
+		const inner = cylinder( 0.039, 0.036, 0.09, 18, 1, true );
+		inner.translate( mx, ytop + 0.05, mz );
+		orientTowardsAxis( inner );
+		kit.add( 'fittings', inner, { color: 0xe9e4d8, rough: 0.25 } );
+		const coffee = new CircleGeometry( 0.039, 18 );
+		coffee.applyMatrix4( mat4( mx, ytop + 0.082, mz, - Math.PI / 2, 0, 0 ) );
+		kit.add( 'fittings', coffee, { color: 0x2a160b, rough: 0.1 } );
+		const base = new CircleGeometry( 0.038, 18 );
+		base.applyMatrix4( mat4( mx, ytop + 0.0005, mz, Math.PI / 2, 0, 0 ) );
+		kit.add( 'fittings', base, { color: 0x1f4a3a, rough: 0.4 } );
+		const handle = torus( 0.026, 0.006, 6, 12, Math.PI );
+		handle.applyMatrix4( mat4( mx - 0.042, ytop + 0.048, mz, 0, 0, Math.PI / 2 ) );
+		kit.add( 'fittings', handle, { color: 0x1f4a3a, rough: 0.25 } );
+
+	}
+
+	// ---- port bench: lifejackets, a folded chart; coiled line on the sole aft
+	{
+
+		const top = y0 + 0.47;
+		for ( const [ i, dy ] of [ 0, 0.05 ].entries() ) {
+
+			const v = roundedBox( 0.34, 0.05, 0.4, 0.02, 1 );
+			v.applyMatrix4( mat4( 0.86, top + 0.025 + dy, 0.28 + i * 0.02, 0, 0.12 * i - 0.05, 0 ) );
+			kit.add( 'fittings', v, { color: 0xe2531a, rough: 0.6, pattern: 9 } );
+			for ( const dz of [ - 0.08, 0.08 ] ) {
+
+				const st = box( 0.345, 0.052, 0.025 );
+				st.applyMatrix4( mat4( 0.86, top + 0.025 + dy, 0.28 + i * 0.02 + dz, 0, 0.12 * i - 0.05, 0 ) );
+				kit.add( 'fittings', st, { color: 0x151515, rough: 0.7 } );
+
+			}
+
+		}
+
+		const chart = new PlaneGeometry( 0.3, 0.22 );
+		chart.applyMatrix4( mat4( 0.85, top + 0.002, 0.64, - Math.PI / 2, 0, 0.3 ) );
+		kit.add( 'fittings', chart, { color: 0xffffff, rough: 0.85, pattern: 6 } );
+
+		for ( let k = 0; k < 5; k ++ ) {
+
+			const loop = torus( 0.15 - k * 0.004, 0.011, 6, 28 );
+			loop.applyMatrix4( mat4( 0.62 + k * 0.004, y0 + 0.02 + k * 0.02, - 0.14 + k * 0.006, Math.PI / 2 + ( k % 2 ) * 0.06, 0, 0 ) );
+			const uv = loop.attributes.uv;
+			for ( let j = 0; j < uv.count; j ++ ) uv.setXY( j, uv.getX( j ) * 0.94, uv.getY( j ) );
+			kit.add( 'fittings', loop, { color: 0x2c5a8c, rough: 0.8, pattern: 1 } );
+
+		}
+
+	}
+
+}
+
+// flip a lathe / open cylinder's winding so its faces point inward (the inside of the mug)
+function orientTowardsAxis( g ) {
+
+	const idx = Array.from( g.index.array );
+	for ( let i = 0; i < idx.length; i += 3 ) {
+
+		const t = idx[ i + 1 ]; idx[ i + 1 ] = idx[ i + 2 ]; idx[ i + 2 ] = t;
+
+	}
+
+	g.setIndex( idx );
+	const n = g.attributes.normal;
+	for ( let i = 0; i < n.count; i ++ ) n.setXYZ( i, - n.getX( i ), - n.getY( i ), - n.getZ( i ) );
 
 }
 

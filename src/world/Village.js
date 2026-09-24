@@ -272,10 +272,12 @@ export class Village {
 		const g = ( x, z ) => terrain.heightAt( x, z );
 		const box = ( x, y, z, hx, hy, hz, ry, tag ) => colliders.addBox( new Vector3( x, y, z ), new Vector3( hx, hy, hz ), ry, { tag } );
 
-		// rowboats pulled up on the sand near the pier foot
+		// rowboats pulled up on the sand: two upturned ones down the beach west of Joe's fish stand (kept
+		// clear of it), one by the pier foot
+		const BX = - 26; // the upturned pair and their oars, relative to where they first stood by the stand
 		const boats = [
-			{ x: 46.8, z: - 57.2, ry: 0.35, up: true, hull: lin( 0x2f8f9a ), bottom: lin( 0xa0402e ) },
-			{ x: 43.9, z: - 59.8, ry: 0.55, up: true, hull: lin( 0xe9e4d6 ), bottom: lin( 0x2e5f86 ) },
+			{ x: 46.8 + BX, z: - 57.2, ry: 0.35, up: true, hull: lin( 0x2f8f9a ), bottom: lin( 0xa0402e ) },
+			{ x: 43.9 + BX, z: - 59.8, ry: 0.55, up: true, hull: lin( 0xe9e4d6 ), bottom: lin( 0x2e5f86 ) },
 			{ x: 63.5, z: - 55.6, ry: - 0.35, up: false, hull: lin( 0xd8c35a ), bottom: lin( 0x3e6f5a ), rz: 0.14 },
 		];
 		for ( const b of boats ) {
@@ -302,8 +304,8 @@ export class Village {
 		}
 
 		// oars leaning against the first upturned boat, oars on the sand
-		oar( B, [ 48.1, g( 48.1, - 55.7 ) + 0.03, - 55.7 ], [ 49.6, g( 49.6, - 57.9 ) + 0.05, - 57.9 ], rand.next(), lin( 0xc23b2e ) );
-		oar( B, [ 48.4, g( 48.4, - 55.4 ) + 0.03, - 55.4 ], [ 49.9, g( 49.9, - 57.6 ) + 0.06, - 57.6 ], rand.next(), lin( 0xc23b2e ) );
+		oar( B, [ 48.1 + BX, g( 48.1 + BX, - 55.7 ) + 0.03, - 55.7 ], [ 49.6 + BX, g( 49.6 + BX, - 57.9 ) + 0.05, - 57.9 ], rand.next(), lin( 0xc23b2e ) );
+		oar( B, [ 48.4 + BX, g( 48.4 + BX, - 55.4 ) + 0.03, - 55.4 ], [ 49.9 + BX, g( 49.9 + BX, - 57.6 ) + 0.06, - 57.6 ], rand.next(), lin( 0xc23b2e ) );
 
 		// net drying racks
 		const racks = [ [ 41.8, - 64.2, 0.25, lin( 0x3f6f5f ) ], [ 74.6, - 58.6, - 0.12, lin( 0x2f5f8a ) ], [ 86.4, - 64.0, 0.3, lin( 0xb0553a ) ] ];

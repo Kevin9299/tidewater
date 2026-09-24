@@ -17,7 +17,7 @@ import { detailBinding } from './terrain/TerrainShading.js';
 //   heightTexture  R32F   exact heights, bilinear filtering done manually (heightAt)
 //   normalTexture  RGBA8  macro normal xz (encoded), rock mask, baked ambient occlusion (mipmapped)
 //   splatTexture   RGBA8  loose sand, worn ground / paths, gullies (land) or seagrass (seabed),
-//                         seabed rubble (mipmapped)
+//                         seabed rubble / the eroded beach scarp face on land (mipmapped)
 //   detailTexture  RGBA8  512^2 tileable detail heights (rock, soil, sand, fbm), see DetailTextures
 //   shadowHeightTexture R16F 512^2 (4 m) heights with max-mips (input of the sun shadow bake)
 //   sunShadowTexture    RGBA16F storage 512^2: 'shadow top' height and occluder distance toward the
@@ -255,7 +255,8 @@ fn terrainNormalAt( xz: vec2f ) -> vec3f {
 	return normalize( vec3f( nr.x, sqrt( max( 1.0 - nr.x * nr.x - nr.y * nr.y, 0.0025 ) ), nr.y ) );
 }
 
-// loose sand, worn ground / paths, gullies (land) or seagrass (seabed), seabed rubble
+// loose sand, worn ground / paths, gullies (land) or seagrass (seabed), seabed rubble (the
+// eroded beach scarp face on land)
 fn terrainSplat( xz: vec2f ) -> vec4f {
 	return textureSample( terrainSplatTex, smpLinearClamp, terrainUvOf( xz ) );
 }

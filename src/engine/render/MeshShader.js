@@ -10,6 +10,8 @@ import { collectModules } from '../gpu/Shader.js';
 //   'depth' — depth only (shadow maps); fragment only when alpha matters
 //   'color' — a single color target (cube faces, hull mask, reflections)
 // pass.late: the water / transparent pass (velocity is blended premultiplied there)
+// pass.defines: extra defines, e.g. REFRACTION_CLIP + REFRACTION_CLIP_MARGIN (m): fragments higher than
+// sea level + margin are discarded (the water's refraction source, ocean/RefractionPass.js)
 
 const STD_ATTRS = {
 	position: 'vec3f',
@@ -254,6 +256,10 @@ struct FragOut {
 
 @fragment fn fs( vs: VSOut, @builtin( front_facing ) front: bool ) -> FragOut {
 	let in = fragInput( vs, front );
+#if REFRACTION_CLIP
+	// the water's refraction source only holds what is under the water (pass.defines)
+	if ( in.P.y > frame.seaLevel + REFRACTION_CLIP_MARGIN ) { discard; }
+#endif
 	var s = surfaceOf( in );
 #if ALPHA_TEST
 	if ( s.alpha < mat.alphaTest ) { discard; }
@@ -305,7 +311,8 @@ struct FragOut {
 	const code = main
 		.replace( 'fn fragInput(', shadowHook + 'fn fragInput(' )
 		.replace( /\bTRANSPARENT_F\b/g, material.transparent ? 'true' : 'false' )
-		.replace( /\bVELOCITY_WEIGHT\b/g, fmt( material.velocityWeight ) );
+		.replace( /\bVELOCITY_WEIGHT\b/g, fmt( material.velocityWeight ) )
+		.replace( /\bREFRACTION_CLIP_MARGIN\b/g, fmt( ( pass.defines && pass.defines.REFRACTION_CLIP_MARGIN ) ?? 0 ) );
 
 	// modules: lighting (with the installed hooks) for colour passes, or whenever a material module needs it
 	let modules = [ commonModule, surfaceModule, ...material.modules ];

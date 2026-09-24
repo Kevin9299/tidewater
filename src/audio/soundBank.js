@@ -36,4 +36,16 @@ export const BANK = {
 	tern: { file: 'tern.ogg', slices: [ [ 0.08, 2.1097 ], [ 2.2697, 1.85 ], [ 4.1997, 2.4098 ], [ 6.6894, 1.3657 ], [ 8.1351, 1.02 ], [ 9.2351, 1.99 ] ], lufs: [ -9.8, -10.7, -12.4, -12, -9, -12.9 ] },
 	whale_blow: { file: 'whale_blow.ogg', slices: [ [ 0.08, 2.0057 ], [ 2.1657, 1.3331 ], [ 3.5789, 1.5137 ] ], lufs: [ -13.3, -14.2, -14.4 ] },
 	big_splash: { file: 'big_splash.ogg', slices: [ [ 0.08, 2.1477 ], [ 2.3077, 1.7777 ] ], lufs: [ -15.6, -18.7 ] },
+	// fishing (tools/audio/build-fishing.mjs)
+	reel_wind: { file: 'reel_wind.ogg', loop: true, lufs: -23 },
+	reel_drag: { file: 'reel_drag.ogg', loop: true, lufs: -22.6 },
+	line_strain: { file: 'line_strain.ogg', loop: true, lufs: -24.4 },
+	rod_swish: { file: 'rod_swish.ogg', slices: [ [ 0.08, 0.404 ], [ 0.564, 0.4453 ], [ 1.0893, 0.604 ], [ 1.7733, 0.424 ], [ 2.2773, 0.604 ] ], lufs: [ -18.3, -22.1, -20.9, -18.4, -16 ] },
+	bail_click: { file: 'bail_click.ogg', slices: [ [ 0.08, 0.164 ], [ 0.324, 0.174 ], [ 0.578, 0.144 ], [ 0.802, 0.184 ] ], lufs: [ -30, -29.8, -31.1, -29.3 ] },
+	line_out: { file: 'line_out.ogg', slices: [ [ 0.08, 0.644 ] ], lufs: [ -15.9 ] },
+	plop: { file: 'plop.ogg', slices: [ [ 0.08, 0.624 ], [ 0.784, 0.264 ] ], lufs: [ -21.4, -20.7 ] },
+	line_snap: { file: 'line_snap.ogg', slices: [ [ 0.08, 0.554 ], [ 0.714, 0.504 ], [ 1.298, 0.504 ], [ 1.882, 0.504 ] ], lufs: [ -17.9, -23.4, -20.8, -23.2 ] },
+	fish_splash: { file: 'fish_splash.ogg', slices: [ [ 0.08, 0.464 ], [ 0.624, 0.324 ], [ 1.028, 0.504 ], [ 1.612, 1.204 ], [ 2.896, 1.304 ] ], lufs: [ -16, -14.2, -16.6, -17, -15.8 ] },
+	fish_flop: { file: 'fish_flop.ogg', slices: [ [ 0.08, 1.354 ], [ 1.514, 0.304 ], [ 1.898, 0.304 ], [ 2.282, 0.324 ] ], lufs: [ -24.6, -23.9, -23, -17 ] },
+	coins: { file: 'coins.ogg', slices: [ [ 0.08, 1.604 ] ], lufs: [ -16.5 ] },
 };

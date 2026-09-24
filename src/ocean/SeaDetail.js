@@ -21,9 +21,8 @@ export class SeaDetail {
 
 		this.texture = makeNoiseTexture( size );
 		this.size = size;
-		// read with textureLoad + manual bilinear filtering: no sampler binding at all (these lookups
-		// end up in scene materials that are close to the sampler limit). The noise is smooth
-		// and low frequency, so no mipmaps are needed.
+		// hardware bilinear through the shared repeat sampler (group 0). The noise is smooth and low
+		// frequency, so no mipmaps are needed.
 		this.uniforms = new UniformBlock( 'SeaDetailParams', {
 			offset: [ 'vec2f', new Vector2() ], // accumulated wind drift (m)
 			gustAmount: [ 'f32', 1 ],
@@ -44,18 +43,9 @@ export class SeaDetail {
 			code: /* wgsl */`
 struct SeaDetailSample { rough: f32, gust: f32, slick: f32, streak: f32 };
 
-// bilinear, repeat-wrapped lookup without a sampler (uv in texture repeats)
+// hardware bilinear, repeat-wrapped (the shared sampler: no binding of its own)
 fn seaDetailLoad( uv: vec2f ) -> vec4f {
-	let n = ${ size }.0;
-	let p = uv * n - 0.5;
-	let i = vec2i( floor( p ) );
-	let f = fract( p );
-	let m = vec2i( ${ size - 1 } );
-	let a = textureLoad( seaDetailNoise, i & m, 0 );
-	let b = textureLoad( seaDetailNoise, ( i + vec2i( 1, 0 ) ) & m, 0 );
-	let c = textureLoad( seaDetailNoise, ( i + vec2i( 0, 1 ) ) & m, 0 );
-	let d = textureLoad( seaDetailNoise, ( i + vec2i( 1, 1 ) ) & m, 0 );
-	return mix( mix( a, b, f.x ), mix( c, d, f.x ), f.y );
+	return textureSampleLevel( seaDetailNoise, smpLinearRepeat, uv, 0.0 );
 }
 
 fn seaDetailSample( xz: vec2f ) -> SeaDetailSample {
@@ -177,8 +167,7 @@ function makeNoiseTexture( size ) {
 
 	}
 
-	// nearest + no mips: read with textureLoad (manual bilinear) to keep scene materials well under
-	// the sampler limit
+	// no mips: sampled at level 0 with the shared linear repeat sampler
 	return new Texture( { label: 'seaDetailNoise', width: size, height: size, format: 'rgba16float', data, usage: [ 'sample', 'copyDst' ] } );
 
 }

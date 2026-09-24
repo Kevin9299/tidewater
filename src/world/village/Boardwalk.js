@@ -89,8 +89,8 @@ export function buildBoardwalk( ctx, pts, opts = {} ) {
 		const newer = rand.chance( 0.05 );
 		B.box( 'wood', s.p.x + rand.range( - 0.02, 0.02 ) * s.nx, deck[ i ] - 0.021 - rand.range( 0, 0.005 ), s.p.z + rand.range( - 0.02, 0.02 ) * s.nz, width + rand.range( - 0.04, 0.03 ), 0.042, 0.182, {
 			grain: 0, skip: 8, ry: s.yaw + rand.range( - 0.01, 0.01 ), rx: - Math.atan( slope ),
-			tint: newer ? [ 1.12, 1.02, 0.9 ] : ( ( k, w ) => [ k * ( 1 + w ), k, k * ( 1 - w ) ] )( rand.range( 0.86, 1.08 ), rand.range( - 0.01, 0.04 ) ),
-			data: WOOD( rand.next(), newer ? 0.2 : rand.range( 0.55, 0.95 ), 0, 7 ),
+			tint: newer ? [ 1.06, 1.0, 0.93 ] : ( ( k, w ) => [ k * ( 1 + w ), k, k * ( 1 - w ) ] )( rand.range( 0.86, 1.08 ), rand.range( - 0.01, 0.04 ) ),
+			data: WOOD( rand.next(), newer ? 0.35 : rand.range( 0.6, 1.0 ), 0, 7 ),
 		} );
 
 	}

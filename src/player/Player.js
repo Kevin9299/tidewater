@@ -1,5 +1,8 @@
 import * as THREE from '../engine/index.js';
 import { WORLD } from '../world/WorldLayout.js';
+import { HOUSE } from '../world/boat/Wheelhouse.js';
+
+const HOUSE_HELM = { x: HOUSE.helmX, z: HOUSE.seatZ };
 
 const EYE = 1.62;
 const SWIM_EYE = EYE * 0.1; // eyes above the body's float point while swimming
@@ -14,11 +17,20 @@ const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _e = new THREE.Euler( 0, 0, 0, 'YXZ' );
+const _yAxis = new THREE.Vector3( 0, 1, 0 );
+const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _qc = new THREE.Quaternion();
+const _wish = new THREE.Vector3();
+// walking on the boat
+const DECK_RADIUS = 0.24;
+const DECK_STEP = 0.36; // highest ledge you step up onto
+const HELM_REACH = 0.75; // m from the helm seat to take the wheel
 
 // First-person walker / swimmer / boat captain.
 //   walk : capsule on terrain + walkable colliders, wading slows you down
 //   swim : floats with the head at the surface; look down + W (or C) to dive, Space to rise
-//   boat : E near the boat to board; V toggles helm (1st person) / chase (3rd person) camera
+//   deck : aboard, walking in the boat's frame (it moves and rocks under you); E at the helm
+//          takes the wheel, E near a pier / the beach steps ashore
+//   boat : at the helm, driving; V toggles helm (1st person) / chase (3rd person) camera, E stands up
 export class Player {
 
 	constructor( { camera, input, terrain, colliders, query, boat, reef = null, audio = null } ) {
@@ -34,10 +46,12 @@ export class Player {
 
 		this.mode = 'walk';
 		this.camMode = 'third';
-		this.position = new THREE.Vector3().copy( WORLD.spawn.position );
-		this.position.y = terrain.heightAt( this.position.x, this.position.z );
+		const start = WORLD.start || WORLD.spawn;
+		this.position = new THREE.Vector3().copy( start.position );
+		// standing on whatever is there (the boardwalk planks), not in it
+		this.position.y = Math.max( terrain.heightAt( this.position.x, this.position.z ), colliders ? colliders.groundHeightAt( this.position.x, this.position.z, 50 ) : - Infinity );
 		this.velocity = new THREE.Vector3();
-		this.yaw = WORLD.spawn.yaw;
+		this.yaw = start.yaw;
 		this.pitch = - 0.05;
 		this.grounded = false;
 		this.bob = 0;
@@ -63,6 +77,23 @@ export class Player {
 		this.camPos = new THREE.Vector3();
 		this.camInit = false;
 		this.wasUnder = false;
+
+		// on deck: position and heading in the boat frame (+Z forward, yaw 0 looks forward)
+		this.deckPos = new THREE.Vector3();
+		this.deckVel = new THREE.Vector3();
+		this.deckYaw = 0;
+		this.deckGrounded = true;
+		this._ashore = null; // cached step-ashore target
+		this._ashoreT = 0;
+		// set by the fishing game: while a line is out the helm / step ashore prompts give way
+		this.busy = false;
+
+	}
+
+	// view direction in world space (for casting); works in every mode
+	getViewDir( out ) {
+
+		return out.set( 0, 0, - 1 ).applyQuaternion( this.camera.quaternion );
 
 	}
 
@@ -114,16 +145,24 @@ export class Player {
 
 		}
 
+		if ( this.mode === 'deck' ) {
+
+			this.updateDeck( dt );
+			return;
+
+		}
+
 		const look = inp.consumeLook();
 		this.yaw -= look.x * 0.0022;
 		this.pitch = THREE.MathUtils.clamp( this.pitch - look.y * 0.0022, - 1.5, 1.5 );
 
-		if ( this.nearBoat() ) {
+		// (not with a line out or a fish in hand: E belongs to the fishing then)
+		if ( this.nearBoat() && ! this.busy ) {
 
 			this.prompt = { key: 'E', text: 'Board boat' };
 			if ( inp.hit( 'KeyE' ) ) {
 
-				this.enterBoat();
+				this.boardBoat();
 				return;
 
 			}
@@ -372,7 +411,26 @@ export class Player {
 
 	// ------------------------------------------------------------------ boat
 
-	enterBoat() {
+	// step aboard from the pier / beach / water: onto the cockpit sole at the boarding point
+	boardBoat() {
+
+		const b = this.boat;
+		this.mode = 'deck';
+		this.deckPos.copy( b.model.boardPoint );
+		this.deckVel.set( 0, 0, 0 );
+		// keep looking where you looked (relative to the boat)
+		this.deckYaw = this.yaw - ( b.getYaw() + Math.PI );
+		this.deckGrounded = true;
+		this._ashore = null;
+		this._ashoreT = 0;
+		this.velocity.set( 0, 0, 0 );
+		this._camY = null;
+		this.deckToWorld();
+
+	}
+
+	// sit down at the helm and drive (the old "enter boat")
+	takeHelm() {
 
 		this.mode = 'boat';
 		this.boat.driven = true;
@@ -385,9 +443,36 @@ export class Player {
 
 	}
 
-	exitBoat() {
+	// get up from the helm: stand beside the seat, looking forward
+	leaveHelm() {
 
 		const b = this.boat;
+		b.driven = false;
+		b.throttle = 0;
+		this.mode = 'deck';
+		this.deckPos.set( HOUSE_HELM.x + 0.45, b.model.lines.deckY, HOUSE_HELM.z - 0.1 );
+		this.deckVel.set( 0, 0, 0 );
+		this.deckYaw = this.helmYaw;
+		this.pitch = this.helmPitch;
+		this.deckGrounded = true;
+		this._camY = null;
+		if ( this.audio ) this.audio.engineStop();
+		this.deckToWorld();
+
+	}
+
+	// enterBoat() kept for callers: straight to the helm
+	enterBoat() {
+
+		this.boardBoat();
+		this.takeHelm();
+
+	}
+
+	exitBoat( target = null ) {
+
+		const b = this.boat;
+		const wasDriving = b.driven;
 		b.driven = false;
 		b.throttle = 0;
 		// choose the exit point closest to something walkable (pier deck / sand)
@@ -412,6 +497,7 @@ export class Player {
 
 		}
 
+		if ( target ) best = target, bestScore = 0;
 		if ( best && bestScore < 1.2 ) {
 
 			this.position.set( best.out.x, best.g, best.out.z );
@@ -428,7 +514,198 @@ export class Player {
 
 		this.velocity.set( 0, 0, 0 );
 		this.yaw = b.getYaw() + Math.PI;
-		if ( this.audio ) this.audio.engineStop();
+		this._camY = null;
+		if ( this.audio && wasDriving ) this.audio.engineStop();
+
+	}
+
+	// best walkable spot next to the boat (pier deck / sand / shallows), or null
+	ashoreTarget() {
+
+		const b = this.boat;
+		let best = null, bestScore = Infinity;
+		for ( const ep of b.model.exitPoints ) {
+
+			const w = b.toWorld( ep, new THREE.Vector3() );
+			const side = w.clone().sub( b.position ).setY( 0 ).normalize().multiplyScalar( 1.4 );
+			const out = w.clone().add( side );
+			const g = this.groundAt( out.x, out.z, w.y + 2.5 );
+			const water = this.query.cpuValid ? this.query.cpu[ 0 ] : 0;
+			const score = Math.abs( g - w.y ) + ( g < water - 0.3 ? 5 : 0 );
+			if ( score < bestScore ) { bestScore = score; best = { out, g, ep }; }
+
+		}
+
+		return best && bestScore < 1.2 ? best : null;
+
+	}
+
+	// ------------------------------------------------------------------ deck
+
+	// camera base orientation on the boat: its heading, with roll and pitch half stabilised
+	deckBase( out ) {
+
+		const b = this.boat;
+		_qa.setFromAxisAngle( _yAxis, b.getYaw() + Math.PI );
+		_qb.copy( b.quaternion ).multiply( _qc.setFromAxisAngle( _yAxis, Math.PI ) );
+		return out.slerpQuaternions( _qb, _qa, 0.55 );
+
+	}
+
+	// world position / heading of the player from the deck state (feet)
+	deckToWorld() {
+
+		const b = this.boat;
+		b.toWorld( this.deckPos, this.position );
+		this.yaw = b.getYaw() + Math.PI + this.deckYaw;
+
+	}
+
+	// highest walkable box top under the point (boat frame), not above maxY; the sole otherwise
+	deckGroundAt( x, z, maxY ) {
+
+		const L = this.boat.model.lines;
+		let g = L.deckY;
+		for ( const c of this.boat.model.colliders ) {
+
+			if ( ! c.walkable ) continue;
+			if ( Math.abs( x - c.center.x ) > c.half.x || Math.abs( z - c.center.z ) > c.half.z ) continue;
+			const top = c.center.y + c.half.y;
+			if ( top <= maxY && top > g ) g = top;
+
+		}
+
+		return g;
+
+	}
+
+	updateDeck( dt ) {
+
+		const inp = this.input;
+		const b = this.boat;
+		const L = b.model.lines;
+		const look = inp.consumeLook();
+		this.deckYaw -= look.x * 0.0022;
+		this.pitch = THREE.MathUtils.clamp( this.pitch - look.y * 0.0022, - 1.5, 1.5 );
+
+		// movement in the boat frame (camera base looks along +Z at deckYaw 0)
+		const sy = Math.sin( this.deckYaw ), cy = Math.cos( this.deckYaw );
+		_fwd.set( sy, 0, cy );
+		_right.set( - cy, 0, sy );
+		_wish.set( 0, 0, 0 );
+		if ( inp.down( 'KeyW' ) ) _wish.add( _fwd );
+		if ( inp.down( 'KeyS' ) ) _wish.sub( _fwd );
+		if ( inp.down( 'KeyD' ) ) _wish.add( _right );
+		if ( inp.down( 'KeyA' ) ) _wish.sub( _right );
+		if ( _wish.lengthSq() > 0 ) _wish.normalize();
+		const speed = ( inp.down( 'ShiftLeft' ) ? 2.6 : 1.6 );
+		const k = 1 - Math.exp( - 12 * dt );
+		const v = this.deckVel;
+		v.x += ( _wish.x * speed - v.x ) * k;
+		v.z += ( _wish.z * speed - v.z ) * k;
+		if ( this.deckGrounded && inp.hit( 'Space' ) ) {
+
+			v.y = 3.2;
+			this.deckGrounded = false;
+
+		}
+
+		v.y -= 9.81 * dt;
+		const p = this.deckPos;
+		const oldX = p.x, oldZ = p.z;
+		p.addScaledVector( v, dt );
+
+		// walls: push out of the solid boxes you can't step onto (boat frame, axis aligned)
+		for ( let iter = 0; iter < 2; iter ++ ) for ( const c of b.model.colliders ) {
+
+			if ( ! c.solid ) continue;
+			const top = c.center.y + c.half.y, bot = c.center.y - c.half.y;
+			if ( top <= p.y + DECK_STEP || bot >= p.y + HEIGHT ) continue;
+			const ex = c.half.x + DECK_RADIUS, ez = c.half.z + DECK_RADIUS;
+			const dx = p.x - c.center.x, dz = p.z - c.center.z;
+			if ( Math.abs( dx ) >= ex || Math.abs( dz ) >= ez ) continue;
+			const px = ex - Math.abs( dx ), pz = ez - Math.abs( dz );
+			if ( px < pz ) { p.x += Math.sign( dx || ( oldX - c.center.x ) || 1 ) * px; v.x = 0; }
+			else { p.z += Math.sign( dz || ( oldZ - c.center.z ) || 1 ) * pz; v.z = 0; }
+
+		}
+
+		// stay inside the hull (the bulwarks, plus a margin fore and aft)
+		p.z = THREE.MathUtils.clamp( p.z, L.zAft + L.shell + DECK_RADIUS, 4.0 );
+		const halfIn = Math.max( 0.15, L.halfBreadth( L.tAtSheerZ( p.z ), Math.max( p.y, L.deckY ) ) - L.shell - DECK_RADIUS );
+		p.x = THREE.MathUtils.clamp( p.x, - halfIn, halfIn );
+
+		const g = this.deckGroundAt( p.x, p.z, p.y + DECK_STEP );
+		if ( p.y <= g ) {
+
+			p.y = g;
+			if ( v.y < 0 ) v.y = 0;
+			this.deckGrounded = true;
+
+		} else this.deckGrounded = p.y - g < 0.04;
+
+		// footsteps on the deck
+		const moved = Math.hypot( p.x - oldX, p.z - oldZ );
+		if ( this.deckGrounded ) {
+
+			this.bob += moved * 2.4;
+			this.stepDist += moved;
+			if ( this.stepDist > 0.6 ) {
+
+				this.stepDist = 0;
+				if ( this.audio ) this.audio.footstep( 'wood' );
+
+			}
+
+		}
+
+		this.deckToWorld();
+
+		// prompts: take the helm, or step ashore
+		const hx = HOUSE_HELM.x, hz = HOUSE_HELM.z;
+		const nearHelm = Math.hypot( p.x - hx, p.z - hz ) < HELM_REACH && ! this.busy;
+		this._ashoreT -= dt;
+		if ( this._ashoreT <= 0 ) {
+
+			this._ashoreT = 0.25;
+			this._ashore = b.speed < 2.5 ? this.ashoreTarget() : null;
+
+		}
+
+		if ( nearHelm ) {
+
+			this.prompt = { key: 'E', text: 'Take the helm' };
+			if ( inp.hit( 'KeyE' ) ) {
+
+				this.takeHelm();
+				return;
+
+			}
+
+		} else if ( this._ashore && ! this.busy ) {
+
+			// only when standing at the rail on that side
+			const ep = this._ashore.ep;
+			if ( Math.hypot( p.x - ep.x, p.z - ep.z ) < 1.3 ) {
+
+				this.prompt = { key: 'E', text: 'Step ashore' };
+				if ( inp.hit( 'KeyE' ) ) {
+
+					this.exitBoat( this._ashore );
+					return;
+
+				}
+
+			}
+
+		}
+
+		// camera: eye above the feet, following the boat's motion
+		const eyeL = _v.set( p.x, p.y + EYE + Math.sin( this.bob ) * 0.02, p.z );
+		b.toWorld( eyeL, this.camera.position );
+		this._camY = this.camera.position.y;
+		this.deckBase( _q );
+		this.camera.quaternion.copy( _q ).multiply( _qa.setFromEuler( _e.set( this.pitch, this.deckYaw, 0 ) ) );
 
 	}
 
@@ -442,7 +719,7 @@ export class Player {
 		if ( inp.hit( 'KeyV' ) ) this.camMode = this.camMode === 'first' ? 'third' : 'first';
 		if ( inp.hit( 'KeyE' ) ) {
 
-			this.exitBoat();
+			this.leaveHelm();
 			return;
 
 		}
@@ -454,7 +731,7 @@ export class Player {
 		if ( inp.down( 'KeyA' ) ) steer += 1;
 		if ( inp.down( 'KeyD' ) ) steer -= 1;
 		b.setInput( throttle, steer, dt );
-		this.prompt = { key: 'E', text: 'Leave boat   ·   V  camera' };
+		this.prompt = { key: 'E', text: 'Leave helm   ·   V  camera' };
 
 		// keep the player attached (for audio / queries)
 		b.toWorld( b.model.helmEye, this.position );

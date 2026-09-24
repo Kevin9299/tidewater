@@ -8,7 +8,9 @@ import { commonModule } from '../engine/render/wgsl/common.js';
 // down to a plane `D` metres below, and the vertex is placed at that landing point. The fragment
 // writes (area on the surface / area on the floor) with additive blending, which is exactly the
 // light concentration, so focusing folds form the bright caustic networks physically. The grid
-// is drawn 9 times offset by +-1 tile so the result tiles seamlessly (no finite area).
+// covers the tile plus a margin on every side (the FFT tiles, so the margin is the neighbouring
+// tiles' surface): light refracted in from across the tile edge lands inside it, and the result
+// tiles seamlessly (no finite area). Landing offsets stay well under the margin at these depths.
 //
 // Two focal planes are rendered (R = shallow, G = deep) and blended by the real depth at lookup.
 // A second, larger tile from the next cascade adds broad focusing so the result never repeats.
@@ -17,15 +19,23 @@ import { commonModule } from '../engine/render/wgsl/common.js';
 //   fn causticsSample( P: vec3f, depth: f32, slope: vec2f, foam: f32, gdx: vec2f, gdy: vec2f ) -> vec3f
 //        caustic light factor (mean ~1); gdx / gdy = dpdx / dpdy of P.xz (the pixel footprint)
 //   fn causticsSampleLevel( P: vec3f, depth: f32, level: f32 ) -> vec3f   flat surface, fixed blur level
+//   fn causticsSampleBaked( P, depth, slope, foam, gdx, gdy, detailK: f32 ) -> vec3f
+//        as causticsSample, with the gust / slick factor precomputed (UnderwaterLighting's baked map)
+//   fn causticsSampleShaft( P: vec3f, depth: f32, level: f32, detailK: f32 ) -> vec3f
+//        flat surface, one fine lookup (no dispersion) and a precomputed gust / slick factor: for
+//        ray marches (the factor varies over hundreds of metres: take it once per pixel)
+//   fn causticsDetailK( xz: vec2f ) -> f32   that gust / slick factor
 class CausticLayer {
 
-	constructor( fft, cascade, { res, grid, depths, name, slopeLevel } ) {
+	constructor( fft, cascade, { res, grid, depths, name, slopeLevel, margin } ) {
 
 		this.fft = fft;
 		this.cascade = cascade;
 		this.tile = fft.sizes[ cascade ];
 		this.res = res;
-		this.grid = grid;
+		// [-margin, 1 + margin]^2 at the same vertex density as the tile
+		this.margin = margin;
+		this.grid = Math.ceil( grid * ( 1 + 2 * margin ) );
 		this.depths = depths;
 
 		// the floor is mostly seen at grazing angles: filter along the view (anisotropic sampler at
@@ -42,13 +52,13 @@ class CausticLayer {
 			const code = /* wgsl */`
 struct CauOut { @builtin( position ) pos: vec4f, @location( 0 ) vOld: vec2f, @location( 1 ) vNew: vec2f };
 
-@vertex fn vs( @builtin( vertex_index ) vi: u32, @builtin( instance_index ) ii: u32 ) -> CauOut {
-	// grid of ${ grid } x ${ grid } quads over [0,1]^2, two triangles each
+@vertex fn vs( @builtin( vertex_index ) vi: u32 ) -> CauOut {
+	// grid of ${ this.grid } x ${ this.grid } quads over [-margin, 1 + margin]^2, two triangles each
 	let q = vi / 6u; let corner = vi % 6u;
-	let cx = q % ${ grid }u; let cy = q / ${ grid }u;
+	let cx = q % ${ this.grid }u; let cy = q / ${ this.grid }u;
 	var o2 = vec2u( 0u );
 	switch corner { case 1u: { o2 = vec2u( 1u, 0u ); } case 2u, 3u: { o2 = vec2u( 0u, 1u ); } case 4u: { o2 = vec2u( 1u, 0u ); } case 5u: { o2 = vec2u( 1u, 1u ); } default: {} }
-	let uv = vec2f( vec2u( cx, cy ) + o2 ) / ${ grid }.0;
+	let uv = vec2f( vec2u( cx, cy ) + o2 ) / ${ this.grid }.0 * ${ ( 1 + 2 * margin ).toFixed( 4 ) } - ${ margin.toFixed( 4 ) };
 	let d = textureSampleLevel( oceanDerivatives, smpLinearRepeat, uv, ${ cascade }, ${ slopeLevel.toFixed( 3 ) } );
 	let s = vec2f( d.x / max( d.z + 1.0, 0.3 ), d.y / max( d.w + 1.0, 0.3 ) );
 	let n = normalize( vec3f( - s.x, 1.0, - s.y ) );
@@ -63,11 +73,7 @@ struct CauOut { @builtin( position ) pos: vec4f, @location( 0 ) vOld: vec2f, @lo
 	var o: CauOut;
 	o.vOld = p;
 	o.vNew = qq;
-	// 3x3 copies shifted by whole tiles for seamless wrapping
-	let i = f32( ii );
-	let ox = i - 3.0 * floor( i / 3.0 ) - 1.0;
-	let oy = floor( i / 3.0 ) - 1.0;
-	let ndc = ( qq / ${ L } + vec2f( ox, oy ) ) * 2.0 - 1.0;
+	let ndc = qq / ${ L } * 2.0 - 1.0;
 	o.pos = vec4f( ndc.x, ndc.y, 0.0, 1.0 );
 	return o;
 }
@@ -110,7 +116,7 @@ struct CauOut { @builtin( position ) pos: vec4f, @location( 0 ) vOld: vec2f, @lo
 			rp.setPipeline( p.pipeline );
 			rp.setBindGroup( 0, p.group0.getBindGroup() );
 			rp.setBindGroup( 1, p.bindings.getBindGroup() );
-			rp.draw( this.grid * this.grid * 6, 9 );
+			rp.draw( this.grid * this.grid * 6, 1 );
 
 		}
 
@@ -132,9 +138,9 @@ export class Caustics {
 		this.detail = null; // SeaDetail: rougher water in gusts focuses more, slicks less
 		const fine = fft.cascades - 1;
 		// fine networks (finest cascade, ripples < ~11 cm filtered out: they defocus immediately)
-		this.fine = new CausticLayer( fft, fine, { res: 512, grid: 256, depths: [ 1.2, 4.0 ], name: 'causticsFine', slopeLevel: 1 } );
+		this.fine = new CausticLayer( fft, fine, { res: 512, grid: 256, depths: [ 1.2, 4.0 ], name: 'causticsFine', slopeLevel: 1, margin: 0.35 } );
 		// broad focusing from the next cascade; different tile size -> no visible repetition
-		this.broad = new CausticLayer( fft, fine - 1, { res: 256, grid: 128, depths: [ 3.0, 9.0 ], name: 'causticsBroad', slopeLevel: 0.5 } );
+		this.broad = new CausticLayer( fft, fine - 1, { res: 256, grid: 128, depths: [ 3.0, 9.0 ], name: 'causticsBroad', slopeLevel: 0.5, margin: 0.35 } );
 		this._module = null;
 
 	}
@@ -182,7 +188,14 @@ fn _causticsFetchBroad( uv: vec2f, lvl: f32, gdx: vec2f, gdy: vec2f, useGrad: bo
 	return textureSampleGrad( causticsBroadTex, smpAnisoRepeat, uv, _causticsStretch( gdx / ${ B.tile }, minLen ), _causticsStretch( gdy / ${ B.tile }, minLen ) );
 }
 
-fn _causticsSample( P: vec3f, depth: f32, level: f32, slope: vec2f, foam: f32, hasFoam: bool, gdx: vec2f, gdy: vec2f, useGrad: bool ) -> vec3f {
+// gust / slick factor of the caustics at xz (1 without sea detail)
+fn causticsDetailK( xz: vec2f ) -> f32 {
+${ det ? `	let det = seaDetailSample( xz );
+	return mix( 0.55, 1.25, det.gust ) * ( 1.0 - det.slick * 0.6 );` : '	return 1.0;' }
+}
+
+// mono: one fine lookup instead of three (no chromatic dispersion); detailK < 0: evaluated here
+fn _causticsSample( P: vec3f, depth: f32, level: f32, slope: vec2f, foam: f32, hasFoam: bool, gdx: vec2f, gdy: vec2f, useGrad: bool, mono: bool, detailK: f32 ) -> vec3f {
 	// the light reaching this point entered the water up-sun along the refracted sun ray
 	let n = normalize( vec3f( - slope.x, 1.0, - slope.y ) );
 	let Ls = refract( - frame.sunDir, n, 1.0 / 1.333 );
@@ -193,23 +206,26 @@ fn _causticsSample( P: vec3f, depth: f32, level: f32, slope: vec2f, foam: f32, h
 	let blur = select( clamp( depth * 0.4 - 0.2, 0.0, 3.0 ), level, level >= 0.0 );
 	let wD = sat( ( depth - 1.2 ) / 2.8 ); // blend between the two focal planes
 
-	// slight chromatic dispersion: each color lands a little apart along the sun direction
-	let disp = normalize( Ls.xz + vec2f( 1e-4, 0.0 ) ) * ( depth * 0.0035 );
 	let uvF = entry / ${ F.tile };
-	let tr = _causticsFetchFine( uvF + disp / ${ F.tile }, blur, gdx, gdy, useGrad );
 	let tg = _causticsFetchFine( uvF, blur, gdx, gdy, useGrad );
-	let tb = _causticsFetchFine( uvF - disp / ${ F.tile }, blur, gdx, gdy, useGrad );
-	let r = mix( tr.x, tr.y, wD );
 	let g = mix( tg.x, tg.y, wD );
-	let b = mix( tb.x, tb.y, wD );
+	var r = g;
+	var b = g;
+	if ( ! mono ) {
+		// slight chromatic dispersion: each color lands a little apart along the sun direction
+		let disp = normalize( Ls.xz + vec2f( 1e-4, 0.0 ) ) * ( depth * 0.0035 );
+		let tr = _causticsFetchFine( uvF + disp / ${ F.tile }, blur, gdx, gdy, useGrad );
+		let tb = _causticsFetchFine( uvF - disp / ${ F.tile }, blur, gdx, gdy, useGrad );
+		r = mix( tr.x, tr.y, wD );
+		b = mix( tb.x, tb.y, wD );
+	}
 	let broad = _causticsFetchBroad( entry / ${ B.tile }, 1.5, gdx, gdy, useGrad );
 	let br = mix( broad.x, broad.y, sat( depth / 9.0 ) );
 	let c = vec3f( r, g, b ) * mix( 1.0, br, 0.6 );
 
 	// no caustics right at the surface, strongest in the first metres, fading with depth
 	var k = smoothstep( 0.03, 0.5, depth ) * exp( depth * -0.06 ) * caustics.strength;
-${ det ? `	let det = seaDetailSample( entry );
-	k = k * mix( 0.55, 1.25, det.gust ) * ( 1.0 - det.slick * 0.6 );` : '' }
+	k *= select( causticsDetailK( entry ), detailK, detailK >= 0.0 );
 	if ( hasFoam ) { k *= 1.0 - sat( foam ); }
 	let result = mix( vec3f( 1.0 ), c, k );
 	// foam and bubble clouds scatter the light back up: the floor under them is shaded
@@ -217,11 +233,19 @@ ${ det ? `	let det = seaDetailSample( entry );
 }
 
 fn causticsSample( P: vec3f, depth: f32, slope: vec2f, foam: f32, gdx: vec2f, gdy: vec2f ) -> vec3f {
-	return _causticsSample( P, depth, -1.0, slope, foam, true, gdx, gdy, true );
+	return _causticsSample( P, depth, -1.0, slope, foam, true, gdx, gdy, true, false, -1.0 );
+}
+
+fn causticsSampleBaked( P: vec3f, depth: f32, slope: vec2f, foam: f32, gdx: vec2f, gdy: vec2f, detailK: f32 ) -> vec3f {
+	return _causticsSample( P, depth, -1.0, slope, foam, true, gdx, gdy, true, false, detailK );
 }
 
 fn causticsSampleLevel( P: vec3f, depth: f32, level: f32 ) -> vec3f {
-	return _causticsSample( P, depth, level, vec2f( 0.0 ), 0.0, false, vec2f( 0.0 ), vec2f( 0.0 ), false );
+	return _causticsSample( P, depth, level, vec2f( 0.0 ), 0.0, false, vec2f( 0.0 ), vec2f( 0.0 ), false, false, -1.0 );
+}
+
+fn causticsSampleShaft( P: vec3f, depth: f32, level: f32, detailK: f32 ) -> vec3f {
+	return _causticsSample( P, depth, level, vec2f( 0.0 ), 0.0, false, vec2f( 0.0 ), vec2f( 0.0 ), false, true, detailK );
 }
 `,
 		} );

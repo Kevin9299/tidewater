@@ -15,3 +15,5 @@ export { FullscreenPass } from './render/FullscreenPass.js';
 export { commonModule } from './render/wgsl/common.js';
 export { SceneLighting, surfaceModule, lightingModule, shadowModule, ShadowUniforms } from './render/wgsl/lighting.js';
 export { Engine } from './Engine.js';
+export { SkinnedModel, skinnedMaterial } from './render/Skinning.js';
+export { loadGLB, parseGLB, decodeImage } from './loaders/GLTF.js';

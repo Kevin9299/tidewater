@@ -10,6 +10,8 @@ import { Matrix4, Vector4 } from '../../math/index.js';
 //       fn hookDirectModulation( P: vec3f, N: vec3f ) -> vec3f   caustics, water column, clouds, hill shadow
 //       fn hookAmbientModulation( P: vec3f, N: vec3f ) -> vec3f  underwater tint / attenuation
 //       fn hookContactShadow( P: vec3f, N: vec3f ) -> f32        screen-space contact shadow of the sun
+//       fn hookShadowPosition( P: vec3f, N: vec3f, pixel: vec2f ) -> vec3f   where the sun shadow map is
+//                                                  sampled for P (underwater: the light's entry point)
 //       fn hookBounce( P: vec3f, N: vec3f ) -> vec3f             ground bounce irradiance (already / PI)
 //       fn hookLocalLights( s: Surface, P, N, V, acc: ptr<function, LightAccum> )   point / spot lights
 //       fn hookEnvSpecular( R: vec3f, roughness: f32 ) -> vec3f  IBL radiance (Environment probe)
@@ -42,6 +44,7 @@ const HOOK_DEFAULTS = {
 	directModulation: 'fn hookDirectModulation( P: vec3f, N: vec3f ) -> vec3f { return vec3f( 1.0 ); }',
 	ambientModulation: 'fn hookAmbientModulation( P: vec3f, N: vec3f ) -> vec3f { return vec3f( 1.0 ); }',
 	contactShadow: 'fn hookContactShadow( P: vec3f, N: vec3f ) -> f32 { return 1.0; }',
+	shadowPosition: 'fn hookShadowPosition( P: vec3f, N: vec3f, pixel: vec2f ) -> vec3f { return P; }',
 	bounce: 'fn hookBounce( P: vec3f, N: vec3f ) -> vec3f { return vec3f( 0.0 ); }',
 	localLights: 'fn hookLocalLights( s: Surface, P: vec3f, N: vec3f, V: vec3f, acc: ptr<function, LightAccum> ) {}',
 	envSpecular: 'fn hookEnvSpecular( R: vec3f, roughness: f32 ) -> vec3f { let t = sat( R.y * 0.5 + 0.5 ); return mix( frame.horizonColor * 0.6, frame.skyIrradiance * PI, t ) * frame.envIntensity; }',
@@ -341,6 +344,22 @@ export const lightingModule = new ShaderModule( {
 	name: 'lighting',
 	deps: [ commonModule, surfaceModule, shadowModule ],
 	code: /* wgsl */`
+// STUDIO_LIGHTING (a pass define, e.g. the fish portraits of the catch card): the world hooks are
+// skipped (no shadows, caustics, cloud / hill shadow, bounce, local lights, underwater tint) and the
+// environment is a neutral photo studio: a grey sweep lit from above plus one large softbox whose
+// azimuth is frame.debug.x (radians, animatable). The key light is frame.sunDir / frame.sunColor of
+// the view's own frame block.
+fn studioEnvSpecular( R: vec3f, roughness: f32 ) -> vec3f {
+	let sweep = mix( vec3f( 0.035, 0.04, 0.045 ), vec3f( 0.55, 0.57, 0.6 ), smoothstep( -0.35, 0.85, R.y ) );
+	let az = atan2( R.x, R.z ) - frame.debug.x;
+	let w = 0.35 + roughness * 1.6;
+	let box = exp( - az * az / ( w * w ) ) * smoothstep( -0.05, 0.3, R.y ) * smoothstep( 0.98, 0.55, R.y );
+	return ( sweep + box * vec3f( 2.4, 2.35, 2.25 ) / ( 1.0 + roughness * 3.0 ) ) * frame.envIntensity;
+}
+fn studioEnvDiffuse( N: vec3f ) -> vec3f {
+	return mix( vec3f( 0.05, 0.055, 0.06 ), vec3f( 0.3, 0.31, 0.33 ), N.y * 0.5 + 0.5 ) * frame.envIntensity;
+}
+
 fn shadeSurface( s: Surface, P: vec3f, V: vec3f, pixel: vec2f ) -> vec3f {
 	let N = s.normal;
 	let rough = clamp( s.roughness, 0.03, 1.0 );
@@ -354,14 +373,23 @@ fn shadeSurface( s: Surface, P: vec3f, V: vec3f, pixel: vec2f ) -> vec3f {
 	// ---- sun / moon
 	let L = frame.sunDir;
 	let dotNL = sat( dot( N, L ) );
+#if STUDIO_LIGHTING
+	let lightColor = frame.sunColor;
+#else
 	var lightColor = frame.sunColor * hookDirectModulation( P, N );
 #if MATERIAL_SUN_MODULATION
 	// per-material key-light multiplier (the former TerrainLightingModel: heightfield hill shadow)
 	lightColor *= materialSunModulation( P, N );
 #endif
 	let geomN = N;
-	let shadow = sunShadow( P, geomN, pixel ) * hookContactShadow( P, N );
+#if REFRACTION_CLIP
+	// the water's refraction source (seen blurred through the water): one hard shadow tap
+	let shadow = sunShadowHard( hookShadowPosition( P, geomN, pixel ) );
+#else
+	let shadow = sunShadow( hookShadowPosition( P, geomN, pixel ), geomN, pixel ) * hookContactShadow( P, N );
+#endif
 	lightColor *= shadow;
+#endif
 	let irradiance = dotNL * lightColor;
 	acc.directDiffuse += irradiance * diffuseColor * INV_PI;
 	acc.directSpecular += irradiance * BRDF_GGX( L, V, N, specF0, specF90, rough );
@@ -377,28 +405,43 @@ fn shadeSurface( s: Surface, P: vec3f, V: vec3f, pixel: vec2f ) -> vec3f {
 #endif
 
 	// ---- local lights (lanterns, windows, boat lights, flashlight)
+#if !STUDIO_LIGHTING
 	hookLocalLights( s, P, N, V, &acc );
+#endif
 
 	// ---- indirect: environment + ground bounce
 	// (three's PhysicalLightingModel: env irradiance goes through the multiscatter-compensated
 	// diffuse; the ground bounce is plain Lambert)
-	let envIrr = hookEnvDiffuse( N ) * PI * s.envIntensity;
 	let R = reflect( -V, N );
 	let Rr = normalize( mix( R, N, rough * rough ) );
+#if STUDIO_LIGHTING
+	let envIrr = studioEnvDiffuse( N ) * PI * s.envIntensity;
+	let radiance = studioEnvSpecular( Rr, rough ) * s.envIntensity;
+#else
+	let envIrr = hookEnvDiffuse( N ) * PI * s.envIntensity;
 	let radiance = hookEnvSpecular( Rr, rough ) * s.envIntensity;
+#endif
 	var single = vec3f( 0.0 ); var multi = vec3f( 0.0 );
 	multiscatter( N, V, specF0, specF90, rough, &single, &multi );
 	let totalScatter = single + multi;
 	let diffuseMS = diffuseColor * ( 1.0 - max( max( totalScatter.r, totalScatter.g ), totalScatter.b ) );
 	acc.indirectSpecular += radiance * single + multi * envIrr * INV_PI;
+#if STUDIO_LIGHTING
+	acc.indirectDiffuse += diffuseMS * envIrr * INV_PI;
+#else
 	acc.indirectDiffuse += diffuseMS * envIrr * INV_PI + hookBounce( P, N ) * diffuseColor;
+#endif
 
 	// ambient occlusion (specular occlusion after Lagarde)
 	let dotNV = sat( dot( N, V ) );
 	let specAO = sat( pow( dotNV + s.ao, exp2( -16.0 * rough - 1.0 ) ) - 1.0 + s.ao );
 	acc.indirectDiffuse *= s.ao;
 	acc.indirectSpecular *= specAO;
+#if STUDIO_LIGHTING
+	let amb = vec3f( 1.0 );
+#else
 	let amb = hookAmbientModulation( P, N );
+#endif
 	acc.indirectDiffuse *= amb;
 	acc.indirectSpecular *= amb;
 
@@ -409,7 +452,11 @@ fn shadeSurface( s: Surface, P: vec3f, V: vec3f, pixel: vec2f ) -> vec3f {
 #if CLEARCOAT
 	let ccNV = sat( dot( ccN, V ) );
 	let Fcc = F_Schlick( vec3f( 0.04 ), 1.0, ccNV ) * s.clearcoat;
+#if STUDIO_LIGHTING
+	let ccRad = studioEnvSpecular( reflect( -V, ccN ), clamp( s.clearcoatRoughness, 0.03, 1.0 ) ) * amb * specAO;
+#else
 	let ccRad = hookEnvSpecular( reflect( -V, ccN ), clamp( s.clearcoatRoughness, 0.03, 1.0 ) ) * amb * specAO;
+#endif
 	color = color * ( 1.0 - Fcc ) + ( ccSpec * s.clearcoat + ccRad * Fcc );
 #endif
 	return color + s.emissive;

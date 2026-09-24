@@ -162,7 +162,9 @@ export class BoatMaterials {
 
 	}
 
-	// White fiberglass (deck, lining, house, console); pattern 1 = molded non-skid.
+	// White fiberglass (deck, lining, house, console); pattern 1 = molded non-skid,
+	// 2 = wheelhouse interior (painted panels: seams, screws, grime, water stains),
+	// 3 = headliner (perforated vinyl between battens).
 	createGelcoat() {
 
 		const m = standard( { roughness: 0.35, metalness: 0, ...COMMON() } );
@@ -174,19 +176,104 @@ export class BoatMaterials {
 	let h = boatNonSkidHeight( in.uv ) * grip;
 	let p = in.vs.vLocal;
 	let dirtN = mx_noise_float3( p * 1.7 );
-	let dirt = sat( dirtN * 0.5 + 0.35 ) * grip * 0.16;
+	// worked deck: trodden grime, blotchy oil / bait / water stains
+	let blot = boatLstep( 0.2, 0.55, mx_fractal_noise_float3( p * vec3f( 2.2, 2.2, 2.2 ) + vec3f( 7.7, 0.0, 3.1 ), 3, 2.0, 0.5 ) );
+	let dirt = ( sat( dirtN * 0.5 + 0.35 ) * 0.22 + blot * 0.2 ) * grip;
 	// a little grime where walls meet the sole
 	let corner = boatInvstep( 0.35, 0.5, p.y ) * 0.08 * ( 1.0 - grip );
-	s.albedo = vColor * ( 1.0 - h * 0.07 ) * ( 1.0 - dirt - corner );
-	s.roughness = mix( aux.x, 0.72, grip ) + h * 0.1;
-	s.metalness = aux.y;
-	s.normal = boatBumpNormal( in.P, in.N, h * 0.0008 );
+
+	// old gelcoat everywhere (not the non-skid): chalky yellowed patches, grime settling low down and
+	// faint rust / dirt streaks running down from fittings
+	let plainK = 1.0 - grip;
+	let wear = mx_fractal_noise_float3( p * vec3f( 1.1, 1.6, 1.1 ) + vec3f( 5.3, 1.1, 2.9 ), 3, 2.0, 0.5 );
+	let streakN = mx_noise_float3( vec3f( p.x * 14.0, p.y * 1.2, p.z * 14.0 ) );
+	let streaks = boatLstep( 0.3, 0.7, streakN ) * 0.7 * plainK;
+	// (deck / sole at 0.35 m)
+	let lowDirt = boatInvstep( 0.38, 1.15, p.y ) * sat( wear + 0.7 ) * 0.34 * plainK;
+	var base = vColor * ( 1.0 - h * 0.07 ) * ( 1.0 - dirt - corner * 1.8 - lowDirt );
+	base = mix( base, base * vec3f( 0.94, 0.89, 0.78 ), boatLstep( -0.15, 0.35, wear ) * 0.45 * plainK );
+	base = mix( base, base * vec3f( 0.78, 0.7, 0.6 ), streaks * 0.25 );
+	var rough = mix( aux.x, 0.72, grip ) + h * 0.1 + ( sat( wear + 0.3 ) * 0.18 + lowDirt * 0.5 ) * plainK;
+	var metal = aux.y;
+	var groove = 0.0;
+	var interiorAO = 1.0;
+	var fill = vec3f( 0.0 );
+	// wheelhouse interior (2) and headliner (3) only: the rest of the gelcoat skips the noise
+	if ( aux.z > 1.5 ) {
+		let mottle = mx_fractal_noise_float3( p * vec3f( 2.3, 3.1, 2.3 ), 3, 2.0, 0.5 );
+
+		// ---- painted panels with screwed seams, grime and water stains
+		let panel = boatIsPattern( aux.z, 2.0 );
+		// seams: vertical every 0.61 m along the boat, horizontal at the rail height and below the windows
+		let sz = ( p.z + 0.13 ) / 0.61;
+		let seamDz = 0.305 - abs( fract( sz ) - 0.5 ) * 0.61; // distance to the nearest vertical seam (m)
+		let dyA = abs( p.y - 1.17 );
+		let dyB = abs( p.y - 1.52 );
+		let seamD = min( seamDz, min( dyA, dyB ) );
+		let aa = fwidth( seamD ) + 1e-4;
+		let seam = boatInvstep( 0.0015, 0.0015 + aa * 1.5, seamD ) * panel;
+		// pan-head screws every 0.15 m along the seams, 12 mm off the joint
+		let screwV = length( vec2f( ( fract( p.y / 0.15 ) - 0.5 ) * 0.15, seamDz - 0.012 ) );
+		let screwH = length( vec2f( ( fract( p.z / 0.15 ) - 0.5 ) * 0.15, min( dyA, dyB ) - 0.012 ) );
+		let screwD = min( screwV, screwH );
+		let screw = boatInvstep( 0.0035, 0.0035 + fwidth( screwD ) + 1e-4, screwD ) * panel;
+		// grime: darker toward the sole and along the seams (hands, boots, salt), mottled
+		// (the panels start at the rail, 1.17 m: grime collects on their lower part and the bottom seam)
+		let low = boatInvstep( 1.15, 1.6, p.y );
+		let grime = sat( low * ( 0.35 + mottle * 0.3 ) + boatInvstep( 0.0, 0.035, seamD ) * 0.18 + mottle * 0.08 ) * panel;
+		// years of sun and diesel: blotchy yellowing over whole panels
+		let age = mx_fractal_noise_float3( p * vec3f( 0.9, 1.4, 0.9 ) + vec3f( 3.1, 0.0, 1.7 ), 3, 2.0, 0.5 );
+		// hand smudges at grab height, boot scuffs (streaks along the boat) just above the sole
+		let smudge = boatLstep( 0.25, 0.6, mx_noise_float3( p * vec3f( 7.0, 5.0, 7.0 ) + vec3f( 9.0 ) ) ) * boatLstep( 1.05, 1.25, p.y ) * boatInvstep( 1.5, 1.75, p.y );
+		let scuffN = mx_noise_float3( vec3f( p.z * 3.0, p.y * 60.0, p.x * 3.0 ) );
+		let scuff = boatLstep( 0.45, 0.7, scuffN ) * boatInvstep( 0.9, 1.15, p.y ) * boatLstep( 0.2, 0.35, mottle + 0.5 );
+		// water stains running down from the window sills, brown at their ends
+		let run = mx_noise_float3( vec3f( p.z * 9.0, p.y * 0.8, p.x * 9.0 ) );
+		let stain = boatLstep( 0.25, 0.7, run ) * boatLstep( 0.9, 1.35, p.y ) * boatInvstep( 1.3, 1.56, p.y ) * panel;
+		// warm, yellowed off-white paint
+		var pc = vColor * vec3f( 0.97, 0.94, 0.87 );
+		pc = mix( pc, pc * vec3f( 0.9, 0.82, 0.64 ), boatLstep( -0.1, 0.35, age ) * 0.7 );
+		pc = pc * ( 1.0 - grime * 0.6 ) * ( 1.0 - smudge * 0.12 * panel ) * ( 1.0 - scuff * 0.25 * panel );
+		pc = mix( pc, pc * vec3f( 0.66, 0.54, 0.4 ), stain * 0.6 );
+		pc = mix( pc, pc * 0.3, seam );
+		// pan-head screws, some rusted with a short streak below
+		let rustK = step( 0.55, boatHash21( floor( vec2f( p.y / 0.15, p.z / 0.15 ) + 0.5 ) ) );
+		let screwCol = mix( vec3f( 0.55, 0.55, 0.53 ), vec3f( 0.32, 0.17, 0.08 ), rustK );
+		pc = mix( pc, screwCol, screw );
+
+		// ---- headliner: off-white perforated vinyl, quilted between the battens
+		let head = boatIsPattern( aux.z, 3.0 );
+		let hq = p.xz / 0.006;
+		let perf = boatInvstep( 0.12, 0.3, length( fract( hq ) - 0.5 ) ) * boatInvstep( 0.3, 0.7, fwidth( hq.x ) );
+		let quilt = sin( ( p.z + 0.1 ) / 0.5 * 3.14159 ) * 0.5 + 0.5;
+		let hc = vec3f( 0.72, 0.69, 0.63 ) * ( 1.0 - perf * 0.18 ) * ( quilt * 0.12 + 0.88 ) * ( mottle * 0.08 + 0.96 );
+
+		base = mix( mix( base, pc, panel ), hc, head );
+		rough = mix( mix( rough, 0.5 + grime * 0.3 + age * 0.08 - smudge * 0.12 - screw * 0.2, panel ), 0.8, head );
+		metal = metal + screw * 0.8 * ( 1.0 - rustK );
+		// inside an enclosed wheelhouse most of the sky and sea is hidden: dim the ambient (the sun
+		// through the windows is direct light and unaffected). Darker into the corners and overhead.
+		interiorAO = mix( mix( 1.0, 0.55 - low * 0.12 - boatLstep( 1.9, 2.3, p.y ) * 0.1, panel ), 0.12, head );
+		// the headliner faces the sole, not the sea: its light is the sun and sky bounced off the
+		// deck, the sole and the walls (warm, neutral) - a small fill in place of the hidden IBL
+		let skyL = dot( frame.skyIrradiance, vec3f( 0.3, 0.5, 0.2 ) );
+		let sunL = dot( frame.sunColor, vec3f( 0.3, 0.5, 0.2 ) ) * sat( frame.sunDir.y );
+		fill = hc * vec3f( 1.0, 0.95, 0.86 ) * ( skyL * 0.5 + sunL * 0.004 ) * head;
+		groove = seam * -0.0006 + screw * 0.0004 + ( perf * -0.0002 + quilt * 0.002 ) * head;
+	}
+	s.albedo = base;
+	s.roughness = rough;
+	s.metalness = metal;
+	s.ao = interiorAO;
+	s.emissive = fill;
+	s.normal = boatBumpNormal( in.P, in.N, h * 0.0008 + groove );
 `;
 		return m;
 
 	}
 
-	// Varnished teak/mahogany; grain follows uv.x. Pattern 1 = plain (brass, paint).
+	// Varnished teak/mahogany; grain follows uv.x. Pattern 1 = plain (brass, paint),
+	// 2 = teak-and-holly sole (planks along uv.x, 0.1 m wide, pale holly strips, scuffed varnish).
 	createWood() {
 
 		const m = standard( { roughness: 0.35, metalness: 0, ...COMMON() } );
@@ -199,17 +286,43 @@ export class BoatMaterials {
 	let rings = sin( w.y * 150.0 + g1 * 5.0 + w.x * 0.6 ) * 0.5 + 0.5;
 	let grain = sat( rings * 0.45 + g2 * 0.22 + g1 * 0.22 + 0.28 );
 	let plain = boatIsPattern( aux.z, 1.0 );
-	let wood = mix( ${ col( 0x4a230f ) }, ${ col( 0x9c5b2b ) }, grain );
+	var wood = mix( ${ col( 0x4a230f ) }, ${ col( 0x9c5b2b ) }, grain );
+	var rough = aux.x + g2 * 0.04 * ( 1.0 - plain );
+
+	// teak and holly: per-plank tone, holly strip between planks, butt joints, worn traffic lane
+	let sole = boatIsPattern( aux.z, 2.0 );
+	let pv = w.y / 0.1;
+	let plankI = floor( pv );
+	let pf = abs( fract( pv ) - 0.5 );
+	let aaP = fwidth( pv ) + 1e-4;
+	let holly = boatLstep( 0.5 - 0.06 - aaP, 0.5 - 0.06, pf );
+	let caulk = boatLstep( 0.5 - 0.012 - aaP, 0.5 - 0.012, pf );
+	let butt = boatInvstep( 0.0, 0.004 + fwidth( w.x ), abs( fract( w.x / 1.8 + boatHash21( vec2f( plankI, 3.0 ) ) ) - 0.5 ) * 1.8 );
+	let tone = boatHash21( vec2f( plankI, 7.0 ) ) * 0.25 + 0.85;
+	let lane = mx_noise_float3( vec3f( w.x * 1.3, w.y * 1.3, 2.0 ) ) * 0.5 + 0.5;
+	var teak = mix( ${ col( 0x6b3f1d ) }, ${ col( 0xa87445 ) }, grain ) * tone;
+	teak = mix( teak, teak * vec3f( 1.12, 1.08, 1.02 ), lane * 0.5 ); // worn, sun-bleached
+	teak = mix( teak, ${ col( 0xd9c9a6 ) }, holly * ( 1.0 - caulk ) );
+	teak = mix( teak, ${ col( 0x1c140e ) }, max( caulk, butt ) );
+	wood = mix( wood, teak, sole );
+	rough = mix( rough, 0.45 + lane * 0.25, sole );
+
 	s.albedo = mix( wood, vec3f( 1.0 ), plain ) * in.color.rgb;
-	s.roughness = aux.x + g2 * 0.04 * ( 1.0 - plain );
+	s.roughness = rough;
 	s.metalness = aux.y;
+	s.normal = boatBumpNormal( in.P, in.N, ( g2 * 0.0002 - max( caulk, butt ) * 0.0012 ) * sole );
+	// the sole is inside the wheelhouse: most of the sky is hidden (ambient only)
+	s.ao = mix( 1.0, 0.6, sole );
 `;
 		return m;
 
 	}
 
 	// Everything else opaque: stainless, bronze, painted metal, plastics, rope, vinyl, flag.
-	// Pattern 1 = laid rope, 2 = flag (animated), 3 = whip antenna (animated sway).
+	// Pattern 1 = laid rope, 2 = flag (animated), 3 = whip antenna (animated sway),
+	// 4 = wrinkle-finish paint / textured plastic with scuffs, 5 = printed page (tide table, rows of
+	// type; uv 0..1), 6 = folded paper chart, 7 = photo print, 8 = label tape (white, black type),
+	// 9 = heavy fabric (oilskin, lifejacket; folds + stitching).
 	createFittings() {
 
 		const m = standard( {
@@ -241,9 +354,79 @@ export class BoatMaterials {
 
 	var c = mix( vColor, vColor * ropeShade, boatIsPattern( aux.z, 1.0 ) );
 	c = mix( c, flag, boatIsPattern( aux.z, 2.0 ) );
+	var rough = aux.x;
+	var bump = 0.0;
+	// interior props (patterns 4..9) only: ordinary fittings skip the noise
+	if ( aux.z > 3.5 ) {
+		let p = in.vs.vLocal;
+
+		// wrinkle finish: fine crinkle bump, pale scuffs on the edges people touch
+		let wrinkle = boatIsPattern( aux.z, 4.0 );
+		let wn = mx_noise_float3( p * 380.0 );
+		let scuffN = mx_fractal_noise_float3( p * vec3f( 6.0, 14.0, 6.0 ), 3, 2.0, 0.5 );
+		let scuff = boatLstep( 0.35, 0.6, scuffN ) * wrinkle;
+		c = mix( c, mix( c * ( 1.0 + wn * 0.08 ), c + vec3f( 0.05 ), scuff * 0.6 ), wrinkle );
+		rough = mix( rough, rough + wn * 0.08 - scuff * 0.15, wrinkle );
+		bump += wn * 0.00015 * wrinkle;
+
+		// printed page: margins, header block, rows of type, a table grid, coffee ring
+		let page = boatIsPattern( aux.z, 5.0 );
+		let row = fract( u.y * 34.0 );
+		let word = boatHash21( floor( vec2f( u.x * 16.0, u.y * 34.0 ) ) );
+		let inText = step( 0.08, u.x ) * step( u.x, 0.92 ) * step( 0.06, u.y ) * step( u.y, 0.82 );
+		let typeK = boatLstep( 0.35, 0.45, row ) * boatInvstep( 0.7, 0.8, row ) * step( 0.18, word ) * inText;
+		let header = step( 0.86, u.y ) * step( u.y, 0.93 ) * step( 0.08, u.x ) * step( u.x, 0.6 );
+		let grid = boatLstep( 0.478, 0.49, abs( fract( u.x * 4.0 ) - 0.5 ) ) * inText;
+		let ring = boatInvstep( 0.0, 0.02, abs( length( u - vec2f( 0.7, 0.3 ) ) - 0.16 ) ) * 0.5;
+		let paper = mix( vec3f( 0.86, 0.84, 0.78 ), vec3f( 0.1, 0.1, 0.12 ), max( max( typeK * 0.7, header * 0.85 ), grid * 0.5 ) );
+		c = mix( c, mix( paper, vec3f( 0.45, 0.3, 0.18 ), ring ), page );
+		rough = mix( rough, 0.9, page );
+
+		// folded paper chart: sea and land tints, depth contours, fold creases, pencilled course
+		let chartK = boatIsPattern( aux.z, 6.0 );
+		let cn = mx_fractal_noise_float3( vec3f( u * 3.0 + vec2f( 1.3, 4.2 ), 0.7 ), 4, 2.0, 0.5 );
+		let shore = cn + ( u.x - 0.55 ) * 1.4;
+		let landK = boatLstep( 0.0, 0.02, shore );
+		let contour = boatInvstep( 0.03, 0.06, abs( fract( shore * 7.0 ) - 0.5 ) ) * ( 1.0 - landK );
+		let crease = boatInvstep( 0.0, 0.006, abs( u.x - 0.5 ) ) + boatInvstep( 0.0, 0.006, abs( u.y - 0.5 ) );
+		let course = boatInvstep( 0.001, 0.004, abs( u.y - 0.2 - u.x * 0.45 ) ) * step( 0.1, u.x ) * step( u.x, 0.7 );
+		var chart = mix( vec3f( 0.72, 0.8, 0.84 ), vec3f( 0.86, 0.78, 0.58 ), landK );
+		chart = chart * ( 1.0 - contour * 0.25 ) * ( 1.0 - crease * 0.2 );
+		chart = mix( chart, vec3f( 0.2, 0.2, 0.22 ), course * 0.8 );
+		c = mix( c, chart, chartK );
+		rough = mix( rough, 0.85, chartK );
+
+		// photo print: white border, a sunlit boat / sea / sky picture
+		let photo = boatIsPattern( aux.z, 7.0 );
+		let inPic = step( 0.07, u.x ) * step( u.x, 0.93 ) * step( 0.07, u.y ) * step( u.y, 0.8 );
+		let horizon = 0.45 + sin( u.x * 3.0 + aux.w * 6.0 ) * 0.03;
+		var pic = mix( vec3f( 0.08, 0.22, 0.35 ), vec3f( 0.45, 0.65, 0.85 ), step( horizon, u.y ) );
+		pic = mix( pic, vec3f( 0.85, 0.25, 0.12 ), boatInvstep( 0.06, 0.08, length( ( u - vec2f( 0.4 + aux.w * 0.2, horizon ) ) * vec2f( 1.0, 3.0 ) ) ) );
+		pic = mix( vec3f( 0.92, 0.9, 0.86 ), pic * ( mx_noise_float3( vec3f( u * 20.0, aux.w * 9.0 ) ) * 0.15 + 0.9 ), inPic );
+		c = mix( c, pic, photo );
+		rough = mix( rough, 0.3, photo );
+
+		// label tape: white with blocks of black type
+		let label = boatIsPattern( aux.z, 8.0 );
+		let lt = step( 0.3, fract( u.x * 7.0 ) ) * step( 0.3, boatHash21( floor( vec2f( u.x * 28.0, 3.0 ) ) ) ) * step( 0.25, u.y ) * step( u.y, 0.75 );
+		c = mix( c, mix( vec3f( 0.85, 0.85, 0.82 ), vec3f( 0.05 ), lt ), label );
+
+		// heavy fabric: soft folds, stitched seams, grime
+		let fabric = boatIsPattern( aux.z, 9.0 );
+		let fold = mx_fractal_noise_float3( p * vec3f( 9.0, 4.0, 9.0 ), 2, 2.0, 0.5 );
+		// stitched seams every 0.31 m (dashed)
+		let stitch = boatLstep( 0.486, 0.494, abs( fract( p.y / 0.31 ) - 0.5 ) ) * step( 0.5, fract( p.x * 160.0 + p.z * 160.0 ) );
+		c = mix( c, c * ( fold * 0.35 + 0.8 ) * ( 1.0 - stitch * 0.3 ), fabric );
+		rough = mix( rough, 0.65 + fold * 0.1, fabric );
+		bump += fold * 0.004 * fabric;
+	}
+
 	s.albedo = c;
-	s.roughness = aux.x;
+	s.roughness = rough;
 	s.metalness = aux.y;
+	s.normal = boatBumpNormal( in.P, in.N, bump );
+	// patterns 4..9 are wheelhouse interior pieces: most of the sky is hidden (ambient only)
+	s.ao = select( 1.0, 0.6, aux.z > 3.5 );
 `;
 
 		// vertex animation

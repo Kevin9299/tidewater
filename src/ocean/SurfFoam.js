@@ -11,7 +11,9 @@ import { Texture, ShaderModule, commonModule } from '../engine/webgpu.js';
 //   struct SurfFoamArgs { coverage, foam, footprint, depth, bubbles: f32, lagXZ: vec2f, normal: vec3f,
 //                         baseNormal: vec3f, fresh, sim: f32, simState: vec4f, roller: f32, P: vec3f }
 //     (P: world position of the fragment — the pattern lives in world space; set it!)
-//   struct SurfFoamInfo { foam, density, height, surf, ww, relief, selfShadow, cavity: f32 }
+//   struct SurfFoamInfo { foam, density, height, surf, ww, relief, selfShadow, cavity: f32,
+//                         reliefPat, reliefK, thinPat, thinK, bubPat, bubK: f32 }
+//     (height / relief = pattern x weight; the *Pat / *K split is what the lighting differentiates)
 //   fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo
 //   fn surfFoamLight( info: SurfFoamInfo, N: vec3f, L: vec3f, V: vec3f, sun: vec3f, P: vec3f ) -> vec3f
 //   fn surfFoamFlowLace( q: vec2f, flow: vec2f, salt: f32 ) -> vec4f
@@ -278,6 +280,16 @@ struct SurfFoamInfo {
 	relief: f32,
 	selfShadow: f32,
 	cavity: f32,
+	// relief split into world-space patterns and their weights: the weights come from values
+	// interpolated across the water mesh (fresh whitewater, depth, footprint), so the screen-space
+	// gradient of a weight is constant per triangle; differentiating the product drew every mesh
+	// triangle as a flat facet into the foam. Only the patterns are differentiated.
+	reliefPat: f32, // whitewater lumps (m), relief = reliefPat * reliefK
+	reliefK: f32,
+	thinPat: f32, // thin foam: height = thinPat * thinK + bubPat * bubK
+	thinK: f32,
+	bubPat: f32,
+	bubK: f32,
 };
 
 // Henyey-Greenstein phase (1/sr)
@@ -329,6 +341,9 @@ fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
 	var wwRelief = 0.0; // relief of the whitewater (m)
 	var wwShadow = 1.0; // sun visibility inside the churn
 	var wwCav = 1.0; // sky visibility in its crevices
+	var reliefPat = 0.0; var reliefK = 0.0;
+	var thinPat = 0.0; var thinK = 0.0;
+	var bubPat = 0.0; var bubK = 0.0;
 	// surf look near the beach, the default whitecap look offshore
 	let surf = smoothstep( 7.0, 3.0, a.depth ) * shoreSimInside( shoreSimUvOf( xz ) );
 	if ( surf > 0.0 && coverage > 0.04 ) {
@@ -353,9 +368,9 @@ fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
 		// (the along-crest coordinate warped by low-frequency noise: the 3.5 m lace tile must not repeat as a
 		// row of identical lumps and spikes along the break)
 		let al = dot( xz, tangent );
-		let qv = vec2f( al + sin( al * 0.19 + 0.8 ) * 2.1 + sin( al * 0.47 + 2.9 ) * 0.6, P.y * 2.4 );
+		let qv = vec2f( al + sin( al * 0.19 + 0.8 ) * 2.1 + sin( al * 0.47 + 2.9 ) * 0.6 + sin( P.y * 1.7 + al * 0.11 ) * 0.5, P.y * 1.1 );
 		if ( steep > 0.01 ) {
-			let vert = surfFoamFlowLace( qv, vec2f( 0.0, -1.8 ), 1.0 );
+			let vert = surfFoamFlowLace( qv, vec2f( 0.0, -0.9 ), 1.0 );
 			lace = mix( flat, vert, steep );
 		}
 		// Churning whitewater is a pile of foam lumps at several scales (tumbling masses ~1.3 m,
@@ -364,14 +379,15 @@ fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
 		if ( ww > 0.02 ) {
 			let L = frame.sunDir;
 			let pq = mix( xz, qv, steep );
-			let pflow = mix( flow, vec2f( 0.0, -1.8 ), steep );
+			let pflow = mix( flow, vec2f( 0.0, -0.9 ), steep );
 			let big = surfFoamBigAt( pq, pflow );
 			let mid = sqrt( surfFoamFlowLace( pq / 2.2, pflow / 2.2, 3.0 ).x );
 			lumps = big * 0.6 + mid * 0.4;
 			let A = 0.22; // relief of the lumps (m)
-			wwRelief = ( big * A + mid * ( A * 0.45 ) + ( 1.0 - lace.x ) * ( A * 0.12 ) ) * ww;
+			reliefPat = big * A + mid * ( A * 0.45 ) + ( 1.0 - lace.x ) * ( A * 0.12 );
+			wwRelief = reliefPat * ww;
 			// the sun direction in the pattern's coordinates, and its elevation above the local surface
-			let Lp = mix( L.xz, vec2f( dot( L.xz, tangent ), L.y * 2.4 ), steep );
+			let Lp = mix( L.xz, vec2f( dot( L.xz, tangent ), L.y * 1.1 ), steep );
 			let Ld = Lp / max( length( Lp ), 1e-3 );
 			let NdL = dot( a.normal, L );
 			let tanE = NdL / max( length( L - a.normal * NdL ), 0.05 );
@@ -418,16 +434,22 @@ fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
 		// optical thickness (thin foam is translucent, thick foam scatters like snow) and a relief
 		// height for the lighting: lumpy boiling whitewater, thick foam higher than its thin edges
 		density = max( sat( c * 1.3 ) * ( inner * 0.5 + 0.5 ), ww );
-		let relief = inner * sat( c * 1.5 ) * ( 1.0 - ww );
+		let reliefThin = inner * sat( c * 1.5 );
+		let relief = reliefThin * ( 1.0 - ww );
 		wwOut = ww * ( 1.0 - far * 0.6 );
 		// far away the lumps average out: a mean shadowing of the churn instead
 		wwShadow = mix( wwShadow, 0.82, far );
 		wwCav = mix( wwCav, 0.8, far );
 		wwRelief *= 1.0 - far;
 		height = ( relief + a.bubbles * 0.15 ) * surf * ( 1.0 - far );
+		reliefK = ww * ( 1.0 - far );
+		thinPat = reliefThin;
+		thinK = ( 1.0 - ww ) * surf * ( 1.0 - far );
+		bubPat = a.bubbles * 0.15;
+		bubK = surf * ( 1.0 - far );
 	}
 
-	return SurfFoamInfo( opacity, density, height, surf, wwOut, wwRelief, wwShadow, wwCav );
+	return SurfFoamInfo( opacity, density, height, surf, wwOut, wwRelief, wwShadow, wwCav, reliefPat, reliefK, thinPat, thinK, bubPat, bubK );
 }
 
 // Foam radiance: a dense scatterer, wrapped diffuse sun (light diffuses through the bubbles),
@@ -437,11 +459,12 @@ fn surfFoamLight( info: SurfFoamInfo, N: vec3f, L: vec3f, V: vec3f, sun: vec3f, 
 	let cavity = info.cavity;
 	// relief normal from the screen-space gradient of the height (Mikkelsen surface gradient): the
 	// thin-foam relief (in units of ~3 cm) plus the whitewater lumps (m)
-	let hN = info.height * ${ f( this.bump * 0.04 ) } + info.relief;
+	// (gradients of the world-space patterns only, scaled by their weights: see SurfFoamInfo)
+	let kb = ${ f( this.bump * 0.04 ) };
 	let dpx = dpdx( P );
 	let dpy = dpdy( P );
-	let dhdx = dpdx( hN );
-	let dhdy = dpdy( hN );
+	let dhdx = dpdx( info.reliefPat ) * info.reliefK + ( dpdx( info.thinPat ) * info.thinK + dpdx( info.bubPat ) * info.bubK ) * kb;
+	let dhdy = dpdy( info.reliefPat ) * info.reliefK + ( dpdy( info.thinPat ) * info.thinK + dpdy( info.bubPat ) * info.bubK ) * kb;
 	let r1 = cross( dpy, N );
 	let r2 = cross( N, dpx );
 	let det = dot( dpx, r1 );

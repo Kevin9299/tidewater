@@ -444,7 +444,7 @@ export class SkyProClouds {
 
 	async _loadNoise() {
 
-		const base = '/tidewater/public/';
+		const base = ( import.meta.env && import.meta.env.BASE_URL ) || '/';
 		const get = async ( name ) => {
 
 			const r = await fetch( base + 'clouds/' + name );

@@ -444,7 +444,7 @@ export class SkyProClouds {
 
 	async _loadNoise() {
 
-		const base = './';
+		const base = '/tidewater/';
 		const get = async ( name ) => {
 
 			const r = await fetch( base + 'clouds/' + name );

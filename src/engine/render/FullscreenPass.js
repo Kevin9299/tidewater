@@ -54,14 +54,20 @@ export class FullscreenPass {
 			primitive: { topology: 'triangle-list' },
 		};
 		if ( depthFormat ) desc.depthStencil = { format: depthFormat, depthCompare, depthWriteEnabled: depthWrite };
-		this.pipeline = GPU.device.createRenderPipeline( desc );
+		this.handle = GPU.renderPipeline( desc );
 		this.timestampWrites = null;
+
+	}
+
+	get pipeline() {
+
+		return GPU.ready( this.handle );
 
 	}
 
 	draw( rp, frameBlock = FrameUniforms ) {
 
-		rp.setPipeline( this.pipeline );
+		rp.setPipeline( GPU.ready( this.handle ) );
 		rp.setBindGroup( 0, group0ForBlock( frameBlock, 'render' ).getBindGroup() );
 		rp.setBindGroup( 1, this.bindings.getBindGroup() );
 		rp.draw( 3 );

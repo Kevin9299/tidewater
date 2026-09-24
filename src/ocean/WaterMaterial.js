@@ -119,10 +119,28 @@ export class WaterMaterial extends Material {
 
 	}
 
+	// two pipelines: with the hull-mask discard (a hull on screen) and without it. A shader that can
+	// discard loses early depth / hidden surface removal on every pixel, so the sea only pays for it
+	// while a hull is actually masked (SceneRenderer sets hullMaskActive before the water pass).
+	// hullOverride (0 / 1) forces a variant (App.precompile builds both).
+	get _hullOn() {
+
+		if ( ! this._hull ) return false;
+		if ( this.hullOverride !== undefined && this.hullOverride !== null ) return !! this.hullOverride;
+		return this.hullMaskActive.value > 0.5;
+
+	}
+
 	pipelineKey() {
 
 		if ( ! this._built ) this._build();
-		return super.pipelineKey();
+		return super.pipelineKey() + ( this._hullOn ? '.hull' : '' );
+
+	}
+
+	allDefines() {
+
+		return { ...super.allDefines(), WATER_HULL: this._hullOn ? 1 : 0 };
 
 	}
 
@@ -153,7 +171,7 @@ export class WaterMaterial extends Material {
 
 		this.setDefine( 'WATER_REFRACTION', REFR ? 1 : 0 );
 		if ( HULL ) this.bindings.waterHullMask = { texture: this.hullMaskTexture, sampleType: 'unfilterable-float' };
-		this.setDefine( 'WATER_HULL', HULL ? 1 : 0 );
+		this._hull = HULL;
 
 		this.vertex = /* wgsl */`
 	let r = waterSurfaceVertex( v.nodeData, v.position.xz );
@@ -214,7 +232,8 @@ export class WaterMaterial extends Material {
 	let L = frame.sunDir;
 	// the sun light reaching the surface: sun colour x shadow maps (three's direct light), x clouds,
 	// x the island's own shadow (heightfield horizon: the shadow map's range is too short to hold it)
-	var sunLight = frame.sunColor * sunShadow( pos, vec3f( 0.0, 1.0, 0.0 ), in.pixel );
+	// (5-tap PCF: the waves break up any penumbra detail the contact-hardening filter would add)
+	var sunLight = frame.sunColor * sunShadowPCF( pos, vec3f( 0.0, 1.0, 0.0 ), in.pixel );
 ${ CL ? '	sunLight *= cloudsShadow( pos.xz );' : '' }
 ${ T ? '	sunLight *= terrainSunShadowAt( pos );' : '' }
 
@@ -224,7 +243,7 @@ ${ T ? '	sunLight *= terrainSunShadowAt( pos );' : '' }
 	var frontD = 1e3;
 	var swTau = 0.0;
 	var swRt = 0.0;
-${ hasClip ? `	{
+${ hasClip ? `	if ( vDepth < 1.0 ) {
 		let se = shoreSwashEdge( pos.xz, thickness );
 		thickness = se.x; frontD = se.y; swTau = se.z; swRt = se.w;
 	}` : '' }
@@ -341,8 +360,13 @@ ${ REFL ? `
 
 		// water column below the surface along the refracted ray (terrain, 2 refinements)
 ${ T ? `		let L0 = max( pos.y - terrainHeightAt( pos.xz ), 0.0 ) / tDown;
-		let L1 = max( pos.y - terrainHeightAt( pos.xz + Tv.xz * min( L0, 200.0 ) ), 0.0 ) / tDown;
-		let Lt = max( pos.y - terrainHeightAt( pos.xz + Tv.xz * min( L1 * 0.5 + L0 * 0.5, 200.0 ) ), 0.0 ) / tDown;` : '		let Lt = 400.0;' }
+		// deep water: the end point is capped at 80 m and the column is opaque long before, so the
+		// refinements can't change the result
+		var Lt = L0;
+		if ( L0 < 100.0 ) {
+			let L1 = max( pos.y - terrainHeightAt( pos.xz + Tv.xz * min( L0, 200.0 ) ), 0.0 ) / tDown;
+			Lt = max( pos.y - terrainHeightAt( pos.xz + Tv.xz * min( L1 * 0.5 + L0 * 0.5, 200.0 ) ), 0.0 ) / tDown;
+		}` : '		let Lt = 400.0;' }
 		let Lter = clamp( Lt, 0.0, 400.0 );
 		// thin breaking crests: the refracted ray leaves through the back of the wave into the sky
 		let crestT = ${ hasCrest ? 'shoreCrestPath( lagXZ, vDepth, Tv )' : '1e4' };
@@ -362,13 +386,16 @@ ${ T ? `		let L0 = max( pos.y - terrainHeightAt( pos.xz ), 0.0 ) / tDown;
 		// the scene below the water only (RefractionPass): nothing above the water (pier, rails, posts,
 		// the boat) can hide the refracted end point. Coverage in alpha: bilinear across its edge, then
 		// un-premultiplied, so the clip boundary blends instead of darkening.
-		if ( onScreen ) {
-			let rc = textureSampleLevel( waterRefrColor, smpLinearClamp, uvR, 0.0 );
+		// (an end point off screen takes the nearest edge texel: the opaque pass shades deep seabed
+		// cheaply, see MeshShader submergedHidden, so the unrefracted pixel is no fallback there)
+		{
+			let uvRc = clamp( uvR, vec2f( 0.001 ), vec2f( 0.999 ) );
+			let rc = textureSampleLevel( waterRefrColor, smpLinearClamp, uvRc, 0.0 );
 			let rSize = vec2f( textureDimensions( waterRefrDepth ) );
-			let rd = textureLoad( waterRefrDepth, vec2i( min( uvR * rSize, rSize - 1.0 ) ), 0 ).x;
+			let rd = textureLoad( waterRefrDepth, vec2i( min( uvRc * rSize, rSize - 1.0 ) ), 0 ).x;
 			if ( rc.a > 0.5 && rd > 0.0 ) {
 				sceneCol = rc.rgb / rc.a;
-				uvF = uvR;
+				uvF = uvRc;
 				dR = rd;
 				found = true;
 			}
@@ -573,10 +600,10 @@ fn _waterSSR( posV: vec3f, Rv: vec3f ) -> vec4f {
 	var t = 0.15 * stepScale;
 	var dt = 0.25 * stepScale;
 	var prevT = 0.0;
-	for ( var i = 0; i < 14; i++ ) {
+	for ( var i = 0; i < 11; i++ ) {
 		prevT = t;
 		t += dt;
-		dt *= 1.5;
+		dt *= 1.7;
 		let p = posV + Rv * t;
 		let uv = _waterProject( p );
 		if ( uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || p.z > -0.1 ) { break; }
@@ -593,7 +620,7 @@ fn _waterSSR( posV: vec3f, Rv: vec3f ) -> vec4f {
 	if ( hit ) {
 		// refine between the last miss and the hit
 		var a = prevT; var b = t;
-		for ( var k = 0; k < 4; k++ ) {
+		for ( var k = 0; k < 3; k++ ) {
 			let m = ( a + b ) * 0.5;
 			let p = posV + Rv * m;
 			let behind = p.z < _waterSceneZAt( _waterProject( p ) );

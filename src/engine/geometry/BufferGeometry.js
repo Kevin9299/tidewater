@@ -63,8 +63,8 @@ export class BufferGeometry extends EventDispatcher {
 	setIndirect( indirect, offset = 0 ) { this.indirect = indirect; this.indirectOffset = offset; return this; }
 	getIndirect() { return this.indirect; }
 	getAttribute( name ) { return this.attributes[ name ]; }
-	setAttribute( name, attr ) { this.attributes[ name ] = attr; return this; }
-	deleteAttribute( name ) { delete this.attributes[ name ]; return this; }
+	setAttribute( name, attr ) { this.attributes[ name ] = attr; this.attributesVersion = ( this.attributesVersion || 0 ) + 1; return this; }
+	deleteAttribute( name ) { delete this.attributes[ name ]; this.attributesVersion = ( this.attributesVersion || 0 ) + 1; return this; }
 	hasAttribute( name ) { return this.attributes[ name ] !== undefined; }
 	addGroup( start, count, materialIndex = 0 ) { this.groups.push( { start, count, materialIndex } ); }
 	clearGroups() { this.groups = []; }

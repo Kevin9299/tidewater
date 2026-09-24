@@ -27,6 +27,7 @@ export const SUN_ANGULAR_RADIUS = 0.004675 * 1.15;
 const T_W = 256, T_H = 64;
 const MS_RES = 32;
 const SV_W = 192, SV_H = 108;
+const LOG_STEP = Math.log( 1.02 );
 
 const f = ( x ) => {
 
@@ -469,17 +470,34 @@ fn main() {
 
 	update( dt, cameraY ) {
 
-		this.viewHeight.value = RG + Math.max( 0.001, cameraY / 1000 + 0.0005 );
+		// camera height quantized (2 m near the sea, 2 % higher up): the sky view LUT is rebuilt only
+		// when a parameter changes, not every frame the camera bobs
+		const y = Math.max( 0.5, cameraY + 0.5 );
+		const yq = y < 100 ? Math.round( y / 2 ) * 2 : Math.exp( Math.round( Math.log( y ) / LOG_STEP ) * LOG_STEP );
+		this.viewHeight.value = RG + Math.max( 0.001, yq / 1000 );
 
+		let dirty = false;
 		if ( this.needsStatic ) {
 
 			this.needsStatic = false;
+			dirty = true;
 			this.transmittanceKernel.dispatch( [ T_W / 8, T_H / 8, 1 ] );
 			this.multiScatKernel.dispatch( [ MS_RES / 8, MS_RES / 8, 1 ] );
 
 		}
 
-		this.skyViewKernel.dispatch( [ SV_W / 8, Math.ceil( SV_H / 8 ), 1 ] );
+		// sky view LUT: only when the parameters (sun, height, scattering) changed
+		this.params._pack();
+		const cur = this.params.u32;
+		const last = this._svLast || ( this._svLast = new Uint32Array( cur.length ) );
+		for ( let i = 0; i < cur.length && ! dirty; i ++ ) dirty = cur[ i ] !== last[ i ];
+		if ( dirty || ! this._svValid ) {
+
+			last.set( cur );
+			this._svValid = true;
+			this.skyViewKernel.dispatch( [ SV_W / 8, Math.ceil( SV_H / 8 ), 1 ] );
+
+		}
 
 		// periodically integrate irradiance and read it back for CPU-side uniforms/lights
 		this._irrTimer -= dt;
@@ -507,6 +525,7 @@ fn main() {
 	invalidate() {
 
 		this.needsStatic = true;
+		this._svValid = false;
 
 	}
 

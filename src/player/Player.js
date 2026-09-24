@@ -13,6 +13,7 @@ const SWIM_DEPTH = 1.35;
 const STAND_DEPTH = 1.1;
 
 const _v = new THREE.Vector3();
+const _v2 = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _q = new THREE.Quaternion();
@@ -469,24 +470,15 @@ export class Player {
 
 	}
 
-	exitBoat( target = null ) {
+	// target: an ashoreTarget() spot; side: +1 / -1 jumps overboard on the starboard / port side
+	exitBoat( target = null, side = 0 ) {
 
 		const b = this.boat;
 		const wasDriving = b.driven;
 		b.driven = false;
 		b.throttle = 0;
-		// choose the exit point closest to something walkable (pier deck / sand)
-		let best = null, bestScore = Infinity;
-		for ( const ep of b.model.exitPoints ) {
-
-			const w = b.toWorld( ep, new THREE.Vector3() );
-			const side = w.clone().sub( b.position ).setY( 0 ).normalize().multiplyScalar( 1.4 );
-			const out = w.clone().add( side );
-			const g = this.groundAt( out.x, out.z, w.y + 2.5 );
-			const score = Math.abs( g - w.y ) + ( g < this.query.cpu[ 0 ] - 0.3 ? 5 : 0 );
-			if ( score < bestScore ) { bestScore = score; best = { out, g }; }
-
-		}
+		// the exit point closest to something walkable (pier deck / sand)
+		let best = side ? null : this.ashoreTarget();
 
 		const dock = WORLD.boatDock.position;
 		if ( b.position.distanceTo( dock ) < 14 && b.speed < 1.5 ) {
@@ -497,16 +489,18 @@ export class Player {
 
 		}
 
-		if ( target ) best = target, bestScore = 0;
-		if ( best && bestScore < 1.2 ) {
+		if ( target ) best = target;
+		if ( best ) {
 
 			this.position.set( best.out.x, best.g, best.out.z );
 			this.mode = 'walk';
 
 		} else {
 
-			const w = b.toWorld( new THREE.Vector3( 2.2, 0, 0 ), new THREE.Vector3() );
-			this.position.set( w.x, this.waterH - 0.2, w.z );
+			const w = b.toWorld( new THREE.Vector3( 2.2 * ( side || 1 ), 0, 0 ), new THREE.Vector3() );
+			// (the boat floats at the water line: the walker's water height is stale while aboard)
+			this.waterH = this.waterMean = b.position.y;
+			this.position.set( w.x, b.position.y - 0.2, w.z );
 			this.mode = 'swim';
 			if ( this.audio ) this.audio.splash( 0.8, this.position );
 
@@ -519,24 +513,35 @@ export class Player {
 
 	}
 
-	// best walkable spot next to the boat (pier deck / sand / shallows), or null
+	// best walkable spot next to the boat (pier deck / sand / shallows), or null. Looks straight out
+	// from the rail at each exit point (square to the hull, a few reaches: the boat swings on its
+	// mooring) for ground from a little below the rail up to a pier deck a climb above it.
 	ashoreTarget() {
 
 		const b = this.boat;
+		const water = this.query.cpuValid ? this.query.cpu[ 0 ] : 0;
+		// the boat's starboard (local +x) direction in the world, level
+		const sx = _v2.set( 1, 0, 0 ).applyQuaternion( b.quaternion ).setY( 0 ).normalize();
+		const rx = sx.x, rz = sx.z;
 		let best = null, bestScore = Infinity;
 		for ( const ep of b.model.exitPoints ) {
 
 			const w = b.toWorld( ep, new THREE.Vector3() );
-			const side = w.clone().sub( b.position ).setY( 0 ).normalize().multiplyScalar( 1.4 );
-			const out = w.clone().add( side );
-			const g = this.groundAt( out.x, out.z, w.y + 2.5 );
-			const water = this.query.cpuValid ? this.query.cpu[ 0 ] : 0;
-			const score = Math.abs( g - w.y ) + ( g < water - 0.3 ? 5 : 0 );
-			if ( score < bestScore ) { bestScore = score; best = { out, g, ep }; }
+			const sgn = Math.sign( ep.x ) || 1;
+			for ( const reach of [ 0.9, 1.4, 2.0 ] ) {
+
+				const out = new THREE.Vector3( w.x + rx * sgn * reach, w.y, w.z + rz * sgn * reach );
+				const g = this.groundAt( out.x, out.z, w.y + 2.5 );
+				const up = g - w.y;
+				if ( up > 1.7 || up < - 1.2 || g < water - 0.3 ) continue;
+				const score = Math.abs( up ) + reach * 0.2;
+				if ( score < bestScore ) { bestScore = score; best = { out, g, ep }; }
+
+			}
 
 		}
 
-		return best && bestScore < 1.2 ? best : null;
+		return best;
 
 	}
 
@@ -682,16 +687,27 @@ export class Player {
 
 			}
 
-		} else if ( this._ashore && ! this.busy ) {
+		} else if ( ! this.busy ) {
 
-			// only when standing at the rail on that side
-			const ep = this._ashore.ep;
-			if ( Math.hypot( p.x - ep.x, p.z - ep.z ) < 1.3 ) {
+			// at the rail: step ashore where there is ground on that side, else jump into the sea
+			const ep = this._ashore && this._ashore.ep;
+			const atRail = b.model.exitPoints.some( ( e ) => Math.hypot( p.x - e.x, p.z - e.z ) < 1.3 );
+			if ( ep && Math.hypot( p.x - ep.x, p.z - ep.z ) < 1.3 ) {
 
 				this.prompt = { key: 'E', text: 'Step ashore' };
 				if ( inp.hit( 'KeyE' ) ) {
 
 					this.exitBoat( this._ashore );
+					return;
+
+				}
+
+			} else if ( atRail ) {
+
+				this.prompt = { key: 'E', text: 'Jump overboard' };
+				if ( inp.hit( 'KeyE' ) ) {
+
+					this.exitBoat( null, Math.sign( p.x ) || 1 );
 					return;
 
 				}

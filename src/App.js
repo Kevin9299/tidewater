@@ -9,11 +9,13 @@ import { CDLOD } from './core/CDLOD.js';
 import { G } from './core/Globals.js';
 import { Profiler } from './core/Profiler.js';
 import { SceneRenderer, LAYERS } from './core/SceneRenderer.js';
+import { DEPTH_FORMAT } from './engine/render/SceneRenderer.js';
 import { installDebugViews } from './core/DebugViews.js';
 
 import { Atmosphere, SUN_ILLUMINANCE } from './sky/Atmosphere.js';
 import { Sky, sunDirectionFromTime } from './sky/Sky.js';
 import { Clouds } from './sky/Clouds.js';
+import { SkyProClouds } from './sky/SkyProClouds.js';
 import { Environment } from './sky/Environment.js';
 
 import { TerrainData } from './world/TerrainData.js';
@@ -76,7 +78,7 @@ export class App {
 			sunAzimuth: 0, // degrees: turns the sun's daily path about the vertical
 			timeSpeed: 0, // hours per real second
 			exposure: 0.55,
-			dynamicResolution: true,
+			renderScale: 1, // internal resolution (the temporal upscaler reconstructs the output), Performance tab
 		};
 		this.qs = new URLSearchParams( location.search );
 
@@ -115,7 +117,9 @@ export class App {
 		this.sky = new Sky( this.atmosphere );
 		if ( ! qs.has( 'noClouds' ) ) {
 
-			this.clouds = new Clouds( renderer, this.atmosphere );
+			// sky-pro-webgpu's clouds ("Partly cloudy"); ?oldClouds: the previous ones
+			this.clouds = qs.has( 'oldClouds' ) ? new Clouds( renderer, this.atmosphere ) : new SkyProClouds( renderer, this.atmosphere );
+			if ( this.clouds.ready ) await this.clouds.ready;
 			this.sky.clouds = this.clouds;
 
 		}
@@ -333,6 +337,8 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		} );
 		this.post = new PostFX( renderer, { sceneRenderer: this.sceneRenderer, camera, underwater: this.underwater, clouds: this.clouds, sunDir: this.atmosphere.sunDir, haze: this.haze } );
 		G.exposure.value = this.settings.exposure;
+		if ( qs.has( 'scale' ) ) this.settings.renderScale = Number( qs.get( 'scale' ) ) || 1;
+		this.setRenderScale( this.settings.renderScale );
 
 		// ---------------------------------------------------------------- audio
 		// recorded field recordings (public/audio, credits in public/audio/CREDITS.md); ?noAudio turns it off
@@ -367,6 +373,7 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 		this.updateSun();
 		installDebugViews( this );
 		window.__app = this;
+		this.gpu = GPU; // console / test access
 
 		// ---- compile pipelines asynchronously (keeps the page responsive), then prime a few
 		// frames behind the loading screen so any remaining first-use stalls happen there
@@ -383,16 +390,41 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 
 	}
 
-	// Build every pipeline up front by rendering a frame with the normally hidden effects shown, then
-	// wait for the GPU (keeps first-use pipeline stalls behind the loading screen).
+	// Build every pipeline up front, then wait for the GPU (keeps first-use compiles behind the loading
+	// screen). The precompile frame visits every mesh of every pass, hidden or out of view, and the
+	// pipelines compile in parallel in the background (GPU.renderPipeline); the refraction pass and
+	// the hull mask are forced on so their variants are built too.
 	async precompile() {
 
-		const hidden = [ this.marineSnow.mesh, this.airMotes.mesh ].filter( ( m ) => m && ! m.visible );
-		for ( const m of hidden ) m.visible = true;
+		const mr = this.engine.meshRenderer;
+		const refr = this.refraction.enabled;
+		// compute / post pipelines were requested while the systems were built: let them finish first
+		// (the frame below would otherwise compile each one again, synchronously); the post chain
+		// builds its passes on first use, so build it now
+		if ( ! this.post._built ) {
+
+			this.post._build();
+			this.post._outW = 0; // as PostFX.beginFrame: size the new targets
+
+		}
+
+		await GPU.pipelinesReady();
+		mr.precompiling = true;
+		this.refraction.enabled = true;
+		const sr = this.sceneRenderer, hm = sr.hullMaskRT;
+		if ( sr.hullMasks.length ) mr.render( sr.hullMaskScene, {
+			label: 'hull mask', kind: 'color', camera: this.camera, colorViews: [ hm.texture.view() ], colorFormats: hm.formats,
+			clearColors: [ [ 0, 0, 0, 0 ] ], depthView: hm.depthTexture.view(), depthFormat: DEPTH_FORMAT, clearDepth: 0, cull: false,
+		} );
 		try {
 
-			this.frame( 1 / 60 );
-			await GPU.queue.onSubmittedWorkDone();
+			// both water variants: with the hull-mask discard (a hull on screen) and without
+			for ( const hull of [ 0, 1 ] ) {
+
+				this.waterMaterial.hullOverride = hull;
+				this.frame( 1 / 60 );
+
+			}
 
 		} catch ( e ) {
 
@@ -400,7 +432,11 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 
 		}
 
-		for ( const m of hidden ) m.visible = false;
+		this.waterMaterial.hullOverride = null;
+		mr.precompiling = false;
+		this.refraction.enabled = refr;
+		await GPU.pipelinesReady();
+		await GPU.queue.onSubmittedWorkDone();
 
 	}
 
@@ -666,32 +702,18 @@ fn terrainWetness( xz: vec2f, h: f32 ) -> vec2f {
 
 		this.updateAudio( dt );
 		if ( this.ui ) this.ui.update( dt );
-		this.updateDynamicResolution( dt );
 		this.input.endFrame();
 
 	}
 
-	// Hold ~60 fps by lowering the internal resolution (TAAU reconstructs the output resolution).
-	updateDynamicResolution( dt ) {
+	// Internal render resolution relative to the output (0.5..1), set by hand: changing it re-creates
+	// the scene / post / cloud targets, so nothing adjusts it automatically.
+	setRenderScale( v ) {
 
-		if ( ! this.settings.dynamicResolution || dt > 0.1 ) return;
-		const d = this._dynRes || ( this._dynRes = { ema: 1 / 60, t: 0, n: 0 } );
-		d.ema += ( dt - d.ema ) * 0.08;
-		d.t += dt;
-		if ( ++ d.n < 60 || d.t < 0.75 ) return; // let it settle after startup / a change
-		d.t = 0;
-		const target = 1 / 60;
-		let s = this.post.scale;
-		if ( d.ema > target * 1.1 ) s -= 0.05;
-		else if ( d.ema < target * 0.78 ) s += 0.05;
-		s = MathUtils.clamp( Math.round( s * 20 ) / 20, 0.6, 1 );
-		if ( s !== this.post.scale ) {
-
-			this.post.setScale( s );
-			if ( this.clouds ) this.clouds.resolutionScale = s;
-			d.n = 30;
-
-		}
+		const scale = MathUtils.clamp( Math.round( v * 20 ) / 20, 0.5, 1 );
+		this.settings.renderScale = scale;
+		this.post.setScale( scale );
+		if ( this.clouds ) this.clouds.resolutionScale = scale;
 
 	}
 

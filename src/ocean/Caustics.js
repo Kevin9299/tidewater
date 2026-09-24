@@ -1,5 +1,6 @@
-import { GPU, UniformBlock, Texture, ShaderModule, composeShader, createShaderModule, generateMipmaps } from '../engine/webgpu.js';
+import { GPU, UniformBlock, Texture, ShaderModule, composeShader, createShaderModule } from '../engine/webgpu.js';
 import { commonModule } from '../engine/render/wgsl/common.js';
+import { ComputeMips } from './ComputeMips.js';
 
 // Caustics by rasterized photon splatting (as in Evan Wallace's "WebGL Water").
 //
@@ -21,6 +22,7 @@ import { commonModule } from '../engine/render/wgsl/common.js';
 //   fn causticsSampleLevel( P: vec3f, depth: f32, level: f32 ) -> vec3f   flat surface, fixed blur level
 //   fn causticsSampleBaked( P, depth, slope, foam, gdx, gdy, detailK: f32 ) -> vec3f
 //        as causticsSample, with the gust / slick factor precomputed (UnderwaterLighting's baked map)
+//   fn causticsSampleBakedMono( ... )  same without the chromatic dispersion (the refraction source)
 //   fn causticsSampleShaft( P: vec3f, depth: f32, level: f32, detailK: f32 ) -> vec3f
 //        flat surface, one fine lookup (no dispersion) and a precomputed gust / slick factor: for
 //        ray marches (the factor varies over hundreds of metres: take it once per pixel)
@@ -40,8 +42,26 @@ class CausticLayer {
 
 		// the floor is mostly seen at grazing angles: filter along the view (anisotropic sampler at
 		// lookup), stay sharp across it
-		this.texture = new Texture( { label: name, width: res, height: res, format: 'rgba16float', mips: true, usage: [ 'sample', 'render', 'copyDst', 'copySrc' ], sampler: 'anisoRepeat' } );
+		this.texture = new Texture( { label: name, width: res, height: res, format: 'rgba16float', mips: true, usage: [ 'sample', 'render', 'storage', 'copyDst', 'copySrc' ], sampler: 'anisoRepeat' } );
 		this.target = { texture: this.texture };
+
+		// indexed grid: each surface vertex is shaded once (the post-transform cache shares it
+		// between its 6 triangles) instead of once per triangle corner
+		const g = this.grid, row = g + 1;
+		const idx = new Uint32Array( g * g * 6 );
+		for ( let y = 0, i = 0; y < g; y ++ ) for ( let x = 0; x < g; x ++ ) {
+
+			const a = y * row + x;
+			idx[ i ++ ] = a; idx[ i ++ ] = a + 1; idx[ i ++ ] = a + row;
+			idx[ i ++ ] = a + row; idx[ i ++ ] = a + 1; idx[ i ++ ] = a + row + 1;
+
+		}
+
+		this.indexCount = idx.length;
+		this.indexBuffer = GPU.device.createBuffer( { label: name + ' indices', size: idx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST } );
+		GPU.queue.writeBuffer( this.indexBuffer, 0, idx );
+		// box-filtered mips in compute (instead of a render pass per level)
+		this.mipChain = new ComputeMips( this.texture, name );
 
 		const L = this.tile;
 		this.pipelines = [];
@@ -53,12 +73,9 @@ class CausticLayer {
 struct CauOut { @builtin( position ) pos: vec4f, @location( 0 ) vOld: vec2f, @location( 1 ) vNew: vec2f };
 
 @vertex fn vs( @builtin( vertex_index ) vi: u32 ) -> CauOut {
-	// grid of ${ this.grid } x ${ this.grid } quads over [-margin, 1 + margin]^2, two triangles each
-	let q = vi / 6u; let corner = vi % 6u;
-	let cx = q % ${ this.grid }u; let cy = q / ${ this.grid }u;
-	var o2 = vec2u( 0u );
-	switch corner { case 1u: { o2 = vec2u( 1u, 0u ); } case 2u, 3u: { o2 = vec2u( 0u, 1u ); } case 4u: { o2 = vec2u( 1u, 0u ); } case 5u: { o2 = vec2u( 1u, 1u ); } default: {} }
-	let uv = vec2f( vec2u( cx, cy ) + o2 ) / ${ this.grid }.0 * ${ ( 1 + 2 * margin ).toFixed( 4 ) } - ${ margin.toFixed( 4 ) };
+	// vertex of a ${ this.grid } x ${ this.grid } quad grid over [-margin, 1 + margin]^2 (indexed)
+	let cx = vi % ${ this.grid + 1 }u; let cy = vi / ${ this.grid + 1 }u;
+	let uv = vec2f( vec2u( cx, cy ) ) / ${ this.grid }.0 * ${ ( 1 + 2 * margin ).toFixed( 4 ) } - ${ margin.toFixed( 4 ) };
 	let d = textureSampleLevel( oceanDerivatives, smpLinearRepeat, uv, ${ cascade }, ${ slopeLevel.toFixed( 3 ) } );
 	let s = vec2f( d.x / max( d.z + 1.0, 0.3 ), d.y / max( d.w + 1.0, 0.3 ) );
 	let n = normalize( vec3f( - s.x, 1.0, - s.y ) );
@@ -91,7 +108,7 @@ struct CauOut { @builtin( position ) pos: vec4f, @location( 0 ) vOld: vec2f, @lo
 			const c = composeShader( { modules: [ commonModule, fft.module ], code, stage: 'render', label: name } );
 			const module = createShaderModule( c.code, name );
 			const add = { srcFactor: 'one', dstFactor: 'one', operation: 'add' };
-			const pipeline = GPU.device.createRenderPipeline( {
+			const pipeline = GPU.renderPipeline( {
 				label: name + k,
 				layout: GPU.device.createPipelineLayout( { bindGroupLayouts: [ c.group0.layout, c.bindings.layout ] } ),
 				vertex: { module, entryPoint: 'vs' },
@@ -111,17 +128,23 @@ struct CauOut { @builtin( position ) pos: vec4f, @location( 0 ) vOld: vec2f, @lo
 			label: this.texture.label,
 			colorAttachments: [ { view: this.texture.view( { dimension: '2d', baseMipLevel: 0, mipLevelCount: 1 } ), clearValue: [ 0, 0, 0, 0 ], loadOp: 'clear', storeOp: 'store' } ],
 		} );
+		rp.setIndexBuffer( this.indexBuffer, 'uint32' );
 		for ( const p of this.pipelines ) {
 
-			rp.setPipeline( p.pipeline );
+			rp.setPipeline( GPU.ready( p.pipeline ) );
 			rp.setBindGroup( 0, p.group0.getBindGroup() );
 			rp.setBindGroup( 1, p.bindings.getBindGroup() );
-			rp.draw( this.grid * this.grid * 6, 1 );
+			rp.drawIndexed( this.indexCount, 1 );
 
 		}
 
 		rp.end();
-		generateMipmaps( this.texture, enc );
+
+	}
+
+	mips( pass ) {
+
+		this.mipChain.dispatch( pass );
 
 	}
 
@@ -149,6 +172,12 @@ export class Caustics {
 
 		this.fine.render( this.renderer );
 		this.broad.render( this.renderer );
+		GPU.computePass( 'Caustics Mips', ( pass ) => {
+
+			this.fine.mips( pass );
+			this.broad.mips( pass );
+
+		} );
 
 	}
 
@@ -238,6 +267,11 @@ fn causticsSample( P: vec3f, depth: f32, slope: vec2f, foam: f32, gdx: vec2f, gd
 
 fn causticsSampleBaked( P: vec3f, depth: f32, slope: vec2f, foam: f32, gdx: vec2f, gdy: vec2f, detailK: f32 ) -> vec3f {
 	return _causticsSample( P, depth, -1.0, slope, foam, true, gdx, gdy, true, false, detailK );
+}
+
+// without the chromatic dispersion (one fine lookup): the water's refraction source, seen blurred
+fn causticsSampleBakedMono( P: vec3f, depth: f32, slope: vec2f, foam: f32, gdx: vec2f, gdy: vec2f, detailK: f32 ) -> vec3f {
+	return _causticsSample( P, depth, -1.0, slope, foam, true, gdx, gdy, true, true, detailK );
 }
 
 fn causticsSampleLevel( P: vec3f, depth: f32, level: f32 ) -> vec3f {

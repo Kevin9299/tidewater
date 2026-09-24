@@ -65,8 +65,14 @@ export class LensDroplets {
 }
 
 const CODE = /* wgsl */`
+// integer hash (pcg2d) of the float bits: no transcendentals (18 cells x 2 hashes per pixel)
 fn lensHash2( p: vec2f ) -> vec2f {
-	return fract( sin( vec2f( dot( p, vec2f( 127.1, 311.7 ) ), dot( p, vec2f( 269.5, 183.3 ) ) ) ) * 43758.5453 );
+	var v = bitcast<vec2u>( p ) * 1664525u + 1013904223u;
+	v.x += v.y * 1664525u; v.y += v.x * 1664525u;
+	v = v ^ ( v >> vec2u( 16u ) );
+	v.x += v.y * 1664525u; v.y += v.x * 1664525u;
+	v = v ^ ( v >> vec2u( 16u ) );
+	return vec2f( v >> vec2u( 8u ) ) / 16777216.0;
 }
 
 struct LensAcc { n2: vec2f, cover: f32, trail: f32 };
@@ -79,8 +85,9 @@ fn lensLayer( p: vec2f, cell: f32, rMin: f32, rMax: f32, density: f32, slide: bo
 		for ( var i = -1; i <= 1; i++ ) {
 			let c = c0 + vec2f( f32( i ), f32( j ) );
 			let h = lensHash2( c + seed );
+			// no drop in this cell: it adds nothing (skip the outline math, most cells are empty)
+			if ( h.x >= density ) { continue; }
 			let h2 = lensHash2( c + seed + 17.3 );
-			let present = select( 0.0, 1.0, h.x < density );
 			var center = ( c + ( vec2f( 0.2 ) + h2 * 0.6 ) ) * cell;
 			// evaporation shrinks drops; big ones last longer
 			let life = clamp( wet * 1.6 - h2.y * 0.6, 0.0, 1.0 );
@@ -95,15 +102,18 @@ fn lensLayer( p: vec2f, cell: f32, rMin: f32, rMax: f32, density: f32, slide: bo
 				let dxT = abs( p.x - center.x );
 				let above = center.y - p.y;
 				let tr = smoothstep( r * 0.45, 0.0, dxT ) * smoothstep( 0.0, 0.01, above ) * smoothstep( dy + 0.01, 0.0, above );
-				( *acc ).trail = max( ( *acc ).trail, tr * present * life );
+				( *acc ).trail = max( ( *acc ).trail, tr * life );
 			}
 			// irregular outline: a few lobes, sliding drops stretched vertically
 			let d = ( p - center ) * vec2f( 1.0, select( 1.0, 0.8, slide ) );
+			// outside the largest outline (wobble <= 1.18): no coverage, skip the lobes
+			let rB = max( r * 1.18, 1e-4 );
+			if ( dot( d, d ) >= rB * rB ) { continue; }
 			let ang = atan2( d.y, d.x );
 			let wobble = 1.0 + sin( ang * 3.0 + h.x * 40.0 ) * 0.12 + sin( ang * 5.0 + h2.y * 30.0 ) * 0.06;
 			let q = d / max( r * wobble, 1e-4 );
 			let rq = dot( q, q );
-			let a = smoothstep( 1.0, 0.7, rq ) * present;
+			let a = smoothstep( 1.0, 0.7, rq );
 			if ( a > ( *acc ).cover ) {
 				( *acc ).n2 = q;
 				( *acc ).cover = a;

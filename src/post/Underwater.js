@@ -1,5 +1,7 @@
 import { ShaderModule, UniformBlock } from '../engine/gpu/Shader.js';
 import { commonModule } from '../engine/render/wgsl/common.js';
+import { RenderTarget } from '../engine/gpu/Texture.js';
+import { FullscreenPass } from '../engine/render/FullscreenPass.js';
 import { Matrix4, Vector3, Vector4 } from '../engine/math/index.js';
 import { localLightsModule } from '../materials/LocalLights.js';
 
@@ -72,6 +74,7 @@ export class Underwater {
 			band: [ 'f32', 9 ], // meniscus half-width in pixels (<= BAND)
 			enabled: [ 'f32', 1 ],
 			torchBeam: [ 'f32', 3 ], // flashlight beam in-scatter strength
+			hasShafts: [ 'f32', 0 ], // the half resolution shaft / torch march ran this frame
 		}, { label: 'underwater' } );
 		const U = this.uniforms.fields;
 		this.lensDistance = U.lensDistance;
@@ -83,6 +86,34 @@ export class Underwater {
 		this.camWorld = U.camWorld;
 		this.proj = U.proj;
 		this._module = null;
+		// caustic light shafts + torch beam in-scatter, ray marched at half the internal resolution
+		// (rgb: in-scatter, a: the pixel's view distance for the depth-aware upsample in the composite)
+		this.shaftTarget = new RenderTarget( 1, 1, { colors: [ 'rgba16float' ], label: 'uwShafts' } );
+		this._shaftPass = null;
+
+	}
+
+	// internal (scene) size
+	setSize( w, h ) {
+
+		this.shaftTarget.setSize( Math.max( 1, Math.ceil( w / 2 ) ), Math.max( 1, Math.ceil( h / 2 ) ) );
+
+	}
+
+	get shaftPass() {
+
+		if ( ! this._shaftPass ) this._shaftPass = new FullscreenPass( {
+			label: 'underwater shafts', colorFormats: [ 'rgba16float' ], modules: [ this.module ], code: this._shaftCode(),
+		} );
+		return this._shaftPass;
+
+	}
+
+	// record the half resolution march when any pixel can be under water (active), before the composite
+	renderShafts( active ) {
+
+		this.uniforms.fields.hasShafts.value = active ? 1 : 0;
+		if ( active ) this.shaftPass.render( { colorViews: [ this.shaftTarget.texture ], clear: [ 0, 0, 0, 0 ] } );
 
 	}
 
@@ -123,7 +154,7 @@ export class Underwater {
 		this._compositeModule = new ShaderModule( {
 			name: 'underwater-composite',
 			deps: [ this.module ],
-			bindings: { underwaterMediumTex: { texture: () => this.mediumTexture } },
+			bindings: { underwaterMediumTex: { texture: () => this.mediumTexture }, underwaterShaftTex: { texture: () => this.shaftTarget.texture } },
 			code: this._compositeCode(),
 		} );
 		return this._compositeModule;
@@ -194,14 +225,16 @@ fn underwaterMedium( uv: vec2f ) -> f32 {
 	}
 
 
-	_compositeCode() {
+	// caustic light shafts + torch beam in-scatter along the view ray, at half the internal resolution
+	// (pixel: this pass's fragment coordinate; the noise is resolved by the TAAU)
+	_shaftCode() {
 
 		const shafts = this.caustics && this.caustics.module ? /* wgsl */`
 		{
 			let steps = 20;
 			let maxD = min( dist, 22.0 );
 			let ds = maxD / f32( steps );
-			// interleaved gradient noise on the real pixel grid, moved every frame (Jimenez 2014) so the
+			// interleaved gradient noise on the pixel grid, moved every frame (Jimenez 2014) so the
 			// temporal resolve integrates the steps instead of freezing a noise pattern on screen
 			let fragPx = pixel + f32( frame.frameIndex % 64u ) * 5.588238;
 			let jitter = _uwIgn( fragPx );
@@ -219,11 +252,70 @@ fn underwaterMedium( uv: vec2f ) -> f32 {
 		}` : '';
 
 		return /* wgsl */`
+fn _uwIgn( px: vec2f ) -> f32 { return fract( fract( dot( px, vec2f( 0.06711056, 0.00583715 ) ) ) * 52.9829189 ); }
+
+fn fragment( in: FSIn ) -> vec4f {
+	let uv = in.uv;
+	let pixel = in.pos.xy;
+	let d = _uwDepthAt( uv );
+	let vz = underwaterViewZ( d );
+	let ray = underwaterViewRay( uv );
+	let dist = max( min( length( ray * ( - vz ) ), 600.0 ) - underwaterParams.lensDistance * length( ray ), 0.0 );
+	let dir = underwaterWorldDir( uv );
+	let st = waterQueryCameraState();
+	let sigS = frame.waterScattering;
+	let sigT = frame.waterAbsorption + sigS;
+
+	let Ls = - refract( - frame.sunDir, vec3f( 0.0, 1.0, 0.0 ), 1.0 / UW_IOR ); // toward the sun, underwater
+	let mu = max( Ls.y, 0.15 );
+	let cosPh = dot( dir, Ls );
+	let g = 0.85;
+	let phase = ( 1.0 - g * g ) / ( 4.0 * PI ) / pow( max( 1.0 + g * g - cosPh * 2.0 * g, 1e-4 ), 1.5 ) * 0.75 + 0.25 / ( 4.0 * PI );
+
+	let sunE = frame.sunColor * 0.96;
+
+	var shafts = vec3f( 0.0 );
+${ shafts }
+	// diver's torch: single scattering of the flashlight cone along the view ray (the torch sits
+	// beside the eye, so the beam is a shaft slightly off the view axis), extinction on the light
+	// and the view legs, same phase function, up to the scene depth
+	var torch = vec3f( 0.0 );
+	if ( uwFlashOn() > 0.5 ) {
+		let tSteps = 8;
+		let tMax = min( dist, 25.0 );
+		let tds = tMax / f32( tSteps );
+		let tPx = pixel + f32( frame.frameIndex % 64u ) * 5.588238 + 17.3;
+		let tJit = _uwIgn( tPx );
+		let fpos = uwFlashPos(); let fdir = uwFlashDir(); let cone = uwFlashCone();
+		for ( var i = 0; i < tSteps; i++ ) {
+			let s = ( f32( i ) + tJit ) * tds;
+			let v = underwaterParams.camPos + dir * s - fpos;
+			let r2 = max( dot( v, v ), 1e-4 );
+			let r = sqrt( r2 );
+			let Lr = v / r;
+			let spot = localLightsSpotProfile( dot( Lr, fdir ), cone.x, cone.y );
+			// same lobe as the sun in-scatter (0.75 forward g = 0.85 + 0.25 isotropic), Schlick's form
+			let sk = 1.55 * g - 0.55 * g * g * g;
+			let sd = 1.0 - dot( dir, - Lr ) * sk;
+			let ph = ( 1.0 - sk * sk ) / ( 4.0 * PI ) * 0.75 / ( sd * sd ) + 0.25 / ( 4.0 * PI );
+			torch += exp( - sigT * ( r + s ) ) * ( spot * ph / ( r2 + 0.15 ) );
+		}
+		// x3: the suspended particles scatter more than the clear-water coefficient (the beam reads)
+		torch = torch * uwFlashCol() * sigS * tds * underwaterParams.torchBeam;
+	}
+
+	return vec4f( max( shafts, vec3f( 0.0 ) ) + torch, dist );
+}
+`;
+
+	}
+
+	_compositeCode() {
+
+		return /* wgsl */`
 fn _uwMed( pc: vec2i, dy: i32, mSize: vec2i ) -> f32 {
 	return textureLoad( underwaterMediumTex, vec2i( pc.x, clamp( pc.y + dy, 0, mSize.y - 1 ) ), 0 ).r;
 }
-
-fn _uwIgn( px: vec2f ) -> f32 { return fract( fract( dot( px, vec2f( 0.06711056, 0.00583715 ) ) ) * 52.9829189 ); }
 
 fn _uwLit( m: f32, sigT: vec3f, zc: f32, dirY: f32, dist: f32 ) -> vec3f {
 	let a = sigT * zc / m;
@@ -303,40 +395,30 @@ fn underwaterComposite( uv: vec2f, pixel: vec2f ) -> vec4f {
 		let inSun = sunE * ( sigS * phase + msAlb * sigT * ( 1.0 / PI ) ) * _uwLit( mu, sigT, zc, dir.y, dist );
 		let inAmb = ambE * ( sigS * ( 1.0 / ( 4.0 * PI ) ) + msAlb * sigT * ( 1.0 / PI ) ) * _uwLit( 0.8, sigT, zc, dir.y, dist );
 
-		// light shafts: march the first metres and modulate the sun in-scatter by caustics
-		var shafts = vec3f( 0.0 );
-${ shafts }
-
-		// diver's torch: single scattering of the flashlight cone along the view ray (the torch sits
-		// beside the eye, so the beam is a shaft slightly off the view axis), extinction on the light
-		// and the view legs, same phase function, up to the scene depth
-		var torch = vec3f( 0.0 );
-		if ( uwFlashOn() > 0.5 ) {
-			let tSteps = 8;
-			let tMax = min( dist, 25.0 );
-			let tds = tMax / f32( tSteps );
-			let tPx = pixel + f32( frame.frameIndex % 64u ) * 5.588238 + 17.3;
-			let tJit = _uwIgn( tPx );
-			let fpos = uwFlashPos(); let fdir = uwFlashDir(); let cone = uwFlashCone();
-			for ( var i = 0; i < tSteps; i++ ) {
-				let s = ( f32( i ) + tJit ) * tds;
-				let v = underwaterParams.camPos + dir * s - fpos;
-				let r2 = max( dot( v, v ), 1e-4 );
-				let r = sqrt( r2 );
-				let Lr = v / r;
-				let spot = localLightsSpotProfile( dot( Lr, fdir ), cone.x, cone.y );
-				// same lobe as the sun in-scatter (0.75 forward g = 0.85 + 0.25 isotropic), Schlick's form
-				let sk = 1.55 * g - 0.55 * g * g * g;
-				let sd = 1.0 - dot( dir, - Lr ) * sk;
-				let ph = ( 1.0 - sk * sk ) / ( 4.0 * PI ) * 0.75 / ( sd * sd ) + 0.25 / ( 4.0 * PI );
-				torch += exp( - sigT * ( r + s ) ) * ( spot * ph / ( r2 + 0.15 ) );
+		// caustic light shafts and the torch beam: the half resolution march (underwaterShafts), depth-aware
+		// upsampled (bilinear weights times the view distance similarity)
+		var extra = vec3f( 0.0 );
+		if ( underwaterParams.hasShafts > 0.5 ) {
+			let ls = vec2i( textureDimensions( underwaterShaftTex ) );
+			let pa = uv * vec2f( ls ) - 0.5;
+			let q0 = floor( pa );
+			let fr = pa - q0;
+			var acc = vec3f( 0.0 );
+			var wSum = 1e-6;
+			for ( var k = 0; k < 4; k++ ) {
+				let o = vec2i( k & 1, k >> 1u );
+				let sm = textureLoad( underwaterShaftTex, clamp( vec2i( q0 ) + o, vec2i( 0 ), ls - 1 ), 0 );
+				let wb = select( 1.0 - fr.x, fr.x, o.x == 1 ) * select( 1.0 - fr.y, fr.y, o.y == 1 );
+				let rel = abs( sm.w - dist ) / max( dist, 0.5 );
+				let wt = wb / pow2( rel * 10.0 + 1.0 ) + 1e-5;
+				acc += sm.rgb * wt;
+				wSum += wt;
 			}
-			// x3: the suspended particles scatter more than the clear-water coefficient (the beam reads)
-			torch = torch * uwFlashCol() * sigS * tds * underwaterParams.torchBeam;
+			extra = acc / wSum;
 		}
 
 		let T = exp( - sigT * dist );
-		result = base * T + inSun + inAmb + max( shafts, vec3f( 0.0 ) ) + torch;
+		result = base * T + inSun + inAmb + extra;
 	}
 
 	// meniscus contact line and bright rim

@@ -57,7 +57,7 @@ export class Profiler {
 		enc.resolveQuerySet( this.querySet, 0, n * 2, this.resolveBuffer, 0 );
 		enc.copyBufferToBuffer( this.resolveBuffer, 0, slot.buffer, 0, n * 16 );
 		const names = this._slots.map( ( s ) => s.name );
-		const kinds = this._slots.map( ( s ) => ( s.node.pipeline && s.node.pipeline.constructor && /Compute/.test( s.node.pipeline.constructor.name ) ) || s.node.dispatch ? 'compute' : 'render' );
+		const kinds = this._slots.map( ( s ) => s.node.dispatch || ( s.node.handle ? s.node.handle.kind === 'compute' : s.node.pipeline && /Compute/.test( s.node.pipeline.constructor.name ) ) ? 'compute' : 'render' );
 		GPU.onSubmit( null, () => {
 
 			slot.buffer.mapAsync( GPUMapMode.READ ).then( () => {

@@ -26,6 +26,9 @@ const _vp = new Matrix4();
 const _v = new Vector3();
 const _camPos = new Vector3();
 
+const _layouts = new WeakMap();
+let _listToken = 0; // one per drawItems call (see BindingSet.getBindGroup)
+
 const DRAW_STRIDE = 256; // minUniformBufferOffsetAlignment
 const DRAW_FLOATS = 40;
 
@@ -43,6 +46,10 @@ export class MeshRenderer {
 		this.stats = { draws: 0, triangles: 0, pipelines: 0 };
 		this.drawLayout = null;
 		this.drawBindGroup = null;
+		// true: a draw compiles its pipeline on the spot (one-off bakes, portraits, tests); the engine's
+		// scene renderer sets false: pipelines compile in the background and a draw is skipped until
+		// its pipeline is ready (no first-use stalls)
+		this.syncPipelines = true;
 
 	}
 
@@ -140,8 +147,10 @@ export class MeshRenderer {
 		const src = attr.isInterleavedBufferAttribute ? attr.data : attr;
 		if ( src.gpuBuffer ) return src.gpuBuffer.getGPU ? src.gpuBuffer.getGPU() : src.gpuBuffer; // storage-backed attribute
 		let b = g.buffers.get( src );
-		const conv = convertArray( attr );
 		const version = src.version ?? 0;
+		// unchanged since the last upload (same array, same version)
+		if ( b && b.version === version && b.array === src.array ) return b.buffer;
+		const conv = convertArray( attr );
 		if ( ! b || b.size < conv.byteLength ) {
 
 			if ( b ) b.buffer.destroy();
@@ -170,6 +179,7 @@ export class MeshRenderer {
 
 		}
 
+		b.array = src.array;
 		return b.buffer;
 
 	}
@@ -179,6 +189,7 @@ export class MeshRenderer {
 		const index = geometry.index;
 		if ( ! index ) return null;
 		const g = this._geometryGPU( geometry );
+		if ( g.indexRef && g.indexSrc === index.array && g.indexVersion === ( index.version ?? 0 ) ) return g.indexRef;
 		const arr = index.array instanceof Uint16Array || index.array instanceof Uint32Array ? index.array : new Uint32Array( index.array );
 		if ( ! g.index || g.index.size < arr.byteLength ) {
 
@@ -195,7 +206,41 @@ export class MeshRenderer {
 
 		}
 
-		return { buffer: g.index.buffer, format: arr instanceof Uint16Array ? 'uint16' : 'uint32' };
+		g.indexSrc = index.array;
+		g.indexRef = { buffer: g.index.buffer, format: arr instanceof Uint16Array ? 'uint16' : 'uint32' };
+		return g.indexRef;
+
+	}
+
+	// cached _layout(): per geometry and material, checked against the attribute objects it used
+	_cachedLayout( object, geometry, material ) {
+
+		let byMat = _layouts.get( geometry );
+		if ( ! byMat ) _layouts.set( geometry, byMat = new Map() );
+		const inst = object.isInstancedMesh ? ( object.instanceColor ? 2 : 1 ) : 0;
+		const mkey = inst ? material.id + ':' + inst : material.id;
+		let e = byMat.get( mkey );
+		if ( e && e.version === material.version && e.attrsVersion === geometry.attributesVersion && ( ! inst || e.instanceMatrix === object.instanceMatrix ) ) {
+
+			const refs = e.refs, names = e.names, attrs = geometry.attributes;
+			let ok = true;
+			for ( let i = 0; i < names.length; i ++ ) if ( attrs[ names[ i ] ] !== refs[ i ] ) {
+
+				ok = false;
+				break;
+
+			}
+
+			if ( ok ) return e.vl;
+
+		}
+
+		const vl = this._layout( object, geometry, material );
+		const names = vl.layout.filter( ( l ) => ! l.name.startsWith( 'instance' ) ).map( ( l ) => l.name );
+		e = { version: material.version, attrsVersion: geometry.attributesVersion, instanceMatrix: object.instanceMatrix, names, refs: names.map( ( n ) => geometry.attributes[ n ] ), vl };
+		vl.pipelines = new Map();
+		byMat.set( mkey, e );
+		return vl;
 
 	}
 
@@ -267,12 +312,28 @@ export class MeshRenderer {
 
 	// ------------------------------------------------------------------------------ pipelines
 
+	// the pipeline of ( material, vertex layout, pass ); the material key is computed once per frame
 	_pipeline( material, vl, pass ) {
 
-		const passKey = `${ pass.kind }.${ pass.late ? 1 : 0 }.${ pass.colorFormats.join( ',' ) }.${ pass.depthFormat }.${ pass.depthCompare }.${ pass.cullOverride || '' }.${ JSON.stringify( pass.defines || {} ) }`;
-		const key = `${ material.pipelineKey() }|${ vl.key }|${ passKey }|${ SceneLighting.version }`;
+		if ( material.__pkFrame !== GPU.frame ) {
+
+			material.__pk = material.pipelineKey() + '|' + SceneLighting.version;
+			material.__pkFrame = GPU.frame;
+
+		}
+
+		const passKey = pass.passKey;
+		let c = vl.pipelines && vl.pipelines.get( passKey );
+		if ( c && c.materialKey === material.__pk ) return c.p;
+		const key = `${ material.__pk }|${ vl.key }|${ passKey }`;
 		let p = this.pipelines.get( key );
-		if ( p ) return p;
+		if ( ! p ) p = this._createPipeline( material, vl, pass, key );
+		if ( vl.pipelines ) vl.pipelines.set( passKey, { materialKey: material.__pk, p } );
+		return p;
+
+	}
+
+	_createPipeline( material, vl, pass, key ) {
 
 		const src = buildMeshShader( material, vl.layout, pass );
 		const c = composeShader( { modules: src.modules, bindings: src.bindings, code: src.code, defines: src.defines, stage: 'render', label: material.name } );
@@ -313,8 +374,8 @@ export class MeshRenderer {
 			depthBias: pass.kind === 'depth' ? ( pass.depthBias || 0 ) : material.depthBias,
 			depthBiasSlopeScale: pass.kind === 'depth' ? ( pass.depthBiasSlopeScale || 0 ) : material.depthBiasSlopeScale,
 		};
-		const pipeline = GPU.device.createRenderPipeline( desc );
-		p = { pipeline, bindings: c.bindings, label: desc.label };
+		// compiled in the background: the draw is skipped until it is ready (see GPU.renderPipeline)
+		const p = { handle: GPU.renderPipeline( desc ), bindings: c.bindings, label: desc.label };
 		this.pipelines.set( key, p );
 		this.stats.pipelines = this.pipelines.size;
 		return p;
@@ -336,16 +397,18 @@ export class MeshRenderer {
 
 		}
 
+		// precompile: every mesh of the pass, hidden or not (builds all pipelines behind the loading screen)
+		const all = this.precompiling;
 		const visit = ( o ) => {
 
-			if ( ! o.visible ) return;
+			if ( ! o.visible && ! all ) return;
 			if ( o.isMesh && o.material && o.geometry && ( o.layers.mask & layerMask ) !== 0 && ( ! filter || filter( o ) ) && ( kind !== 'depth' || o.castShadow ) ) {
 
-				if ( ! cull || ! camera || o.frustumCulled === false || this._inFrustum( o ) ) {
+				if ( all || ! cull || ! camera || o.frustumCulled === false || this._inFrustum( o ) ) {
 
 					// ported systems use this for their own LOD / culling (called per pass, as three does)
 					if ( o.onBeforeRender ) o.onBeforeRender( null, null, camera, o.geometry, o.material, null );
-					if ( o.visible ) this._addItems( o, opaque, transparent );
+					if ( o.visible || all ) this._addItems( o, opaque, transparent );
 
 				}
 
@@ -391,7 +454,7 @@ export class MeshRenderer {
 		const z = _v.setFromMatrixPosition( o.matrixWorld ).distanceToSquared( _camPos );
 		const push = ( material, start, count ) => {
 
-			if ( ! material || ! material.visible ) return;
+			if ( ! material || ( ! material.visible && ! this.precompiling ) ) return;
 			const item = { object: o, geometry: geo, material, start, count, z, renderOrder: o.renderOrder || 0, pipeKey: material.id };
 			( material.transparent ? transparent : opaque ).push( item );
 
@@ -425,6 +488,7 @@ export class MeshRenderer {
 			kind: 'main', late: false, colorFormats: [], depthFormat: null, depthCompare: 'greater-equal',
 			frameBlock: FrameUniforms, layerMask: 0xffffffff, ...pass,
 		};
+		pass.passKey = `${ pass.kind }.${ pass.late ? 1 : 0 }.${ pass.colorFormats.join( ',' ) }.${ pass.depthFormat }.${ pass.depthCompare }.${ pass.cullOverride || '' }.${ pass.defines ? JSON.stringify( pass.defines ) : '' }`;
 		const lists = pass.items || this.collect( scene, pass );
 		const enc = GPU.getEncoder();
 		const colorAttachments = ( pass.colorViews || [] ).map( ( view, i ) => {
@@ -454,21 +518,50 @@ export class MeshRenderer {
 
 	drawItems( rp, items, pass ) {
 
-		let lastPipeline = null;
+		let lastPipeline = null, lastGroup = null;
+		const token = ++ _listToken;
 		for ( const it of items ) {
 
 			const { object: o, geometry: geo, material } = it;
 			if ( ! geo.attributes.position && ! geo.vertexCount && ! geo.indirect ) continue;
-			const vl = this._layout( o, geo, material );
-			const p = this._pipeline( material, vl, pass );
+			let vl, p;
+			if ( this.precompiling ) {
+
+				// a hidden mesh may not be drawable yet: its pipeline is optional
+				try {
+
+					vl = this._cachedLayout( o, geo, material );
+					p = this._pipeline( material, vl, pass );
+
+				} catch ( e ) {
+
+					continue;
+
+				}
+
+				continue; // only the pipelines are wanted
+
+			}
+
+			vl = this._cachedLayout( o, geo, material );
+			p = this._pipeline( material, vl, pass );
+			const pipeline = p.handle.pipeline || ( this.syncPipelines ? GPU.ready( p.handle ) : null );
+			if ( ! pipeline ) continue; // still compiling
 			if ( p !== lastPipeline ) {
 
-				rp.setPipeline( p.pipeline );
+				rp.setPipeline( pipeline );
 				lastPipeline = p;
 
 			}
 
-			rp.setBindGroup( 1, p.bindings.getBindGroup() );
+			const group = p.bindings.getBindGroup( token );
+			if ( group !== lastGroup ) {
+
+				rp.setBindGroup( 1, group );
+				lastGroup = group;
+
+			}
+
 			rp.setBindGroup( 2, this.drawBindGroup, [ this._slot( o ) * DRAW_STRIDE ] );
 			for ( let i = 0; i < vl.buffers.length; i ++ ) rp.setVertexBuffer( i, this._attributeBuffer( geo, vl.buffers[ i ].attr ) );
 			const instances = o.isInstancedMesh ? o.count : geo.instanceCount ?? 1;

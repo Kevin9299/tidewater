@@ -143,6 +143,11 @@ const SHADOW_SEARCH_TAPS: i32 = 8;
 const SHADOW_FILTER_TAPS: i32 = 12;
 
 fn sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32, pcfNoise: f32 ) -> f32 {
+	return _sunShadowCascade( P, N, c, noise, pcfNoise, true );
+}
+
+// pcss = false: the 5-tap PCF filter in every cascade (no blocker search)
+fn _sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32, pcfNoise: f32, pcss: bool ) -> f32 {
 	let info = shadowParams.cascades[ c ];
 	let Pb = P + N * info.z;
 	let sc = shadowParams.matrices[ c ] * vec4f( Pb, 1.0 );
@@ -150,7 +155,7 @@ fn sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32, pcfNoise: f32 ) -> 
 	if ( any( uvz.xy < vec2f( 0.0 ) ) || any( uvz.xy > vec2f( 1.0 ) ) || uvz.z > 1.0 ) { return 1.0; }
 	let z = uvz.z - shadowParams.bias;
 	let texel = 1.0 / shadowParams.mapSize;
-	if ( u32( c ) < shadowParams.pcssCascades ) {
+	if ( pcss && u32( c ) < shadowParams.pcssCascades ) {
 		// moved every frame (Jimenez 2014): a noise pattern fixed on screen would never average out
 		let phi = noise * TWO_PI;
 		let width = info.y * shadowParams.mapSize; // cascade width (m)
@@ -194,6 +199,15 @@ fn sunShadowCascade( P: vec3f, N: vec3f, c: i32, noise: f32, pcfNoise: f32 ) -> 
 // 2.5 m at the 10 m seam, 15 m at 60 m, and the last cascade fades out over its final 100 m); each
 // cascade's map is widened to cover its part of the overlap.
 fn sunShadow( P: vec3f, N: vec3f, pixel: vec2f ) -> f32 {
+	return _sunShadow( P, N, pixel, true );
+}
+
+// sunShadow with the plain 5-tap PCF filter everywhere (surfaces whose own detail hides penumbrae: water)
+fn sunShadowPCF( P: vec3f, N: vec3f, pixel: vec2f ) -> f32 {
+	return _sunShadow( P, N, pixel, false );
+}
+
+fn _sunShadow( P: vec3f, N: vec3f, pixel: vec2f, pcss: bool ) -> f32 {
 	if ( shadowParams.enabled < 0.5 ) { return 1.0; }
 	let dist = dot( P - frame.cameraPos, - vec3f( frame.view[ 0 ][ 2 ], frame.view[ 1 ][ 2 ], frame.view[ 2 ][ 2 ] ) );
 	let noise = interleavedGradientNoise( pixel + f32( frame.frameIndex % 64u ) * 5.588238 );
@@ -201,7 +215,7 @@ fn sunShadow( P: vec3f, N: vec3f, pixel: vec2f ) -> f32 {
 	if ( shadowParams.fade < 0.5 ) {
 		let c = shadowCascadeOf( dist );
 		if ( c < 0 ) { return 1.0; }
-		return sunShadowCascade( P, N, c, noise, pcfNoise );
+		return _sunShadowCascade( P, N, c, noise, pcfNoise, pcss );
 	}
 	var ret = 1.0;
 	let last = i32( shadowParams.count ) - 1;
@@ -215,7 +229,7 @@ fn sunShadow( P: vec3f, N: vec3f, pixel: vec2f ) -> f32 {
 			var ratio = clamp( min( dist - csmX, csmY - dist ) / margin, 0.0, 1.0 );
 			// no fade at the near edge of the first cascade
 			if ( i == 0 && dist <= center ) { ratio = 1.0; }
-			ret -= ( 1.0 - sunShadowCascade( P, N, i, noise, pcfNoise ) ) * ratio;
+			ret -= ( 1.0 - _sunShadowCascade( P, N, i, noise, pcfNoise, pcss ) ) * ratio;
 		}
 	}
 	return max( ret, 0.0 );
@@ -386,7 +400,11 @@ fn shadeSurface( s: Surface, P: vec3f, V: vec3f, pixel: vec2f ) -> vec3f {
 	// the water's refraction source (seen blurred through the water): one hard shadow tap
 	let shadow = sunShadowHard( hookShadowPosition( P, geomN, pixel ) );
 #else
-	let shadow = sunShadow( hookShadowPosition( P, geomN, pixel ), geomN, pixel ) * hookContactShadow( P, N );
+	// faces turned away from the sun with no transmission get nothing from it: skip the filter
+	var shadow = 0.0;
+	if ( dotNL > 0.0 || any( s.translucency > vec3f( 0.0 ) ) ) {
+		shadow = sunShadow( hookShadowPosition( P, geomN, pixel ), geomN, pixel ) * hookContactShadow( P, N );
+	}
 #endif
 	lightColor *= shadow;
 #endif

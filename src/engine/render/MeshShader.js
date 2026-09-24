@@ -197,6 +197,26 @@ ${ fetch }#if !HAS_POSITION
 	return o;
 }
 
+#if PASS_MAIN && !PASS_LATE && LIT && !IS_WATER && !ALPHA_TEST && !STUDIO_LIGHTING
+// Deep under the water, seen from above it: the water drawn over this pixel shows the refraction
+// pass (ocean/RefractionPass.js) at its refracted end point, never this pixel's own colour. The end
+// point is predicted as the water shader traces it (flat surface, the seabed at P's depth, a margin
+// for the wave slopes); where it would leave the screen the water takes the refraction pass' edge.
+const SUBMERGED_DEPTH: f32 = 2.5; // m below sea level: below the deepest wave troughs
+fn submergedHidden( P: vec3f ) -> bool {
+	let sea = frame.seaLevel;
+	if ( P.y > sea - SUBMERGED_DEPTH || frame.cameraPos.y < sea + 1.0 ) { return false; }
+	let V = normalize( P - frame.cameraPos );
+	let pos = frame.cameraPos + V * ( ( frame.cameraPos.y - sea ) / max( - V.y, 1e-4 ) );
+	let Tr = refract( V, vec3f( 0.0, 1.0, 0.0 ), 1.0 / 1.333 );
+	let Tv = normalize( vec3f( Tr.x, min( Tr.y, -0.08 ), Tr.z ) );
+	let L = ( sea - P.y ) / max( - Tv.y, 0.04 );
+	let c = frame.viewProj * vec4f( pos + Tv * min( L, 80.0 ), 1.0 );
+	let uv = c.xy / max( c.w, 1e-4 ) * vec2f( 0.5, -0.5 ) + 0.5;
+	return all( uv > vec2f( 0.1 ) ) && all( uv < vec2f( 0.9 ) ) && c.w > 0.0;
+}
+#endif
+
 fn fragInput( vs: VSOut, front: bool ) -> FragInput {
 	var in: FragInput;
 	in.vs = vs;
@@ -259,6 +279,18 @@ struct FragOut {
 #if REFRACTION_CLIP
 	// the water's refraction source only holds what is under the water (pass.defines)
 	if ( in.P.y > frame.seaLevel + REFRACTION_CLIP_MARGIN ) { discard; }
+#endif
+#if PASS_MAIN && !PASS_LATE && LIT && !IS_WATER && !ALPHA_TEST && !STUDIO_LIGHTING
+	// hidden under the water (see submergedHidden): an ambient colour, keeping depth and motion
+	if ( submergedHidden( in.P ) ) {
+		var so: FragOut;
+		so.color = vec4f( mat.color * in.color.rgb * hookEnvDiffuse( in.N ) * hookAmbientModulation( in.P, in.N ), 1.0 );
+		let cur0 = vs.curClip.xy / vs.curClip.w;
+		let prev0 = vs.prevClip.xy / vs.prevClip.w;
+		so.velocity = vec4f( ( cur0 - prev0 ) * vec2f( 0.5, -0.5 ), 0.0, 1.0 );
+		so.mask = vec4f( 0.0 );
+		return so;
+	}
 #endif
 	var s = surfaceOf( in );
 #if ALPHA_TEST

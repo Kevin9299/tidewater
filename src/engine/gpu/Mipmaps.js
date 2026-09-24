@@ -38,27 +38,50 @@ function pipelineFor( format ) {
 
 }
 
-export function generateMipmaps( texture, encoder = GPU.getEncoder() ) {
+// per texture: the views, bind groups and pass descriptors of each level/layer, rebuilt when the
+// GPUTexture changes (textures regenerated every frame, e.g. the caustics, reuse them)
+const _chains = new WeakMap();
 
+function chainFor( texture, g, pipeline ) {
+
+	let c = _chains.get( texture );
+	if ( c && c.gpu === g ) return c;
 	const levels = texture.mipLevelCount;
-	if ( levels < 2 ) return;
-	const g = texture.getGPU();
-	const pipeline = pipelineFor( texture.format );
 	const layers = texture.dimension === '3d' ? 1 : texture.depth;
+	const steps = [];
+	const layout = pipeline.getBindGroupLayout( 0 );
 	for ( let layer = 0; layer < layers; layer ++ ) {
 
 		for ( let m = 1; m < levels; m ++ ) {
 
 			const src = g.createView( { dimension: '2d', baseMipLevel: m - 1, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 } );
 			const dst = g.createView( { dimension: '2d', baseMipLevel: m, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 } );
-			const bg = GPU.device.createBindGroup( { layout: pipeline.getBindGroupLayout( 0 ), entries: [ { binding: 0, resource: src }, { binding: 1, resource: GPU.samplers.linearClamp } ] } );
-			const pass = encoder.beginRenderPass( { colorAttachments: [ { view: dst, loadOp: 'clear', storeOp: 'store', clearValue: [ 0, 0, 0, 0 ] } ] } );
-			pass.setPipeline( pipeline );
-			pass.setBindGroup( 0, bg );
-			pass.draw( 3 );
-			pass.end();
+			const bg = GPU.device.createBindGroup( { label: 'mipmap ' + texture.label, layout, entries: [ { binding: 0, resource: src }, { binding: 1, resource: GPU.samplers.linearClamp } ] } );
+			steps.push( { bg, desc: { label: 'mipmap', colorAttachments: [ { view: dst, loadOp: 'clear', storeOp: 'store', clearValue: [ 0, 0, 0, 0 ] } ] } } );
 
 		}
+
+	}
+
+	c = { gpu: g, pipeline, steps };
+	_chains.set( texture, c );
+	return c;
+
+}
+
+export function generateMipmaps( texture, encoder = GPU.getEncoder() ) {
+
+	if ( texture.mipLevelCount < 2 ) return;
+	const g = texture.getGPU();
+	const pipeline = pipelineFor( texture.format );
+	const { steps } = chainFor( texture, g, pipeline );
+	for ( let i = 0; i < steps.length; i ++ ) {
+
+		const pass = encoder.beginRenderPass( steps[ i ].desc );
+		pass.setPipeline( pipeline );
+		pass.setBindGroup( 0, steps[ i ].bg );
+		pass.draw( 3 );
+		pass.end();
 
 	}
 

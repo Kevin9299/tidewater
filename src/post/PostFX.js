@@ -3,7 +3,8 @@ import { UniformBlock } from '../engine/gpu/Shader.js';
 import { ComputeKernel } from '../engine/gpu/Compute.js';
 import { RenderTarget, StorageBuffer, Texture } from '../engine/gpu/Texture.js';
 import { FullscreenPass } from '../engine/render/FullscreenPass.js';
-import { FrameUniforms, setFrameCamera } from '../engine/render/Frame.js';
+import { FrameUniforms, G, setFrameCamera } from '../engine/render/Frame.js';
+import { LENS_REACH } from './Underwater.js';
 import { commonModule } from '../engine/render/wgsl/common.js';
 import { MathUtils, Matrix4, Vector2, Vector3 } from '../engine/math/index.js';
 import { GTAO } from './GTAO.js';
@@ -11,6 +12,10 @@ import { TemporalUpscale } from './TemporalUpscale.js';
 import { LensDroplets } from './LensDroplets.js';
 import { LensFlare } from './LensFlare.js';
 import { MotionBlur } from './MotionBlur.js';
+
+// full-screen passes overwrite every pixel: clear instead of load (no tile load of the old contents on
+// tile-based GPUs)
+const CLR = [ 0, 0, 0, 0 ];
 
 // Post chain (internal resolution = drawing buffer * scale up to the TAAU resolve):
 //   scene (HDR + velocity) -> GTAO (half internal res, temporally rotated)
@@ -139,11 +144,13 @@ fn fragment( in: FSIn ) -> vec4f {
 			return new FullscreenPass( {
 				label: 'AO blur ' + ( dx ? 'x' : 'y' ),
 				colorFormats: [ 'r16float' ],
-				bindings: { aoSrc: { texture: src }, postOpaqueDepth: { texture: () => this.opaqueDepth } },
+				// the half resolution depth copy (one texel per AO texel): the full resolution depth taps
+				// were mostly cache misses
+				bindings: { aoSrc: { texture: src }, postAODepth: { texture: () => this.aoDepth.texture } },
 				code: /* wgsl */`
 fn postDepthOpaque( uv: vec2f ) -> f32 {
-	let s = vec2i( textureDimensions( postOpaqueDepth ) );
-	return textureLoad( postOpaqueDepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 );
+	let s = vec2i( textureDimensions( postAODepth ) );
+	return textureLoad( postAODepth, clamp( vec2i( floor( uv * vec2f( s ) ) ), vec2i( 0 ), s - 1 ), 0 ).r;
 }
 fn fragment( in: FSIn ) -> vec4f {
 	let size = vec2f( textureDimensions( aoSrc ) );
@@ -222,6 +229,7 @@ ${ taps }
 				postOpaqueDepth: { texture: () => this.opaqueDepth },
 				postFinalDepth: { texture: () => this.finalDepth },
 				postAO: { texture: () => this.aoBlurY.texture },
+				postAODepth: { texture: () => this.aoDepth.texture },
 			},
 			code: /* wgsl */`
 fn postDepthLoad( uv: vec2f, which: i32 ) -> f32 {
@@ -242,21 +250,22 @@ fn postColorAO( uv: vec2f ) -> vec3f {
 	let covered = dF > dO + 1e-7;
 	// depth-aware upsample of the half-res AO: the 4 nearest AO texels, weighted by how close
 	// their depth is to this pixel's (no dark halos bleeding across depth edges)
-	let aoSize = vec2f( textureDimensions( postAO ) );
-	let pa = uv * aoSize - 0.5;
+	// (the AO texels' depths: the half resolution copy the AO was computed from)
+	let aoSizeI = vec2i( textureDimensions( postAO ) );
+	let pa = uv * vec2f( aoSizeI ) - 0.5;
 	let i0 = floor( pa );
 	let fr = pa - i0;
 	var aSum = 0.0; var wSum = 1e-4;
 	for ( var k = 0; k < 4; k++ ) {
-		let o = vec2f( f32( k & 1 ), f32( k >> 1u ) );
-		let uvT = ( i0 + o + 0.5 ) / aoSize;
-		let dT = postDepthLoad( uvT, 0 );
-		let wBil = select( 1.0 - fr.x, fr.x, o.x > 0.5 ) * select( 1.0 - fr.y, fr.y, o.y > 0.5 );
+		let o = vec2i( k & 1, k >> 1u );
+		let pT = clamp( vec2i( i0 ) + o, vec2i( 0 ), aoSizeI - 1 );
+		let dT = textureLoad( postAODepth, pT, 0 ).r;
+		let wBil = select( 1.0 - fr.x, fr.x, o.x == 1 ) * select( 1.0 - fr.y, fr.y, o.y == 1 );
 		// reversed-Z depth ~ near / z, so the relative depth difference ~ |dT - dO| / dO
 		let rel = abs( dT - dO ) / max( dO, 1e-7 );
 		let wDepth = 1.0 / pow2( rel * 40.0 + 1.0 );
 		let wt = wBil * wDepth + 1e-5;
-		aSum += textureSampleLevel( postAO, smpLinearClamp, uvT, 0.0 ).r * wt;
+		aSum += textureLoad( postAO, pT, 0 ).r * wt;
 		wSum += wt;
 	}
 	let a = aSum / wSum;
@@ -282,6 +291,7 @@ fn fragment( in: FSIn ) -> vec4f {
 		// build the lazily built passes now (the profiler tracks them after beginFrame)
 		if ( ! this.aoPass._pass ) this.aoPass._build();
 		if ( haze && ! haze._passes ) haze._build();
+		if ( uw.renderShafts ) void uw.shaftPass;
 
 		// ---- bloom
 		this._buildBloom();
@@ -538,6 +548,7 @@ fn fragment( in: FSIn ) -> vec4f {
 		this.sceneRenderer.setSize( iw, ih );
 		this.beauty.setSize( iw, ih );
 		this.medium.setSize( iw, ih );
+		if ( this.underwater.setSize ) this.underwater.setSize( iw, ih );
 		// rtt resolution scales of the original are relative to the drawing buffer (output) size
 		this.aoPass.resolutionScale = 0.5 * this.scale;
 		this.aoPass.setSize( ow, oh );
@@ -622,11 +633,14 @@ fn fragment( in: FSIn ) -> vec4f {
 		if ( ! this._built ) this.beginFrame();
 		const T = this._timers || null;
 		this.motionBlur.compute( this._outW, this._outH );
-		this._aoDepthPass.render( { colorViews: [ this.aoDepth.texture ] } );
+		this._aoDepthPass.render( { colorViews: [ this.aoDepth.texture ], clear: CLR } );
 		this.aoPass.render();
-		this._aoBlurXPass.render( { colorViews: [ this.aoBlurX.texture ] } );
-		this._aoBlurYPass.render( { colorViews: [ this.aoBlurY.texture ] } );
-		this._mediumPass.render( { colorViews: [ this.medium.texture ] } );
+		this._aoBlurXPass.render( { colorViews: [ this.aoBlurX.texture ], clear: CLR } );
+		this._aoBlurYPass.render( { colorViews: [ this.aoBlurY.texture ], clear: CLR } );
+		this._mediumPass.render( { colorViews: [ this.medium.texture ], clear: CLR } );
+		// caustic shafts / torch beam march (half res): only while the lens can be under water (the CPU
+		// water height lags the GPU's by a frame: 1 m of margin)
+		if ( this.underwater.renderShafts ) this.underwater.renderShafts( this.camera.position.y < G.cameraWaterHeight.value + LENS_REACH + 1.0 );
 		if ( this.haze ) {
 
 			this.haze.update();
@@ -634,11 +648,11 @@ fn fragment( in: FSIn ) -> vec4f {
 
 		}
 
-		this._beautyPass.render( { colorViews: [ this.beauty.texture ] } );
+		this._beautyPass.render( { colorViews: [ this.beauty.texture ], clear: CLR } );
 		this.taau.render();
-		for ( const [ pass, rt ] of this._bloomPasses ) pass.render( { colorViews: [ rt.texture ] } );
+		for ( const [ pass, rt ] of this._bloomPasses ) pass.render( { colorViews: [ rt.texture ], clear: CLR } );
 		const out = this.outputTexture ? this.outputTexture.view( { dimension: '2d', mipLevelCount: 1 } ) : GPU.context.getCurrentTexture().createView();
-		this._finalPass.render( { colorViews: [ out ] } );
+		this._finalPass.render( { colorViews: [ out ], clear: CLR } );
 		// meter this frame's image; the result is used from the next frame on
 		this.meterKernel.dispatch( [ 1, 1, 1 ] );
 		void T;
@@ -664,6 +678,7 @@ fn fragment( in: FSIn ) -> vec4f {
 
 		}
 
+		if ( this.underwater._shaftPass ) list.push( [ 'underwater shafts', this.underwater._shaftPass ] );
 		list.push( [ 'beauty', this._beautyPass ], [ 'TAAU', this.taau._resolve[ 0 ] ], [ 'TAAU ', this.taau._resolve[ 1 ] ] );
 		this._bloomPasses.forEach( ( [ p ], i ) => list.push( [ 'bloom ' + i, p ] ) );
 		list.push( [ 'final', this._finalPass ], [ 'auto exposure', this.meterKernel ] );

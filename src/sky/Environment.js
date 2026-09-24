@@ -1,7 +1,7 @@
 import { ShaderModule, UniformBlock } from '../engine/gpu/Shader.js';
 import { ComputeKernel } from '../engine/gpu/Compute.js';
 import { Texture, StorageBuffer } from '../engine/gpu/Texture.js';
-import { generateMipmaps } from '../engine/gpu/Mipmaps.js';
+import { ComputeMips } from '../ocean/ComputeMips.js';
 import { SceneLighting } from '../engine/render/wgsl/lighting.js';
 import { commonModule } from '../engine/render/wgsl/common.js';
 import { Vector3 } from '../engine/math/index.js';
@@ -255,7 +255,9 @@ fn hookEnvDiffuse( N: vec3f ) -> vec3f {
 		const steps = [];
 		const size = this.size;
 		for ( let i = 0; i < 6; i ++ ) steps.push( () => this.faceKernels[ i ].dispatch( [ size / 8, size / 8, 1 ] ) );
-		steps.push( () => generateMipmaps( this.source ) );
+		// box mips in compute: 2 dispatches instead of 42 render passes in one frame
+		const mips = this._mips || ( this._mips = new ComputeMips( this.source, 'envSource' ) );
+		steps.push( () => mips.dispatch() );
 		for ( let m = 0; m < LEVELS; m ++ ) {
 
 			const n = Math.max( 1, Math.ceil( ( size >> m ) / 8 ) );

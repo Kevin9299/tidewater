@@ -6,6 +6,10 @@ import { shadowModule } from '../engine/render/wgsl/lighting.js';
 import { commonModule } from '../engine/render/wgsl/common.js';
 import { MathUtils, Vector2 } from '../engine/math/index.js';
 
+// full-screen passes overwrite every pixel: clear instead of load (no tile load of the old contents on
+// tile-based GPUs)
+const CLR = [ 0, 0, 0, 0 ];
+
 // Air above the water, in post (no per-material cost):
 //  - aerial perspective + marine haze: two exponential height layers (a thin, dense marine layer at
 //    the sea surface and a thin aerosol layer kilometres high), analytic optical depth along the view
@@ -162,12 +166,12 @@ export class AirHaze {
 
 		if ( ! this._passes ) this._build();
 		const p = this._passes;
-		p.march.render( { colorViews: [ this.low.texture ] } );
+		p.march.render( { colorViews: [ this.low.texture ], clear: CLR } );
 		// the god ray passes only matter while the light is in view (the composite skips them otherwise)
 		if ( this.ssFade.value > 0.001 ) {
 
-			p.mask.render( { colorViews: [ this.ssTargets[ 0 ].texture ] } );
-			for ( let i = 0; i < 3; i ++ ) p.blur[ i ].render( { colorViews: [ this.ssTargets[ i + 1 ].texture ] } );
+			p.mask.render( { colorViews: [ this.ssTargets[ 0 ].texture ], clear: CLR } );
+			for ( let i = 0; i < 3; i ++ ) p.blur[ i ].render( { colorViews: [ this.ssTargets[ i + 1 ].texture ], clear: CLR } );
 
 		}
 

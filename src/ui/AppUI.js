@@ -50,8 +50,7 @@ export class AppUI {
 			saturation: app.post.params.saturation.value,
 			contrast: app.post.params.contrast.value,
 			grain: app.post.params.grain.value,
-			dynamicRes: app.settings.dynamicResolution,
-			renderScale: app.post.scale,
+			renderScale: app.settings.renderScale,
 			shadows: true,
 		};
 
@@ -231,14 +230,7 @@ export class AppUI {
 		live.addInfo( { label: 'CPU per frame', get: () => `${ ( app.cpuMs || 0 ).toFixed( 2 ) } ms` } );
 		live.addInfo( { label: 'Render size', get: () => `${ app.sceneRenderer.width } × ${ app.sceneRenderer.height }` } );
 		const quality = perf.addFolder( 'Quality', { icon: 'layers' } );
-		let scaleCtl = null;
-		quality.addToggle( { label: 'Dynamic resolution', object: s, key: 'dynamicRes', tooltip: 'Lowers the internal resolution to hold 60 fps; the temporal upscaler reconstructs full resolution.', onChange: ( v ) => {
-
-			app.settings.dynamicResolution = v;
-			scaleCtl.setEnabled( ! v );
-
-		} } );
-		scaleCtl = quality.addSlider( { label: 'Render scale', object: s, key: 'renderScale', min: 0.5, max: 1, step: 0.05, format: ( v ) => `${ Math.round( v * 100 ) }%`, onChange: ( v ) => app.post.setScale( v ) } ).setEnabled( ! s.dynamicRes );
+		quality.addSlider( { label: 'Render scale', object: s, key: 'renderScale', min: 0.5, max: 1, step: 0.05, format: ( v ) => `${ Math.round( v * 100 ) }%`, tooltip: 'Internal resolution; the temporal upscaler reconstructs the full output resolution.', onChange: ( v ) => app.setRenderScale( v ) } );
 		quality.addToggle( { label: 'Shadows', object: s, key: 'shadows', onChange: ( v ) => { app.sun.castShadow = v; } } );
 		s.ssr = true;
 		quality.addToggle( { label: 'Water reflections', object: s, key: 'ssr', tooltip: 'Screen-space reflections of the pier, boats and hills on the water.', onChange: ( v ) => { app.waterMaterial.params.ssr.value = v ? 1 : 0; } } );

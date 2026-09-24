@@ -359,7 +359,11 @@ fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
 		// that drew combs of vertical streaks into the foam on flat water and on the swash)
 		let steep = smoothstep( 0.82, 0.5, a.baseNormal.y );
 		let ww = sat( a.fresh * 1.4 );
-		let flat = surfFoamFlowLace( xz, flow, 0.0 );
+		// far pixels (a lace cell under a few pixels) only use the pattern's average (see "far" below):
+		// skip the lace and whitewater lump lookups there
+		let farOnly = a.footprint >= 0.12;
+		var flat = vec4f( 0.5 );
+		if ( ! farOnly ) { flat = surfFoamFlowLace( xz, flow, 0.0 ); }
 		var lace = flat;
 		// lumps of tumbling whitewater (~0.6 m), only where there is whitewater
 		var lumps = 0.5;
@@ -369,14 +373,14 @@ fn surfFoamShading( a: SurfFoamArgs ) -> SurfFoamInfo {
 		// row of identical lumps and spikes along the break)
 		let al = dot( xz, tangent );
 		let qv = vec2f( al + sin( al * 0.19 + 0.8 ) * 2.1 + sin( al * 0.47 + 2.9 ) * 0.6 + sin( P.y * 1.7 + al * 0.11 ) * 0.5, P.y * 1.1 );
-		if ( steep > 0.01 ) {
+		if ( steep > 0.01 && ! farOnly ) {
 			let vert = surfFoamFlowLace( qv, vec2f( 0.0, -0.9 ), 1.0 );
 			lace = mix( flat, vert, steep );
 		}
 		// Churning whitewater is a pile of foam lumps at several scales (tumbling masses ~1.3 m,
 		// clumps ~0.5 m, bubble clusters ~0.2 m): a relief (m) for the normals, sunlit caps and
 		// self-shadowed crevices (a short march toward the sun through the lump field)
-		if ( ww > 0.02 ) {
+		if ( ww > 0.02 && ! farOnly ) {
 			let L = frame.sunDir;
 			let pq = mix( xz, qv, steep );
 			let pflow = mix( flow, vec2f( 0.0, -0.9 ), steep );

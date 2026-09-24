@@ -231,7 +231,12 @@ fn hookDirectModulation( P: vec3f, N: vec3f ) -> vec3f {
 			let mu = max( - Ls.y, 0.15 );
 			let atten = exp( - ( frame.waterAbsorption + frame.waterScattering ) * d / mu );
 #if UNDERWATER_LIGHTING == 2
+#if REFRACTION_CLIP
+			// the refraction source is half resolution and seen blurred: no dispersion
+			let caust = ${ caustics ? 'causticsSampleBakedMono( P, d, lw.slope, lw.foam, gdx, gdy, lw.detailK )' : 'vec3f( 1.0 )' };
+#else
 			let caust = ${ caustics ? 'causticsSampleBaked( P, d, lw.slope, lw.foam, gdx, gdy, lw.detailK )' : 'vec3f( 1.0 )' };
+#endif
 #else
 			let caust = vec3f( 1.0 );
 #endif

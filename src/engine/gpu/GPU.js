@@ -133,6 +133,70 @@ export const GPU = {
 
 	},
 
+	// ---- pipelines
+	// Pipelines compile asynchronously: the browser compiles them in parallel on worker threads, and a
+	// pipeline created synchronously would stall the GPU process (and with it the page) at first use.
+	// Handles are { pipeline, label }; `pipeline` is null until the compile finishes. Users that must
+	// run this frame (compute, post) call ready( handle ), which falls back to a synchronous create.
+	_pending: new Set(),
+	syncCompiles: [], // labels of pipelines needed before their async compile finished (diagnostics)
+
+	renderPipeline( desc ) {
+
+		return this._async( desc, 'render' );
+
+	},
+
+	computePipeline( desc ) {
+
+		return this._async( desc, 'compute' );
+
+	},
+
+	_async( desc, kind ) {
+
+		const h = { pipeline: null, label: desc.label, desc, kind, failed: false };
+		// started after the current task: a kernel dispatched right after it was made (a one-off bake)
+		// compiles once, synchronously, instead of twice
+		const p = Promise.resolve().then( () => {
+
+			if ( h.pipeline ) return;
+			const create = kind === 'render' ? this.device.createRenderPipelineAsync : this.device.createComputePipelineAsync;
+			return create.call( this.device, desc ).then( ( pipeline ) => {
+
+				if ( ! h.pipeline ) h.pipeline = pipeline;
+				h.desc = null;
+
+			}, ( e ) => {
+
+				h.failed = true;
+				console.error( `WebGPU: pipeline "${ desc.label }" failed: ${ e.message.split( '\n' ).slice( 0, 6 ).join( '\n' ) }` );
+
+			} );
+
+		} ).finally( () => this._pending.delete( p ) );
+		this._pending.add( p );
+		return h;
+
+	},
+
+	// the pipeline now (synchronous compile when the async one has not finished)
+	ready( h ) {
+
+		if ( h.pipeline || h.failed ) return h.pipeline;
+		this.syncCompiles.push( h.label );
+		h.pipeline = h.kind === 'render' ? this.device.createRenderPipeline( h.desc ) : this.device.createComputePipeline( h.desc );
+		return h.pipeline;
+
+	},
+
+	// resolves when every pipeline requested so far has compiled
+	async pipelinesReady() {
+
+		while ( this._pending.size ) await Promise.all( [ ...this._pending ] );
+
+	},
+
 	// A compute or render pass on the frame encoder.
 	computePass( label, fn, timestampWrites ) {
 

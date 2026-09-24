@@ -46,7 +46,7 @@ const EDGE = 15; // density ramp of the raw shape value (softness of the cloud s
 const ISLAND_NEAR = 2500, ISLAND_FAR = 9000; // m: big clusters only a little away from the island
 // broad, rounded billows: the coarsest erosion lumps are ~190 m (the fine octaves are kept light,
 // they only read as grain on the lit surfaces)
-const DETAIL_RES = 64, DETAIL_SIZE = 760;
+const DETAIL_RES = 64, DETAIL_SIZE = 1000;
 // detail erosion (after sky-pro-webgpu / Nubis): three worley fbm octaves per fetch (r: 4 - 16, g: 8 - 32,
 // b: 16 - 64 cells per period). An octave fades to the mean once its features shrink under ~2 px (a mip
 // filter without mips); `crease` is 0 on a lump, 1 between lumps
@@ -58,6 +58,7 @@ const SYN_RES = 256, SYN_SIZE = 409600; // m
 const FIB_RES = 1024, FIB_TILE = 40000; // m
 const SHADOW_RES = 256;
 const AP_DIST = 30000; // m, aerial perspective scale toward the horizon
+const MS_GAIN = 2.6; // energy of the diffusion (multiply scattered) sunlight term
 
 // 4x4 ordered-dither sequence: one pixel of every block per frame
 const ORDER = [ 0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12 ];
@@ -65,7 +66,7 @@ const REBUILD_SLOTS = 4; // slots traced per frame right after a camera cut (sha
 // history resolution relative to the (dynamic) render resolution: like sky-pro-webgpu's High quality (0.5),
 // the clouds are reconstructed at reduced width and height and one pixel of every 4x4 block is marched per
 // frame; the saved rays buy finer steps and fuller lighting
-const HISTORY_SCALE = 0.6;
+const HISTORY_SCALE = 0.75;
 
 const f = ( x ) => {
 
@@ -161,6 +162,7 @@ const CL_TILE: f32 = ${ f( TILE ) };
 const CL_D_MEAN: f32 = ${ f( D_MEAN ) };
 const CL_EDGE: f32 = ${ f( EDGE ) };
 const CL_AP_DIST: f32 = ${ f( AP_DIST ) };
+const CL_MS: f32 = ${ f( MS_GAIN ) };
 // weather map lookups are rotated so cloud streets line up with the (initial) wind
 const CL_C: f32 = ${ f( c ) };
 const CL_S: f32 = ${ f( s ) };
@@ -175,12 +177,14 @@ fn clBigTop( cb: f32, lump: f32 ) -> f32 { return pow( cb, 0.6 ) * ( lump * 0.35
 fn clCreaseOf( x: f32 ) -> f32 { return smoothstep( 0.42, 0.64, x ); }
 // erosion grows with the height in the cloud: flat, dense bases, billowy tops; the undersides use the
 // inverted field (wisps instead of lumps)
-fn clErosionAmount( b: vec4f ) -> f32 { return mix( 0.32, 1.15, smoothstep( 0.03, 0.5, b.y ) ); }
-fn clErosionField( F: f32, b: vec4f ) -> f32 { return mix( 1.0 - F, F, smoothstep( 0.02, 0.2, b.y ) ); }
+fn clErosionAmount( b: vec4f ) -> f32 { return mix( 0.25, 1.0, smoothstep( 0.05, 0.6, b.y ) ); }
+fn clErosionField( F: f32, b: vec4f ) -> f32 { return mix( 1.0 - F, F, smoothstep( 0.0, 0.08, b.y ) ); }
+// erosion only eats the outer shell of the base shape (Nubis remap): the dense core keeps no holes
+fn clEroded( b: vec4f, crease: f32 ) -> f32 { return sat( ( b.x - crease * clErosionAmount( b ) * sat( 1.0 - b.x * 0.9 ) - 0.012 ) * CL_EDGE ); }
 // density with every detail octave at its mean (reflections, shadows, deep light samples): the same
 // cloud as the detailed one, seen through a coarse filter
 fn clMeanCrease( b: vec4f ) -> f32 { return clCreaseOf( clErosionField( CL_D_MEAN, b ) ); }
-fn clMeanDensity( b: vec4f ) -> f32 { return sat( ( b.x - clMeanCrease( b ) * clErosionAmount( b ) - 0.012 ) * CL_EDGE ); }
+fn clMeanDensity( b: vec4f ) -> f32 { return clEroded( b, clMeanCrease( b ) ); }
 // layer a (in-scattered radiance, transmittance) in front of layer b
 fn clOver( a: vec4f, b: vec4f ) -> vec4f { return vec4f( a.rgb + b.rgb * a.a, a.a * b.a ); }
 // Henyey-Greenstein phase
@@ -244,8 +248,8 @@ export class Clouds {
 		this.params = new UniformBlock( 'CloudsParams', {
 			coverage: [ 'f32', 0.45 ],
 			densityScale: [ 'f32', 0.07 ], // extinction (1/m) of the densest cloud
-			bottom: [ 'f32', 800 ],
-			top: [ 'f32', 2000 ],
+			bottom: [ 'f32', 750 ],
+			top: [ 'f32', 2400 ],
 			// m/s; clouds drift along it (by default with the surface wind, as trade winds do)
 			wind: [ 'vec2f', wind0 ],
 			offset: [ 'vec2f', new Vector2() ], // accumulated wind offset (m)
@@ -475,7 +479,7 @@ fn cloudsBase( p: vec3f, w: vec2f ) -> vec4f {
 	// columns whose top stays very low hold no cloud: the saddles between overlapping weak cells
 	// along a street made long, thin, flat ribbons, and the thin rims of each dome made it a flat
 	// pancake. Without them the cells stay separate and their sides rise steeply.
-	let Ce = sat( ( w.y - hL ) * 2.2 ) * smoothstep( 0.0, 0.45, w.x ) * smoothstep( hb, hb + 0.012, hL ) * smoothstep( 0.07, 0.15, w.y );
+	let Ce = sat( ( w.y - hL ) * 3.5 ) * smoothstep( 0.0, 0.45, w.x ) * smoothstep( hb, hb + 0.012, hL ) * smoothstep( 0.1, 0.2, w.y );
 	// the shape noise carves the boundary. x is the raw shape value (density before the ramp,
 	// negative outside): the detail erodes it in the same units, and the coarse search uses it
 	// to slow down near a cloud
@@ -495,7 +499,7 @@ fn cloudsErode( p: vec3f, b: vec4f, foot: f32 ) -> vec2f {
 	let alt = p.y + ( p.x * p.x + p.z * p.z ) / ${ f( 2 * EARTH_R ) };
 	let np = p.xz + cloudsParams.nOrigin;
 	// low frequency swirl of the detail lookup
-	let sw = ( b.zw - 0.5 ) * ( 0.5 * ( 1.0 - b.y * 0.6 ) );
+	let sw = ( b.zw - 0.5 ) * ( 0.3 * ( 1.0 - b.y * 0.6 ) );
 	let dp = vec3f( np.x, alt, np.y ) / ${ f( DETAIL_SIZE ) } + vec3f( sw.x, 0.0, sw.y ) + vec3f( frame.time * 0.0015, 0.0, 0.0 );
 	var f1 = CL_D_MEAN;
 	var f2 = CL_D_MEAN;
@@ -508,7 +512,7 @@ fn cloudsErode( p: vec3f, b: vec4f, foot: f32 ) -> vec2f {
 	}
 	let crease = clCreaseOf( clErosionField( f1 * 0.78 + f2 * 0.22, b ) );
 	// the creases are eaten: round lumps (cauliflower) on the upper parts, wisps underneath
-	return vec2f( sat( ( b.x - crease * clErosionAmount( b ) - 0.012 ) * CL_EDGE ), 1.0 - crease );
+	return vec2f( clEroded( b, crease ), 1.0 - crease );
 }
 
 // the cloud field leans downwind with height (wind shear)
@@ -646,7 +650,7 @@ fn cloudsBandStart( b: f32 ) -> f32 { return select( exp2( b ) * CL_B0, 0.0, b =
 fn cloudsPosMod( x: f32, c: f32 ) -> f32 { return x - floor( x / c ) * c; }
 
 struct CloudsMarch { L: vec3f, T: f32, depth: f32 };
-${ marchWGSL( 'View', { maxSteps: 200, maxDist: 50000, ds0: 24, dsMax: 120, coarse: 4, lightSteps: [ 12, 50, 140, 350, 900, 1800 ], lightDetail: 2, detail: true, ambient: 1.2, pxAngle: 'cloudsParams.camTan.y * 2.0 / cloudsParams.displayH' } ) }
+${ marchWGSL( 'View', { maxSteps: 200, maxDist: 50000, ds0: 24, dsMax: 120, coarse: 4, lightSteps: [ 12, 50, 140, 350, 900, 1800 ], lightDetail: 3, detail: true, ambient: 1.2, pxAngle: 'cloudsParams.camTan.y * 2.0 / cloudsParams.displayH' } ) }
 ${ marchWGSL( 'Pano', { maxSteps: 56, maxDist: 50000, ds0: 60, dsMax: 320, coarse: 2, lightSteps: [ 120, 500 ], lightDetail: 0, detail: false, ambient: 1.2, pxAngle: f( 2 * PI / PANO_W ) } ) }
 `,
 		} );
@@ -924,6 +928,9 @@ ${ MAIN } {
 
 		// ---- view: one pixel of every 4x4 block per frame. Per trace: its own block + kernels (see header)
 		this._traceSets = [];
+		// created up front (at most REBUILD_SLOTS traces a frame) so their pipelines compile in the
+		// background during loading, not serially in the first frame
+		for ( let i = 0; i < REBUILD_SLOTS; i ++ ) this._traceSet( i );
 
 		// ---- panorama (reflections / environment): interleaved progressive refresh (PANO_FULL: every texel)
 		const panoCode = ( full ) => /* wgsl */`
@@ -1473,7 +1480,7 @@ fn cloudsMarch${ name }( rd: vec3f, jitter: f32 ) -> CloudsMarch {
 	// toward the sun, where the forward peak makes the thin edges glow (silver lining)
 	let powderK = sat( cosT * -0.5 + 0.6 );
 	// warm light bounced by the sunlit sea onto the undersides (at low sun the sunlight is warm)
-	let bounce = frame.sunColor * ( max( sunDir.y, 0.0 ) * 0.05 + 0.012 );
+	let bounce = frame.sunColor * ( max( sunDir.y, 0.0 ) * 0.01 + 0.003 );
 
 	var t = cloudsSnapCoarse${ name }( t0, true, jitter, k0 );
 	var bd = cloudsBand( t );
@@ -1545,28 +1552,34 @@ ${ light }
 						let sig = dens * cloudsParams.densityScale;
 						// light optical depth (the local segment included); multiple scattering lowers the
 						// effective extinction of the light
-						let tau = ( od + dens * 12.0 ) * cloudsParams.densityScale * 0.55;
-						// three orders from one exponential: extinction and energy halve each order
-						let quarter = exp( tau * -0.25 );
-						let halfT = quarter * quarter;
-						let sun = dot( vec3f( halfT * halfT, halfT * 0.5, quarter * 0.25 ), phase ) + ph3 * exp( tau * -0.06 );
+						let tau = ( od + dens * 6.0 ) * cloudsParams.densityScale;
+						// single scattering (dual-lobe HG) through the true optical depth, one multiple
+						// scattering octave (Wrenninge 2013: extinction and eccentricity lowered), and the
+						// diffusion regime of a thick, non-absorbing cloud: diffuse light is transmitted
+						// ~ 1 / (1 + 0.75 (1 - g) tau), so a sunlit surface reflects like a bright diffuser and
+						// the shaded side stays grey, not black (the octave sum alone was ~4x too dark)
+						// multiply scattered light builds up with height in the cloud (Nubis 'vertical
+						// probability'): the lower parts are darker
+						let msV = mix( 0.35, 1.0, smoothstep( 0.0, 0.45, b.y ) );
+						let sun = phase.x * exp( -tau ) + ( phase.y * 0.6 * exp( tau * -0.3 )
+							+ phase.z * ( CL_MS / pow2( 1.0 + 0.1 * tau ) ) + ph3 * exp( tau * -0.03 ) ) * msV;
 						// skylight occlusion: two broad upward probes (125 m, 600 m) of the filtered density
 						let pu1 = cloudsSheared( pr + vec3f( 0.0, 125.0, 0.0 ) ); let pu2 = cloudsSheared( pr + vec3f( 0.0, 600.0, 0.0 ) );
 						let skyTau = ( clMeanDensity( cloudsBase( pu1, w ) ) * 250.0 + clMeanDensity( cloudsBase( pu2, cloudsWeather( pu2.xz ) ) ) * 700.0
 							+ dens * 25.0 ) * cloudsParams.densityScale;
-						let skyVis = 0.2 + 0.8 / ( skyTau * 0.35 + 1.0 );
+						let skyVis = 0.3 + 0.7 / ( skyTau * 0.35 + 1.0 );
 						// darker bases (their direct light is scattered away by the cloud above)
-						let baseShadow = mix( 1.0, mix( 0.28, 1.0, smoothstep( -0.1, 0.45, b.y ) ), 0.72 );
+						let baseShadow = mix( 0.55, 1.0, smoothstep( -0.1, 0.45, b.y ) );
 						let depthP = pow( dens, mix( 0.5, 1.6, b.y ) ) * 0.95 + 0.05;
 						let vertP = pow( smoothstep( 0.02, 0.2, b.y ), 0.8 ) * 0.85 + 0.15;
 						let powder = mix( 1.0, depthP * vertP, powderK );
 						// ambient: the sky lights the tops; the bases only see the dark sea and the
 						// horizon (darker, bluer), and crevices of the detail noise are occluded
 						let up = sat( b.y * 1.4 );
-						let ambH = mix( vec3f( 0.38, 0.43, 0.52 ), vec3f( 1.0 ), sqrt( up ) ) * skyVis * ( er.y * 0.75 + 0.42 );
+						let ambH = mix( vec3f( 0.45, 0.5, 0.58 ), vec3f( 1.0 ), sqrt( up ) ) * skyVis * ( er.y * 0.75 + 0.42 );
 						// after sunset the tops stay lit longest
 						let alt = pr.y + dot( pr.xz, pr.xz ) / ${ f( 2 * EARTH_R ) };
-						let S = sunE * ( sun * powder * baseShadow * ( er.y * 0.3 + 0.7 ) * cloudsEarthShadow( light, alt, pr.xz ) ) + amb * ambH
+						let S = sunE * ( sun * powder * baseShadow * ( er.y * 0.5 + 0.5 ) * cloudsEarthShadow( light, alt, pr.xz ) ) + amb * ambH
 							+ bounce * ( 1.0 - up );
 						let Tstep = exp( - sig * ds );
 						let tap = exp( t * ${ f( - 1 / AP_DIST ) } );

@@ -193,24 +193,43 @@ export class UniformBlock {
 
 	}
 
-	// serialize all field values; returns true when the bytes changed
+	// serialize all field values into the CPU mirror
 	_pack() {
 
 		if ( this.onBeforePack ) this.onBeforePack( this );
-		const { f32, u32, i32 } = this;
-		for ( const name of this.order ) {
+		const { f32, u32, i32, fields } = this;
+		const plan = this._plan || this._makePlan();
+		for ( let k = 0; k < plan.length; k ++ ) {
 
-			const { offset, type, stride } = this.layout[ name ];
-			const v = this.fields[ name ].value;
-			const o = offset / 4;
-			if ( type.count ) {
+			const { name, o, type, stride, count, n } = plan[ k ];
+			const v = fields[ name ].value;
+			if ( typeof v === 'number' ) {
+
+				// scalar fast path (writeValue's number case)
+				( type.base.int ? i32 : type.base.uint ? u32 : f32 )[ o ] = v;
+				continue;
+
+			}
+
+			if ( count ) {
 
 				if ( ! v ) continue;
-				const n = Math.min( type.count, v.length / ( typeof v[ 0 ] === 'number' ? type.base.n : 1 ) );
-				for ( let i = 0; i < n; i ++ ) {
+				if ( typeof v[ 0 ] === 'number' ) {
 
-					const e = typeof v[ 0 ] === 'number' ? v.slice( i * type.base.n, ( i + 1 ) * type.base.n ) : v[ i ];
-					writeValue( f32, u32, i32, o + i * stride / 4, type, e );
+					// flat numbers: n per element, elements `stride` words apart
+					const view = type.base.int ? i32 : type.base.uint ? u32 : f32;
+					const m = Math.min( count, v.length / n );
+					for ( let i = 0; i < m; i ++ ) {
+
+						const d = o + i * stride, sIdx = i * n, e = Math.min( n, v.length - sIdx );
+						for ( let j = 0; j < e; j ++ ) view[ d + j ] = v[ sIdx + j ];
+
+					}
+
+				} else {
+
+					const m = Math.min( count, v.length );
+					for ( let i = 0; i < m; i ++ ) writeValue( f32, u32, i32, o + i * stride, type, v[ i ] );
 
 				}
 
@@ -221,6 +240,18 @@ export class UniformBlock {
 			}
 
 		}
+
+	}
+
+	_makePlan() {
+
+		this._plan = this.order.map( ( name ) => {
+
+			const { offset, type, stride } = this.layout[ name ];
+			return { name, o: offset / 4, type, stride: stride / 4, count: type.count, n: type.base.n };
+
+		} );
+		return this._plan;
 
 	}
 
@@ -239,8 +270,12 @@ export class UniformBlock {
 	}
 
 	// upload when anything changed since the last upload (cheap compare of the packed words)
-	upload() {
+	// token: calls with the same token as the previous upload skip the repack (the caller knows
+	// nothing ran in between, see BindingSet.getBindGroup)
+	upload( token ) {
 
+		if ( token !== undefined && token === this._token && this.buffer ) return this.buffer;
+		this._token = token;
 		const buf = this.getBuffer();
 		this._pack();
 		const cur = this.u32, last = this._last;

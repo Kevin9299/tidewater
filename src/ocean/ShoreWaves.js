@@ -521,6 +521,7 @@ fn shorePhaseAt( xz: vec2f ) -> ShorePhase {
 // breaking faces and crests glow turquoise. Marches the analytic cross-section (up to 3 steps).
 fn shoreCrestPath( p: vec2f, d: f32, T: vec3f ) -> f32 {
 	var out = 1e4;
+	if ( d >= 6.0 || shoreP.enabled <= 0.0 ) { return out; } // (before the phase lookup)
 	let ph = shorePhaseAt( p );
 	let tXi = dot( T.xz, ph.dir ); // shoreward component of the ray
 	let env = smoothstep( 26.0, 13.0, d ) * sat( ph.exposure * 1.4 ) * shoreP.enabled;

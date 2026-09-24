@@ -262,7 +262,7 @@ function describe( name, spec, stage ) {
 
 function resourceOf( spec ) {
 
-	if ( spec.uniform ) return { buffer: spec.uniform.upload() };
+	if ( spec.uniform ) return { buffer: spec.uniform.getBuffer() }; // uploaded by getBindGroup
 	if ( spec.uniformBuffer ) return { buffer: resolve( spec.uniformBuffer ) };
 	if ( spec.storage ) {
 
@@ -285,22 +285,22 @@ function resourceOf( spec ) {
 
 }
 
-function versionOf( spec ) {
+// what a binding resolves to, as ( object, version ) pairs compared without building strings
+const K_UNIFORM = 0, K_UBUF = 1, K_STORAGE = 2, K_TEXTURE = 3, K_OTHER = 4;
 
-	if ( spec.uniform ) return 'u' + spec.uniform.id;
-	if ( spec.uniformBuffer ) return 'ub' + ( resolve( spec.uniformBuffer ).label || '' );
-	if ( spec.storage ) {
+function kindOf( spec ) {
 
-		const b = resolve( spec.storage );
-		return b.getGPU ? `s${ b.id }.${ b.version }` : 's' + b.label;
-
-	}
-
-	const t = resolve( spec.storageTexture || spec.texture );
-	if ( t ) return `t${ t.id }.${ t.version }`;
-	return 'x';
+	if ( spec.uniform ) return K_UNIFORM;
+	if ( spec.uniformBuffer ) return K_UBUF;
+	if ( spec.storage ) return K_STORAGE;
+	if ( spec.storageTexture || spec.texture ) return K_TEXTURE;
+	return K_OTHER;
 
 }
+
+// bind groups kept per set: ping-pong resources (history textures, ...) alternate between a few
+// combinations; each keeps its group instead of re-creating one per frame
+const GROUP_CACHE = 4;
 
 const _layoutCache = new Map();
 
@@ -351,7 +351,15 @@ export class BindingSet {
 
 		this.layout = getBindGroupLayout( this.described.map( ( d, i ) => ( { binding: i, ...d.layout } ) ), label );
 		this.group = null;
-		this.signature = '';
+		const n = this.names.length;
+		this._specs = this.names.map( ( k ) => specs[ k ] );
+		this._kinds = this._specs.map( kindOf );
+		this._blocks = this._specs.filter( ( sp ) => sp.uniform ).map( ( sp ) => sp.uniform );
+		this._objs = new Array( n ).fill( null ); // scratch: resolved resources of this call
+		this._vers = new Array( n ).fill( 0 );
+		this._entry = null; // { objs, vers, group } of this.group
+		this._cache = [];
+		this._token = null;
 
 	}
 
@@ -369,20 +377,81 @@ export class BindingSet {
 
 	}
 
-	// current bind group (uploads uniform blocks, rebuilds after resource changes)
-	getBindGroup() {
+	// current bind group (uploads uniform blocks, rebuilds after resource changes).
+	// token: callers drawing many items in a row with nothing else running in between (one list of
+	// a render pass) pass the same token; repeated calls with it return the group as is.
+	getBindGroup( token ) {
 
-		let sig = '';
-		for ( const n of this.names ) sig += versionOf( this.specs[ n ] ) + '|';
-		for ( const n of this.names ) if ( this.specs[ n ].uniform ) this.specs[ n ].uniform.upload();
-		if ( this.group && sig === this.signature ) return this.group;
-		this.signature = sig;
-		this.group = GPU.device.createBindGroup( {
-			label: this.label,
-			layout: this.layout,
-			entries: this.names.map( ( n, i ) => ( { binding: i, resource: resourceOf( this.specs[ n ] ) } ) ),
-		} );
+		if ( token !== undefined && token === this._token && this.group ) return this.group;
+		this._token = token;
+		const specs = this._specs, kinds = this._kinds, objs = this._objs, vers = this._vers;
+		const n = specs.length;
+		for ( let i = 0; i < n; i ++ ) {
+
+			const spec = specs[ i ];
+			let o = null, v = 0;
+			switch ( kinds[ i ] ) {
+
+				case K_UNIFORM: o = spec.uniform; break;
+				case K_UBUF: o = resolve( spec.uniformBuffer ); break;
+				case K_STORAGE:
+					o = resolve( spec.storage );
+					if ( o.getGPU ) {
+
+						o.getGPU();
+						v = o.version;
+
+					}
+
+					break;
+				case K_TEXTURE:
+					o = resolve( spec.storageTexture || spec.texture );
+					if ( o && o.getGPU ) {
+
+						o.getGPU();
+						v = o.version;
+
+					}
+
+					break;
+				default: o = spec.sampler;
+
+			}
+
+			objs[ i ] = o;
+			vers[ i ] = v;
+
+		}
+
+		const blocks = this._blocks;
+		for ( let i = 0; i < blocks.length; i ++ ) blocks[ i ].upload( token );
+		if ( this._entry && this._matches( this._entry ) ) return this.group;
+		const cache = this._cache;
+		for ( let c = 0; c < cache.length; c ++ ) {
+
+			const e = cache[ c ];
+			if ( e === this._entry || ! this._matches( e ) ) continue;
+			this._entry = e;
+			this.group = e.group;
+			return this.group;
+
+		}
+
+		const entries = new Array( n );
+		for ( let i = 0; i < n; i ++ ) entries[ i ] = { binding: i, resource: resourceOf( specs[ i ] ) };
+		this.group = GPU.device.createBindGroup( { label: this.label, layout: this.layout, entries } );
+		this._entry = { objs: objs.slice(), vers: vers.slice(), group: this.group };
+		cache.unshift( this._entry );
+		if ( cache.length > GROUP_CACHE ) cache.pop();
 		return this.group;
+
+	}
+
+	_matches( e ) {
+
+		const objs = this._objs, vers = this._vers, eo = e.objs, ev = e.vers;
+		for ( let i = 0; i < objs.length; i ++ ) if ( objs[ i ] !== eo[ i ] || vers[ i ] !== ev[ i ] ) return false;
+		return true;
 
 	}
 

@@ -203,6 +203,26 @@ export function createStallMaterial( assets ) {
 		nrm = normalize( TBN * tn );
 		alb = a.rgb * tint;
 		ao = r.r; rough = r.g; metal = r.b;
+		// the lantern's glass (prop layer 7: wooden_lantern_01_1): sooty panes that glow warm from dusk,
+		// as the village lanterns do (the stall's local light switches on over the same range, App)
+		if ( abs( L - 107.0 ) < 0.5 ) {
+			let lum = dot( a.rgb, vec3f( 0.3, 0.55, 0.15 ) );
+			let pane = smoothstep( 0.32, 0.16, lum ); // the dark panes, not the frame rims
+			let nightOn = smoothstep( 0.15, 0.75, frame.night );
+			let flicker = sin( frame.time * 9.0 + P.x * 40.0 ) * sin( frame.time * 5.3 + P.z * 13.0 ) * 0.12 + 0.9;
+			// lit from inside: the flame shows through the soot, brighter in the middle of each pane
+			// (the soot and smudges on the glass hold part of it back: a warm, uneven glow, not a light box)
+			let soot = mix( 1.0, 0.35, smoothstep( 0.05, 0.22, lum ) );
+			// the flame sits ~19 cm up in the middle: a hot core behind the glass, dim toward the frame
+			let q = ( uv2 - vec2f( 0.0, 0.19 ) ) / vec2f( 0.05, 0.075 );
+			let core = exp( - dot( q, q ) );
+			let glow = vec3f( 1.0, 0.5, 0.18 ) * 0.35 + vec3f( 1.0, 0.72, 0.4 ) * 3.0 * core;
+			s.emissive = glow * flicker * nightOn * pane * soot;
+			// clean glass over the soot: glossy, a little lighter than the scan by day
+			alb = mix( alb, alb * 1.6 + 0.02, pane );
+			rough = mix( rough, 0.12, pane );
+			metal = 0.0;
+		}
 		// sun-bleached and salty on the upward faces of the stall timber
 		if ( L < 1.5 ) {
 			let up = smoothstep( 0.3, 0.95, N0.y );
@@ -585,6 +605,7 @@ export class KitBuilder {
 		const A = this.assets, P = A.info.props[ name ];
 		if ( ! P ) throw new Error( 'StallKit: no prop ' + name );
 		const V = A.verts, F = A.info.vertexFloats;
+		const fix = propLayers( A, name, P );
 		_n.getNormalMatrix( matrix );
 		const base = this.pos.length / 3;
 		for ( let i = 0; i < P.vCount; i ++ ) {
@@ -592,7 +613,7 @@ export class KitBuilder {
 			const k = ( P.vOff + i ) * F;
 			_v.set( V[ k ], V[ k + 1 ], V[ k + 2 ] ).applyMatrix4( matrix );
 			_w.set( V[ k + 3 ], V[ k + 4 ], V[ k + 5 ] ).applyMatrix3( _n ).normalize();
-			this._vert( _v, _w, [ V[ k + 6 ], V[ k + 7 ] ], [ 1, 1, 1 ], LAYER.PROP + V[ k + 8 ], [ 0, 0 ] );
+			this._vert( _v, _w, [ V[ k + 6 ], V[ k + 7 ] ], [ 1, 1, 1 ], LAYER.PROP + ( fix ? fix.layer[ i ] : V[ k + 8 ] ), fix ? [ fix.uv2[ i * 2 ], fix.uv2[ i * 2 + 1 ] ] : [ 0, 0 ] );
 
 		}
 
@@ -622,6 +643,78 @@ export class KitBuilder {
 		return g;
 
 	}
+
+}
+
+// Per-vertex texture layers of a prop, where props.bin lost a material. The decimated lantern came
+// out as one material (the frame): its four glass panes are found again as the thin flat pieces
+// between the rails (~25 cm tall, ~1 cm thick) and given the glass layer (wooden_lantern_01_1);
+// their uv2 is the position on the pane in metres (across, up) for the flame's glow.
+const _propLayers = new Map();
+function propLayers( A, name, P ) {
+
+	if ( name !== 'wooden_lantern_01' ) return null;
+	if ( _propLayers.has( name ) ) return _propLayers.get( name );
+	const glassLayer = A.info.layers.indexOf( 'wooden_lantern_01_1' );
+	if ( glassLayer < 0 ) return null;
+	const V = A.verts, F = A.info.vertexFloats, n = P.vCount;
+	// connected pieces: shared indices and coincident positions
+	const parent = new Int32Array( n ).map( ( _, i ) => i );
+	const find = ( a ) => {
+
+		while ( parent[ a ] !== a ) a = parent[ a ] = parent[ parent[ a ] ];
+		return a;
+
+	};
+
+	const union = ( a, b ) => { parent[ find( a ) ] = find( b ); };
+	const seen = new Map();
+	for ( let i = 0; i < n; i ++ ) {
+
+		const k = ( P.vOff + i ) * F;
+		const key = `${ Math.round( V[ k ] * 1e4 ) },${ Math.round( V[ k + 1 ] * 1e4 ) },${ Math.round( V[ k + 2 ] * 1e4 ) }`;
+		if ( seen.has( key ) ) union( i, seen.get( key ) );
+		else seen.set( key, i );
+
+	}
+
+	for ( let t = 0; t < P.iCount; t += 3 ) {
+
+		const a = A.index[ P.iOff + t ];
+		union( a, A.index[ P.iOff + t + 1 ] );
+		union( a, A.index[ P.iOff + t + 2 ] );
+
+	}
+
+	const box = new Map();
+	for ( let i = 0; i < n; i ++ ) {
+
+		const r = find( i ), k = ( P.vOff + i ) * F;
+		let b = box.get( r );
+		if ( ! b ) box.set( r, b = [ 1e9, 1e9, 1e9, - 1e9, - 1e9, - 1e9 ] );
+		for ( let j = 0; j < 3; j ++ ) {
+
+			b[ j ] = Math.min( b[ j ], V[ k + j ] );
+			b[ j + 3 ] = Math.max( b[ j + 3 ], V[ k + j ] );
+
+		}
+
+	}
+
+	const out = { layer: new Float32Array( n ), uv2: new Float32Array( n * 2 ) };
+	for ( let i = 0; i < n; i ++ ) {
+
+		const b = box.get( find( i ) ), k = ( P.vOff + i ) * F;
+		const thinX = b[ 3 ] - b[ 0 ] < b[ 5 ] - b[ 2 ];
+		const pane = b[ 4 ] - b[ 1 ] > 0.2 && b[ 1 ] > 0.045 && b[ 4 ] < 0.3 && Math.min( b[ 3 ] - b[ 0 ], b[ 5 ] - b[ 2 ] ) < 0.015;
+		out.layer[ i ] = pane ? glassLayer : V[ k + 8 ];
+		out.uv2[ i * 2 ] = thinX ? V[ k + 2 ] : V[ k ];
+		out.uv2[ i * 2 + 1 ] = V[ k + 1 ];
+
+	}
+
+	_propLayers.set( name, out );
+	return out;
 
 }
 

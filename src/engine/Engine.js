@@ -27,6 +27,7 @@ export class Engine {
 		this.domElement = canvas;
 		await GPU.init( { canvas } );
 		this.meshRenderer = new MeshRenderer();
+		this.meshRenderer.syncPipelines = false; // compile in the background (App.precompile waits for them)
 		this.camera = new PerspectiveCamera( 62, window.innerWidth / window.innerHeight, 0.06, 60000 );
 		this.scene = new Scene();
 		window.addEventListener( 'resize', () => this.resize() );

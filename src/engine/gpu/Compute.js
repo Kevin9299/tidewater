@@ -31,12 +31,18 @@ export class ComputeKernel {
 		this.bindings = c.bindings;
 		this.group0 = c.group0;
 		const module = createShaderModule( c.code, label );
-		this.pipeline = GPU.device.createComputePipeline( {
+		this.handle = GPU.computePipeline( {
 			label,
 			layout: GPU.device.createPipelineLayout( { bindGroupLayouts: [ c.group0.layout, c.bindings.layout ] } ),
 			compute: { module, entryPoint },
 		} );
 		this.timestampWrites = null; // set by the profiler
+
+	}
+
+	get pipeline() {
+
+		return GPU.ready( this.handle );
 
 	}
 
@@ -47,7 +53,7 @@ export class ComputeKernel {
 		if ( ! indirect && ( x === 0 || y === 0 || z === 0 ) ) return;
 		const run = ( p ) => {
 
-			p.setPipeline( this.pipeline );
+			p.setPipeline( GPU.ready( this.handle ) );
 			p.setBindGroup( 0, this.group0.getBindGroup() );
 			p.setBindGroup( 1, this.bindings.getBindGroup() );
 			if ( indirect ) p.dispatchWorkgroupsIndirect( indirect.buffer.getGPU ? indirect.buffer.getGPU() : indirect.buffer, indirect.offset || 0 );

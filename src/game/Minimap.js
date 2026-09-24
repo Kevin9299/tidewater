@@ -150,13 +150,45 @@ export class Minimap {
 		this._bake = { row: 0, ctx: this.canvas.getContext( '2d' ), img: null, h: null, done: false };
 		this._bake.img = this._bake.ctx.createImageData( N, N );
 		this._bake.h = new Float32Array( N * N );
+		// the view's size, kept by a ResizeObserver (reading clientWidth per frame forces a style +
+		// layout pass right after last frame's transform writes)
+		this._viewSize = - 1;
+		if ( typeof ResizeObserver !== 'undefined' ) {
+
+			this._ro = new ResizeObserver( () => {
+
+				this._viewSize = this.view.clientWidth;
+
+			} );
+			this._ro.observe( this.view );
+
+		}
+
+	}
+
+	// style writes only when the value changes
+	_setStyle( el, prop, value ) {
+
+		const k = '__gm_' + prop;
+		if ( el[ k ] === value ) return;
+		el[ k ] = value;
+		el.style[ prop ] = value;
+
+	}
+
+	_toggle( el, cls, on ) {
+
+		const k = '__gm_c_' + cls;
+		if ( el[ k ] === on ) return;
+		el[ k ] = on;
+		el.classList.toggle( cls, on );
 
 	}
 
 	highlight( ids = [] ) {
 
 		this._hot = new Set( ids );
-		for ( const m of this.markers ) m.el.classList.toggle( 'is-hot', this._hot.has( m.id ) );
+		for ( const m of this.markers ) this._toggle( m.el, 'is-hot', this._hot.has( m.id ) );
 
 	}
 
@@ -279,7 +311,8 @@ export class Minimap {
 
 		this._bakeStep();
 		const app = this.game.app, cam = app.camera, p = app.player;
-		const size = this.view.clientWidth;
+		if ( this._viewSize < 0 || ! this._ro ) this._viewSize = this.view.clientWidth;
+		const size = this._viewSize;
 		if ( ! size ) return;
 		const R = size / 2;
 
@@ -308,7 +341,7 @@ export class Minimap {
 		// map: player at the centre, forward up
 		const rot = - Math.PI / 2 - Math.atan2( fz, fx );
 		const s = kpm / PPM;
-		this.canvas.style.transform = `translate(${ R }px, ${ R }px) rotate(${ rot }rad) scale(${ s }) translate(${ - ( x - X0 ) * PPM }px, ${ - ( z - Z0 ) * PPM }px)`;
+		this._setStyle( this.canvas, 'transform', `translate(${ R }px, ${ R }px) rotate(${ rot }rad) scale(${ s }) translate(${ - ( x - X0 ) * PPM }px, ${ - ( z - Z0 ) * PPM }px)` );
 
 		const place = ( el, dx, dz, edgeInset, arrow ) => {
 
@@ -321,8 +354,8 @@ export class Minimap {
 
 			}
 
-			el.style.transform = `translate(${ R + sx }px, ${ R + sy }px)`;
-			if ( arrow ) arrow.style.transform = `rotate(${ Math.atan2( sx, - sy ) }rad)`;
+			this._setStyle( el, 'transform', `translate(${ R + sx }px, ${ R + sy }px)` );
+			if ( arrow && edge ) this._setStyle( arrow, 'transform', `rotate(${ Math.atan2( sx, - sy ) }rad)` );
 			return edge;
 
 		};
@@ -331,10 +364,10 @@ export class Minimap {
 
 			const q = m.pos();
 			const hide = ! q || ( m.hideWhen && m.hideWhen() );
-			m.el.style.display = hide ? 'none' : '';
+			this._setStyle( m.el, 'display', hide ? 'none' : '' );
 			if ( hide ) continue;
 			const edge = place( m.el, q.x - x, q.z - z, 12, m.arrow );
-			m.el.classList.toggle( 'is-edge', edge );
+			this._toggle( m.el, 'is-edge', edge );
 
 		}
 
@@ -354,7 +387,7 @@ export class Minimap {
 		for ( let i = 0; i < this.fish.length; i ++ ) {
 
 			const q = finder ? this._fishPts[ i ] : null;
-			this.fish[ i ].classList.toggle( 'is-on', !! q );
+			this._toggle( this.fish[ i ], 'is-on', !! q );
 			if ( q ) place( this.fish[ i ], q.x - x, q.z - z, 14 );
 
 		}

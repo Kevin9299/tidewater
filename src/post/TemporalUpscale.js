@@ -5,6 +5,10 @@ import { FullscreenPass } from '../engine/render/FullscreenPass.js';
 import { FrameUniforms } from '../engine/render/Frame.js';
 import { Matrix4, Vector2 } from '../engine/math/index.js';
 
+// full-screen passes overwrite every pixel: clear instead of load (no tile load of the old contents on
+// tile-based GPUs)
+const CLR = [ 0, 0, 0, 0 ];
+
 // Temporal anti-aliasing / upscaling, a port of three's TAAUNode (same history, depth dilation,
 // variance clipping and anti-flicker weighting, three's TAAUtils inlined) with two changes that keep
 // the image sharp:
@@ -55,18 +59,16 @@ export class TemporalUpscale {
 			edgeDepthDiff: [ 'f32', 0.001 ],
 			maxVelocityLength: [ 'f32', 128 ],
 			hasWaterMask: [ 'f32', waterMaskTexture ? 1 : 0 ],
-			// weight of last frame's lock. three's TAAUNode (r186) resolves into a single-attachment target and
-			// copies only the colour into the history, so its lock history stays at the seed value (0) and
-			// the lock is this frame's thin-feature term alone. 0 reproduces that look; 1 gives the
-			// accumulating lock the node's code describes.
-			lockFeedback: [ 'f32', 0 ],
 		}, { label: 'taau' } );
 		const U = this.uniforms.fields;
 		this.frameWeight = U.frameWeight;
 		this._jitterOffset = U.jitterOffset;
 		this._jitterIndex = 0;
 
-		const hist = () => ( { colors: [ { format: 'rgba16float', name: 'color' }, { format: 'r16float', name: 'lock' } ], label: 'taauHistory' } );
+		// three's TAAUNode (r186) resolves into a single-attachment target and copies only the colour into
+		// the history, so its lock history stays at the seed value (0) and the lock is this frame's
+		// thin-feature term alone: no lock history target (it was written and read with a weight of 0)
+		const hist = () => ( { colors: [ { format: 'rgba16float', name: 'color' } ], label: 'taauHistory' } );
 		this.history = [ new RenderTarget( 1, 1, hist() ), new RenderTarget( 1, 1, hist() ) ];
 		this._cur = 0;
 		this._prevDepth = new Texture( { label: 'taauPrevDepth', width: 1, height: 1, format: 'depth32float', usage: [ 'sample', 'copyDst' ] } );
@@ -124,12 +126,9 @@ export class TemporalUpscale {
 			taauVelocity: { texture: () => this.velocityTexture },
 			taauMask: { texture: () => this.waterMaskTexture || this.velocityTexture },
 			taauHistory: { texture: () => this.history[ src ].textures[ 0 ] },
-			taauLock: { texture: () => this.history[ src ].textures[ 1 ] },
 		} );
 
 		const code = /* wgsl */`
-struct TAAUOut { @location( 0 ) color: vec4f, @location( 1 ) lock: vec4f };
-
 fn taauClipAABB( currentColor: vec4f, historyColor: vec4f, minColor: vec4f, maxColor: vec4f ) -> vec4f {
 	let pClip = ( maxColor.rgb + minColor.rgb ) * 0.5;
 	let eClip = ( maxColor.rgb - minColor.rgb ) * 0.5 + 1e-7;
@@ -195,7 +194,7 @@ fn taauPreviousDepth( uv: vec2f ) -> f32 {
 	return ( ( near + viewZ ) * far ) / ( ( far - near ) * viewZ );
 }
 
-@fragment fn fs( in: FSIn ) -> TAAUOut {
+fn fragment( in: FSIn ) -> vec4f {
 	let uvNode = in.uv;
 	let inputSizeF = vec2f( textureDimensions( taauBeauty ) );
 
@@ -275,21 +274,17 @@ fn taauPreviousDepth( uv: vec2f ) -> f32 {
 	let isDepthChanged = abs( closestDepth - previousDepth ) > taau.depthThreshold;
 	let canLock = isValidUV && ! isDepthChanged;
 	let gatedThinFeature = select( 0.0, thinFeature, canLock );
-	let decay = select( 0.5, 0.0, isDisocclusion );
-	let lock = sat( max( gatedThinFeature, textureSampleLevel( taauLock, smpLinearClamp, historyUV, 0.0 ).r * taau.lockFeedback * decay ) );
+	let lock = sat( gatedThinFeature );
 	let lockedHistoryColor = mix( clippedHistoryColor, historyColor, lock );
 
 	// fast camera motion trusts the current frame more; capped on water, whose fine detail shimmers under the jitter
 	let motionW = select( motionFactor, min( motionFactor, 0.15 ), isWater );
 	let currentWeight = select( 1.0, sat( taau.frameWeight + motionW ), hasValidHistory );
-	var out: TAAUOut;
-	out.color = taauFlickerReduction( currentColor, lockedHistoryColor, currentWeight );
-	out.lock = vec4f( lock, 0.0, 0.0, 1.0 );
-	return out;
+	return taauFlickerReduction( currentColor, lockedHistoryColor, currentWeight );
 }
 `;
 
-		const formats = [ 'rgba16float', 'r16float' ];
+		const formats = [ 'rgba16float' ];
 		// resolve[ i ] reads history i and writes history 1 - i
 		this._resolve = [ 0, 1 ].map( ( src ) => new FullscreenPass( { label: 'TAAU', bindings: bindings( src ), colorFormats: formats, code } ) );
 		// Seed the history with a bilinear upscale of the current beauty buffer. Without this the first
@@ -297,13 +292,7 @@ fn taauPreviousDepth( uv: vec2f ) -> f32 {
 		this._seed = new FullscreenPass( {
 			label: 'TAAU seed', colorFormats: formats, bindings: { taauBeauty: { texture: beautyTex } },
 			code: /* wgsl */`
-struct TAAUOut { @location( 0 ) color: vec4f, @location( 1 ) lock: vec4f };
-@fragment fn fs( in: FSIn ) -> TAAUOut {
-	var out: TAAUOut;
-	out.color = textureSampleLevel( taauBeauty, smpLinearClamp, in.uv, 0.0 );
-	out.lock = vec4f( 0.0 );
-	return out;
-}
+fn fragment( in: FSIn ) -> vec4f { return textureSampleLevel( taauBeauty, smpLinearClamp, in.uv, 0.0 ); }
 `,
 		} );
 
@@ -330,12 +319,12 @@ struct TAAUOut { @location( 0 ) color: vec4f, @location( 1 ) lock: vec4f };
 		if ( this._needsRestart ) {
 
 			this._needsRestart = false;
-			this._seed.render( { colorViews: this.history[ this._cur ].textures } );
+			this._seed.render( { colorViews: this.history[ this._cur ].textures, clear: CLR } );
 
 		}
 
 		const dst = 1 - this._cur;
-		this._resolve[ this._cur ].render( { colorViews: this.history[ dst ].textures } );
+		this._resolve[ this._cur ].render( { colorViews: this.history[ dst ].textures, clear: CLR } );
 		this._cur = dst;
 
 		// Copy the current scene depth into the previous-depth texture (same size as the source)

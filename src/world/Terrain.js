@@ -196,7 +196,13 @@ const TERRAIN_SURFACE = /* wgsl */`
 	let dF = terDetail( ${ rot2( 'xz', 2.4 ) } / 0.63 + 0.53 );
 	let grain = min( dN.z, 0.62 );
 	let grainF = min( dF.z, 0.62 );
+#if REFRACTION_CLIP
+	// the refraction source (half resolution, seen blurred through the water): every non-rock
+	// fragment under the water takes the cheap seabed path
+	let seabedPath = h < 0.4 && nr.z < 0.05;
+#else
 	let seabedPath = h < -0.8 && nr.z < 0.05 && slope < 0.18;
+#endif
 	let sw = vec2f( ${ WORLD.swellDir.x }, ${ WORLD.swellDir.y } );
 	let swDir = sw;
 	let rc = vec2f( ${ WORLD.reef.center.x.toFixed( 3 ) }, ${ WORLD.reef.center.z.toFixed( 3 ) } );
@@ -413,9 +419,14 @@ const TERRAIN_SURFACE = /* wgsl */`
 		var lawn = mt.tone * ( ( clump - 0.5 ) * clumpK + 1.0 ) * ( ( dF.y - 0.4 ) * 0.22 + 1.0 );
 		lawn = lawn * mix( 1.0, smoothstep( 0.25, 0.55, dN.y * 0.5 + dM.y * 0.5 ) * 0.35 + 0.72, smoothstep( 50.0, 160.0, camDist ) );
 		// grass combed along the wind: long streaks (anisotropic sample of the fbm channel)
-		let combUV = vec2f( dot( xz, frame.windDir ) / 7.5, dot( xz, vec2f( -frame.windDir.y, frame.windDir.x ) ) / 0.9 );
-		let comb = terDetail( combUV + vec2f( 0.31, 0.77 ) ).w;
-		lawn = lawn * ( ( comb - 0.5 ) * 0.3 + 1.0 );
+		// (comb and gust only where the lawn shows: not under full forest, sand or water)
+		let lawnShows = jungleW < 1.0 && landW > 0.0 && sandW < 1.0;
+		var comb = 0.5;
+		if ( lawnShows ) {
+			let combUV = vec2f( dot( xz, frame.windDir ) / 7.5, dot( xz, vec2f( -frame.windDir.y, frame.windDir.x ) ) / 0.9 );
+			comb = terDetail( combUV + vec2f( 0.31, 0.77 ) ).w;
+			lawn = lawn * ( ( comb - 0.5 ) * 0.3 + 1.0 );
+		}
 		// seen from above the dark soil shows between the clumps; at grazing angles blade sides
 		// cover everything (lighter, more saturated)
 		let gapK = smoothstep( 0.3, 0.95, NdV ) * smoothstep( 0.62, 0.3, clump );
@@ -424,8 +435,10 @@ const TERRAIN_SURFACE = /* wgsl */`
 		// travelling gusts flatten the grass: the paler blade backs show as waves (same gust
 		// field as the grass blades)
 		let windStrength = max( frame.windSpeed * 0.1, 0.03 );
-		let gust = terGustAt( xz, mat.gustOffset ) * sat( windStrength * 0.5 );
-		lawn = mix( lawn, lawn * vec3f( 1.25, 1.22, 1.06 ) + 0.01, gust * 0.6 );
+		if ( lawnShows ) {
+			let gust = terGustAt( xz, mat.gustOffset ) * sat( windStrength * 0.5 );
+			lawn = mix( lawn, lawn * vec3f( 1.25, 1.22, 1.06 ) + 0.01, gust * 0.6 );
+		}
 		// bare trodden soil in places, sandy soil toward the beach
 		lawn = mix( lawn, ${ S( 0.4, 0.33, 0.23 ) }, smoothstep( 0.72, 0.84, dN.y + ( dM.y - 0.5 ) * 0.5 ) * 0.25 );
 		lawn = mix( lawn, ${ S( 0.60, 0.52, 0.38 ) }, sat( sp.x * 1.6 ) * smoothstep( 0.45, 0.62, dN.z + dM.y * 0.3 ) * 0.7 );
@@ -446,14 +459,17 @@ const TERRAIN_SURFACE = /* wgsl */`
 		jungle = jungle * ( ( mcr - 0.5 ) * 0.3 + 1.0 );
 		// canopy: seen from a distance (or on slopes too steep for the trees) the forest reads as
 		// a carpet of lumpy crowns with dark gaps
-		let crowns = terDetail( ${ rot2( 'xz', 0.9 ) } / 61.0 ).w;
-		let crownsB = terDetail( ${ rot2( 'xz', 2.3 ) } / 13.0 + 0.37 ).w;
-		let canopyH = smoothstep( 0.32, 0.7, crowns * 0.45 + crownsB * 0.4 + dM.w * 0.15 );
 		let canopyW = jungleW * max( smoothstep( 0.2, 0.4, slope ), smoothstep( 90.0, 260.0, camDist ) ) * smoothstep( 25.0, 70.0, camDist ) * notRock * ( 1.0 - screeW * 0.7 );
-		var canopy = mix( ${ S( 0.05, 0.08, 0.025 ) }, mix( ${ S( 0.14, 0.21, 0.06 ) }, ${ S( 0.22, 0.27, 0.09 ) }, macroB ), canopyH );
-		// steep faces: the canopy hangs in streaks down the fall line
-		canopy = canopy * ( ( streak - 0.5 ) * 0.5 * smoothstep( 0.3, 0.5, slope ) + 1.0 );
-		jungle = mix( jungle, canopy, canopyW );
+		var canopyH = 0.0;
+		if ( canopyW > 0.0 ) {
+			let crowns = terDetail( ${ rot2( 'xz', 0.9 ) } / 61.0 ).w;
+			let crownsB = terDetail( ${ rot2( 'xz', 2.3 ) } / 13.0 + 0.37 ).w;
+			canopyH = smoothstep( 0.32, 0.7, crowns * 0.45 + crownsB * 0.4 + dM.w * 0.15 );
+			var canopy = mix( ${ S( 0.05, 0.08, 0.025 ) }, mix( ${ S( 0.14, 0.21, 0.06 ) }, ${ S( 0.22, 0.27, 0.09 ) }, macroB ), canopyH );
+			// steep faces: the canopy hangs in streaks down the fall line
+			canopy = canopy * ( ( streak - 0.5 ) * 0.5 * smoothstep( 0.3, 0.5, slope ) + 1.0 );
+			jungle = mix( jungle, canopy, canopyW );
+		}
 		var ground = mix( lawn, jungle, jungleW );
 		// around the bare rock: dark humus, stones and moss, with the surrounding plants creeping
 		// in (a soft, noisy band; no speckle)
@@ -531,8 +547,9 @@ const TERRAIN_SURFACE = /* wgsl */`
 		let dryEdge = smoothstep( 0.0, 0.6, wet ) * smoothstep( 1.0, 0.6, wet );
 		let wetK = max( wet, damp ) * ( 1.0 - dryEdge * mottle * 0.6 ) * notRock;
 		let slopeDir = normalize( N0.xz + vec2f( 1e-4, 0.0 ) );
-		let rill = terDetail( vec2f( dot( xz, slopeDir ) / 3.2, dot( xz, vec2f( -slopeDir.y, slopeDir.x ) ) / 0.3 ) ).w;
 		let rillK = smoothstep( 0.2, 0.9, wet ) * smoothstep( 0.05, 0.6, h ) * sandW;
+		var rill = 0.5;
+		if ( rillK > 0.0 ) { rill = terDetail( vec2f( dot( xz, slopeDir ) / 3.2, dot( xz, vec2f( -slopeDir.y, slopeDir.x ) ) / 0.3 ) ).w; }
 		let wetAlbedo = terrainSaturation( albedo * mat.wetDarken, 1.15 ) * vec3f( 0.97, 0.98, 1.0 ) * ( ( rill - 0.5 ) * 0.25 * rillK + 1.0 );
 		albedo = mix( albedo, wetAlbedo, wetK );
 		// swash marks: thin wavy lines of grit left at the limits of earlier uprushes
@@ -543,8 +560,8 @@ const TERRAIN_SURFACE = /* wgsl */`
 			* smoothstep( 0.45, 0.65, dM.y + ( macroB - 0.5 ) * 0.4 ) * sandW * ( 1.0 - smoothstep( 0.8, 2.0, slW * 10.0 ) );
 		albedo = mix( albedo * ( 1.0 - swashLine * 0.3 ), ${ S( 0.9, 0.88, 0.84 ) }, swashLine * smoothstep( 0.6, 0.75, dF.z ) * 0.5 );
 		// foam residue: lacy patterns stranded on the sand
-		let lace = smoothstep( 0.42, 0.18, terDetail( ${ rot2( 'xz', 0.4 ) } / 0.9 ).x ) * 0.7 + 0.3;
-		let residue = sat( wetFoam.y ) * lace * landW * notRock;
+		var residue = sat( wetFoam.y ) * landW * notRock;
+		if ( residue > 0.0 ) { residue *= smoothstep( 0.42, 0.18, terDetail( ${ rot2( 'xz', 0.4 ) } / 0.9 ).x ) * 0.7 + 0.3; }
 		albedo = mix( albedo, ${ S( 0.88, 0.9, 0.9 ) }, residue );
 
 		// ---- roughness
